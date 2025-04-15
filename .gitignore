@@ -1,0 +1,39 @@
+# Node.js
+node_modules/
+npm-debug.log
+yarn-debug.log
+yarn-error.log
+
+# Çevre değişkenleri
+.env
+.env.local
+.env.development
+.env.test
+.env.production
+
+# IDE ve editor klasörleri
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# İşletim sistemi dosyaları
+.DS_Store
+Thumbs.db
+
+# Log dosyaları
+logs/
+*.log
+npm-debug.log*
+
+# Build klasörleri
+dist/
+build/
+coverage/
+
+# Geçici dosyalar
+tmp/
+temp/
+
+# Upload klasörü (kullanıcı yüklemelerini içerebilir)
+uploads/
