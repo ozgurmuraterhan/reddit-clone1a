@@ -1,4 +1,3 @@
-
 const Permission = require('../models/Permission');
 const Role = require('../models/Role');
 const User = require('../models/User');
@@ -43,7 +42,7 @@ const getPermissions = asyncHandler(async (req, res, next) => {
   if (search) {
     filter.$or = [
       { name: { $regex: search, $options: 'i' } },
-      { description: { $regex: search, $options: 'i' } }
+      { description: { $regex: search, $options: 'i' } },
     ];
   }
 
@@ -63,9 +62,9 @@ const getPermissions = asyncHandler(async (req, res, next) => {
     pagination: {
       page,
       limit,
-      pages: Math.ceil(total / limit)
+      pages: Math.ceil(total / limit),
     },
-    data: permissions
+    data: permissions,
   });
 });
 
@@ -101,8 +100,8 @@ const getPermission = asyncHandler(async (req, res, next) => {
     success: true,
     data: {
       permission,
-      roles
-    }
+      roles,
+    },
   });
 });
 
@@ -137,12 +136,11 @@ const createPermission = asyncHandler(async (req, res, next) => {
     description,
     category,
     scope,
-    isSystem: isSystem || false
+    isSystem: isSystem || false,
   });
-
   res.status(201).json({
     success: true,
-    data: permission
+    data: permission,
   });
 });
 
@@ -207,14 +205,14 @@ const updatePermission = asyncHandler(async (req, res, next) => {
       description: description || permission.description,
       category: category || permission.category,
       scope: scope || permission.scope,
-      isSystem: isSystem !== undefined ? isSystem : permission.isSystem
+      isSystem: isSystem !== undefined ? isSystem : permission.isSystem,
     },
-    { new: true, runValidators: true }
+    { new: true, runValidators: true },
   );
 
   res.status(200).json({
     success: true,
-    data: permission
+    data: permission,
   });
 });
 
@@ -252,7 +250,12 @@ const deletePermission = asyncHandler(async (req, res, next) => {
   const usedInRoles = await Role.findOne({ permissions: id });
 
   if (usedInRoles) {
-    return next(new ErrorResponse('Bu izin bir veya daha fazla rol tarafından kullanılmaktadır ve silinemez', 400));
+    return next(
+      new ErrorResponse(
+        'Bu izin bir veya daha fazla rol tarafından kullanılmaktadır ve silinemez',
+        400,
+      ),
+    );
   }
 
   // İzni sil
@@ -261,7 +264,7 @@ const deletePermission = asyncHandler(async (req, res, next) => {
   res.status(200).json({
     success: true,
     data: {},
-    message: 'İzin başarıyla silindi'
+    message: 'İzin başarıyla silindi',
   });
 });
 
@@ -313,11 +316,10 @@ const assignPermissionToRole = asyncHandler(async (req, res, next) => {
   // İzni role ekle
   role.permissions.push(id);
   await role.save();
-
   res.status(200).json({
     success: true,
     data: role,
-    message: 'İzin başarıyla role atandı'
+    message: 'İzin başarıyla role atandı',
   });
 });
 
@@ -362,13 +364,13 @@ const removePermissionFromRole = asyncHandler(async (req, res, next) => {
   }
 
   // İzni rolden kaldır
-  role.permissions = role.permissions.filter(p => p.toString() !== id);
+  role.permissions = role.permissions.filter((p) => p.toString() !== id);
   await role.save();
 
   res.status(200).json({
     success: true,
     data: role,
-    message: 'İzin başarıyla rolden kaldırıldı'
+    message: 'İzin başarıyla rolden kaldırıldı',
   });
 });
 
@@ -406,7 +408,7 @@ const getPermissionsByCategory = asyncHandler(async (req, res, next) => {
   res.status(200).json({
     success: true,
     count: permissions.length,
-    data: permissions
+    data: permissions,
   });
 });
 
@@ -428,10 +430,14 @@ const getPermissionSchema = asyncHandler(async (req, res, next) => {
   const categorizedPermissions = {};
   const validCategories = ['post', 'comment', 'user', 'subreddit', 'moderation', 'admin', 'other'];
 
-  validCategories.forEach(category => {
+  validCategories.forEach((category) => {
     categorizedPermissions[category] = {
-      site: permissions.filter(p => p.category === category && (p.scope === 'site' || p.scope === 'both')),
-      subreddit: permissions.filter(p => p.category === category && (p.scope === 'subreddit' || p.scope === 'both'))
+      site: permissions.filter(
+        (p) => p.category === category && (p.scope === 'site' || p.scope === 'both'),
+      ),
+      subreddit: permissions.filter(
+        (p) => p.category === category && (p.scope === 'subreddit' || p.scope === 'both'),
+      ),
     };
   });
 
@@ -439,8 +445,8 @@ const getPermissionSchema = asyncHandler(async (req, res, next) => {
   const roles = await Role.find().populate('permissions');
 
   // Site ve subreddit kapsamına göre grupla
-  const rolesBySite = roles.filter(role => role.scope === 'site');
-  const rolesBySubreddit = roles.filter(role => role.scope === 'subreddit');
+  const rolesBySite = roles.filter((role) => role.scope === 'site');
+  const rolesBySubreddit = roles.filter((role) => role.scope === 'subreddit');
 
   res.status(200).json({
     success: true,
@@ -448,9 +454,9 @@ const getPermissionSchema = asyncHandler(async (req, res, next) => {
       permissions: categorizedPermissions,
       roles: {
         site: rolesBySite,
-        subreddit: rolesBySubreddit
-      }
-    }
+        subreddit: rolesBySubreddit,
+      },
+    },
   });
 });
 
@@ -479,13 +485,15 @@ const checkUserPermissions = asyncHandler(async (req, res, next) => {
     return res.status(200).json({
       success: true,
       hasPermission: true,
-      message: 'Admin kullanıcısı tüm izinlere sahiptir'
+      message: 'Admin kullanıcısı tüm izinlere sahiptir',
     });
   }
 
   // Subreddit kapsamlı izin için subreddit ID gerekli
   if (permissionObj.scope === 'subreddit' && !subredditId) {
-    return next(new ErrorResponse('Subreddit kapsamlı izin kontrolü için subreddit ID gereklidir', 400));
+    return next(
+      new ErrorResponse('Subreddit kapsamlı izin kontrolü için subreddit ID gereklidir', 400),
+    );
   }
 
   // Subreddit ID formatı kontrolü
@@ -501,23 +509,23 @@ const checkUserPermissions = asyncHandler(async (req, res, next) => {
     userRoles = await UserRoleAssignment.find({
       user: userId,
       scope: 'subreddit',
-      subreddit: subredditId
+      subreddit: subredditId,
     }).populate({
       path: 'role',
       populate: {
-        path: 'permissions'
-      }
+        path: 'permissions',
+      },
     });
   } else {
     // Site kapsamlı roller
     userRoles = await UserRoleAssignment.find({
       user: userId,
-      scope: 'site'
+      scope: 'site',
     }).populate({
       path: 'role',
       populate: {
-        path: 'permissions'
-      }
+        path: 'permissions',
+      },
     });
   }
 
@@ -548,9 +556,7 @@ const checkUserPermissions = asyncHandler(async (req, res, next) => {
   res.status(200).json({
     success: true,
     hasPermission,
-    message: hasPermission ?
-        'Kullanıcı bu izne sahip' :
-        'Kullanıcı bu izne sahip değil'
+    message: hasPermission ? 'Kullanıcı bu izne sahip' : 'Kullanıcı bu izne sahip değil',
   });
 });
 
@@ -600,7 +606,9 @@ const setSubredditPermissions = asyncHandler(async (req, res, next) => {
   const role = await Role.findById(roleId);
   // Rolün kapsamını kontrol et
   if (role.scope !== 'subreddit') {
-    return next(new ErrorResponse('Sadece subreddit kapsamlı roller için izinler ayarlanabilir', 400));
+    return next(
+      new ErrorResponse('Sadece subreddit kapsamlı roller için izinler ayarlanabilir', 400),
+    );
   }
 
   // Sistem rollerinin izinlerini değiştirmeye izin verme
@@ -636,11 +644,10 @@ const setSubredditPermissions = asyncHandler(async (req, res, next) => {
   // Rolün izinlerini güncelle
   role.permissions = validPermissions;
   await role.save();
-
   res.status(200).json({
     success: true,
     data: role,
-    message: 'Subreddit rol izinleri başarıyla güncellendi'
+    message: 'Subreddit rol izinleri başarıyla güncellendi',
   });
 });
 
@@ -666,7 +673,7 @@ const setupDefaultPermissions = asyncHandler(async (req, res, next) => {
       description: 'Site yöneticisi',
       scope: 'site',
       isDefault: false,
-      isSystem: true
+      isSystem: true,
     });
   }
 
@@ -676,7 +683,7 @@ const setupDefaultPermissions = asyncHandler(async (req, res, next) => {
       description: 'Subreddit moderatörü',
       scope: 'subreddit',
       isDefault: false,
-      isSystem: true
+      isSystem: true,
     });
   }
 
@@ -686,19 +693,19 @@ const setupDefaultPermissions = asyncHandler(async (req, res, next) => {
       description: 'Standart kullanıcı',
       scope: 'site',
       isDefault: true,
-      isSystem: true
+      isSystem: true,
     });
   }
 
   // Varsayılan izin kategorileri
   const defaultPermissionCategories = {
-    'post': 'Post işlemleri',
-    'comment': 'Yorum işlemleri',
-    'user': 'Kullanıcı işlemleri',
-    'subreddit': 'Subreddit işlemleri',
-    'moderation': 'Moderasyon işlemleri',
-    'admin': 'Admin işlemleri',
-    'other': 'Diğer işlemler'
+    post: 'Post işlemleri',
+    comment: 'Yorum işlemleri',
+    user: 'Kullanıcı işlemleri',
+    subreddit: 'Subreddit işlemleri',
+    moderation: 'Moderasyon işlemleri',
+    admin: 'Admin işlemleri',
+    other: 'Diğer işlemler',
   };
 
   // Temel izinleri tanımla ve oluştur
@@ -710,7 +717,7 @@ const setupDefaultPermissions = asyncHandler(async (req, res, next) => {
       category: 'post',
       scope: 'both',
       isSystem: true,
-      roles: ['user', 'admin']
+      roles: ['user', 'admin'],
     },
     {
       name: 'post:read',
@@ -718,7 +725,7 @@ const setupDefaultPermissions = asyncHandler(async (req, res, next) => {
       category: 'post',
       scope: 'both',
       isSystem: true,
-      roles: ['user', 'moderator', 'admin']
+      roles: ['user', 'moderator', 'admin'],
     },
     {
       name: 'post:update_own',
@@ -726,7 +733,7 @@ const setupDefaultPermissions = asyncHandler(async (req, res, next) => {
       category: 'post',
       scope: 'both',
       isSystem: true,
-      roles: ['user', 'admin']
+      roles: ['user', 'admin'],
     },
     {
       name: 'post:update_any',
@@ -734,7 +741,7 @@ const setupDefaultPermissions = asyncHandler(async (req, res, next) => {
       category: 'post',
       scope: 'subreddit',
       isSystem: true,
-      roles: ['moderator', 'admin']
+      roles: ['moderator', 'admin'],
     },
     {
       name: 'post:delete_own',
@@ -742,7 +749,7 @@ const setupDefaultPermissions = asyncHandler(async (req, res, next) => {
       category: 'post',
       scope: 'both',
       isSystem: true,
-      roles: ['user', 'admin']
+      roles: ['user', 'admin'],
     },
     {
       name: 'post:delete_any',
@@ -750,7 +757,7 @@ const setupDefaultPermissions = asyncHandler(async (req, res, next) => {
       category: 'post',
       scope: 'subreddit',
       isSystem: true,
-      roles: ['moderator', 'admin']
+      roles: ['moderator', 'admin'],
     },
     {
       name: 'post:vote',
@@ -758,7 +765,7 @@ const setupDefaultPermissions = asyncHandler(async (req, res, next) => {
       category: 'post',
       scope: 'both',
       isSystem: true,
-      roles: ['user', 'admin']
+      roles: ['user', 'admin'],
     },
 
     // Yorum izinleri
@@ -768,7 +775,7 @@ const setupDefaultPermissions = asyncHandler(async (req, res, next) => {
       category: 'comment',
       scope: 'both',
       isSystem: true,
-      roles: ['user', 'admin']
+      roles: ['user', 'admin'],
     },
     {
       name: 'comment:read',
@@ -776,7 +783,7 @@ const setupDefaultPermissions = asyncHandler(async (req, res, next) => {
       category: 'comment',
       scope: 'both',
       isSystem: true,
-      roles: ['user', 'moderator', 'admin']
+      roles: ['user', 'moderator', 'admin'],
     },
     {
       name: 'comment:update_own',
@@ -784,7 +791,7 @@ const setupDefaultPermissions = asyncHandler(async (req, res, next) => {
       category: 'comment',
       scope: 'both',
       isSystem: true,
-      roles: ['user', 'admin']
+      roles: ['user', 'admin'],
     },
     {
       name: 'comment:update_any',
@@ -792,7 +799,7 @@ const setupDefaultPermissions = asyncHandler(async (req, res, next) => {
       category: 'comment',
       scope: 'subreddit',
       isSystem: true,
-      roles: ['moderator', 'admin']
+      roles: ['moderator', 'admin'],
     },
     {
       name: 'comment:delete_own',
@@ -800,7 +807,7 @@ const setupDefaultPermissions = asyncHandler(async (req, res, next) => {
       category: 'comment',
       scope: 'both',
       isSystem: true,
-      roles: ['user', 'admin']
+      roles: ['user', 'admin'],
     },
     {
       name: 'comment:delete_any',
@@ -808,7 +815,7 @@ const setupDefaultPermissions = asyncHandler(async (req, res, next) => {
       category: 'comment',
       scope: 'subreddit',
       isSystem: true,
-      roles: ['moderator', 'admin']
+      roles: ['moderator', 'admin'],
     },
     {
       name: 'comment:vote',
@@ -816,7 +823,7 @@ const setupDefaultPermissions = asyncHandler(async (req, res, next) => {
       category: 'comment',
       scope: 'both',
       isSystem: true,
-      roles: ['user', 'admin']
+      roles: ['user', 'admin'],
     },
 
     // Moderasyon izinleri
@@ -826,7 +833,7 @@ const setupDefaultPermissions = asyncHandler(async (req, res, next) => {
       category: 'moderation',
       scope: 'subreddit',
       isSystem: true,
-      roles: ['moderator', 'admin']
+      roles: ['moderator', 'admin'],
     },
     {
       name: 'moderation:remove',
@@ -834,7 +841,7 @@ const setupDefaultPermissions = asyncHandler(async (req, res, next) => {
       category: 'moderation',
       scope: 'subreddit',
       isSystem: true,
-      roles: ['moderator', 'admin']
+      roles: ['moderator', 'admin'],
     },
     {
       name: 'moderation:ban',
@@ -842,7 +849,7 @@ const setupDefaultPermissions = asyncHandler(async (req, res, next) => {
       category: 'moderation',
       scope: 'subreddit',
       isSystem: true,
-      roles: ['moderator', 'admin']
+      roles: ['moderator', 'admin'],
     },
     {
       name: 'moderation:unban',
@@ -850,7 +857,7 @@ const setupDefaultPermissions = asyncHandler(async (req, res, next) => {
       category: 'moderation',
       scope: 'subreddit',
       isSystem: true,
-      roles: ['moderator', 'admin']
+      roles: ['moderator', 'admin'],
     },
     {
       name: 'moderation:lock',
@@ -858,7 +865,7 @@ const setupDefaultPermissions = asyncHandler(async (req, res, next) => {
       category: 'moderation',
       scope: 'subreddit',
       isSystem: true,
-      roles: ['moderator', 'admin']
+      roles: ['moderator', 'admin'],
     },
     {
       name: 'moderation:config',
@@ -866,7 +873,7 @@ const setupDefaultPermissions = asyncHandler(async (req, res, next) => {
       category: 'moderation',
       scope: 'subreddit',
       isSystem: true,
-      roles: ['moderator', 'admin']
+      roles: ['moderator', 'admin'],
     },
     {
       name: 'moderation:flair',
@@ -874,7 +881,7 @@ const setupDefaultPermissions = asyncHandler(async (req, res, next) => {
       category: 'moderation',
       scope: 'subreddit',
       isSystem: true,
-      roles: ['moderator', 'admin']
+      roles: ['moderator', 'admin'],
     },
     {
       name: 'moderation:wiki',
@@ -882,7 +889,7 @@ const setupDefaultPermissions = asyncHandler(async (req, res, next) => {
       category: 'moderation',
       scope: 'subreddit',
       isSystem: true,
-      roles: ['moderator', 'admin']
+      roles: ['moderator', 'admin'],
     },
     {
       name: 'moderation:manage_moderators',
@@ -890,41 +897,39 @@ const setupDefaultPermissions = asyncHandler(async (req, res, next) => {
       category: 'moderation',
       scope: 'subreddit',
       isSystem: true,
-      roles: ['admin']
+      roles: ['admin'],
     },
-
-    // Subreddit izinleri
     {
       name: 'subreddit:create',
       description: 'Subreddit oluşturma',
       category: 'subreddit',
       scope: 'site',
       isSystem: true,
-      roles: ['user', 'admin']
+      roles: ['user', 'admin'],
     },
     {
       name: 'subreddit:subscribe',
-      description: 'Subreddit'e abone olma',
+      description: 'Subreddite abone olma',
       category: 'subreddit',
       scope: 'both',
       isSystem: true,
-      roles: ['user', 'admin']
+      roles: ['user', 'admin'],
     },
     {
       name: 'subreddit:update_own',
-      description: 'Kendi subreddit\'ini güncelleme',
+      description: "Kendi subreddit'ini güncelleme",
       category: 'subreddit',
       scope: 'subreddit',
       isSystem: true,
-      roles: ['moderator', 'admin']
+      roles: ['moderator', 'admin'],
     },
     {
       name: 'subreddit:delete_own',
-      description: 'Kendi subreddit\'ini silme (sadece kurucular)',
+      description: "Kendi subreddit'ini silme (sadece kurucular)",
       category: 'subreddit',
       scope: 'subreddit',
       isSystem: true,
-      roles: ['admin']
+      roles: ['admin'],
     },
 
     // Kullanıcı izinleri
@@ -934,7 +939,7 @@ const setupDefaultPermissions = asyncHandler(async (req, res, next) => {
       category: 'user',
       scope: 'site',
       isSystem: true,
-      roles: ['user', 'admin']
+      roles: ['user', 'admin'],
     },
     {
       name: 'user:read',
@@ -942,7 +947,7 @@ const setupDefaultPermissions = asyncHandler(async (req, res, next) => {
       category: 'user',
       scope: 'site',
       isSystem: true,
-      roles: ['user', 'moderator', 'admin']
+      roles: ['user', 'moderator', 'admin'],
     },
     {
       name: 'user:manage_any',
@@ -950,7 +955,7 @@ const setupDefaultPermissions = asyncHandler(async (req, res, next) => {
       category: 'user',
       scope: 'site',
       isSystem: true,
-      roles: ['admin']
+      roles: ['admin'],
     },
 
     // Admin izinleri
@@ -960,7 +965,7 @@ const setupDefaultPermissions = asyncHandler(async (req, res, next) => {
       category: 'admin',
       scope: 'site',
       isSystem: true,
-      roles: ['admin']
+      roles: ['admin'],
     },
     {
       name: 'admin:manage_permissions',
@@ -968,7 +973,7 @@ const setupDefaultPermissions = asyncHandler(async (req, res, next) => {
       category: 'admin',
       scope: 'site',
       isSystem: true,
-      roles: ['admin']
+      roles: ['admin'],
     },
     {
       name: 'admin:manage_site',
@@ -976,7 +981,7 @@ const setupDefaultPermissions = asyncHandler(async (req, res, next) => {
       category: 'admin',
       scope: 'site',
       isSystem: true,
-      roles: ['admin']
+      roles: ['admin'],
     },
     {
       name: 'admin:view_logs',
@@ -984,15 +989,15 @@ const setupDefaultPermissions = asyncHandler(async (req, res, next) => {
       category: 'admin',
       scope: 'site',
       isSystem: true,
-      roles: ['admin']
-    }
+      roles: ['admin'],
+    },
   ];
 
   // İzinleri oluştur ve rollere ata
   const roleMap = {
-    'admin': adminRole,
-    'moderator': moderatorRole,
-    'user': userRole
+    admin: adminRole,
+    moderator: moderatorRole,
+    user: userRole,
   };
 
   const createdPermissions = [];
@@ -1008,7 +1013,7 @@ const setupDefaultPermissions = asyncHandler(async (req, res, next) => {
         description: permissionData.description,
         category: permissionData.category,
         scope: permissionData.scope,
-        isSystem: permissionData.isSystem
+        isSystem: permissionData.isSystem,
       });
 
       createdPermissions.push(permission);
@@ -1017,11 +1022,8 @@ const setupDefaultPermissions = asyncHandler(async (req, res, next) => {
     // Rollere ata
     for (const roleName of permissionData.roles) {
       const role = roleMap[roleName];
-
-      if (role && !role.permissions.includes(permission._id)) {
-        role.permissions.push(permission._id);
-        await role.save();
-      }
+      role.permissions.push(permission._id);
+      await role.save();
     }
   }
 
@@ -1030,8 +1032,8 @@ const setupDefaultPermissions = asyncHandler(async (req, res, next) => {
     message: `${createdPermissions.length} varsayılan izin oluşturuldu ve rollere atandı`,
     data: {
       createdPermissions,
-      roles: Object.values(roleMap)
-    }
+      roles: Object.values(roleMap),
+    },
   });
 });
 
@@ -1064,12 +1066,12 @@ const getUserPermissions = asyncHandler(async (req, res, next) => {
   // Kullanıcının site kapsamlı rollerini getir
   const siteRoleAssignments = await UserRoleAssignment.find({
     user: userId,
-    scope: 'site'
+    scope: 'site',
   }).populate({
     path: 'role',
     populate: {
-      path: 'permissions'
-    }
+      path: 'permissions',
+    },
   });
 
   // Site kapsamlı izinleri çıkart
@@ -1083,7 +1085,7 @@ const getUserPermissions = asyncHandler(async (req, res, next) => {
           name: permission.name,
           description: permission.description,
           category: permission.category,
-          role: assignment.role.name
+          role: assignment.role.name,
         });
       }
     }
@@ -1092,13 +1094,15 @@ const getUserPermissions = asyncHandler(async (req, res, next) => {
   // Kullanıcının subreddit kapsamlı rollerini getir
   const subredditRoleAssignments = await UserRoleAssignment.find({
     user: userId,
-    scope: 'subreddit'
-  }).populate({
-    path: 'role',
-    populate: {
-      path: 'permissions'
-    }
-  }).populate('subreddit', 'name');
+    scope: 'subreddit',
+  })
+    .populate({
+      path: 'role',
+      populate: {
+        path: 'permissions',
+      },
+    })
+    .populate('subreddit', 'name');
 
   // Subreddit kapsamlı izinleri çıkart
   const subredditPermissions = {};
@@ -1112,16 +1116,20 @@ const getUserPermissions = asyncHandler(async (req, res, next) => {
           subredditId: assignment.subreddit._id,
           subredditName,
           permissions: [],
-          roles: []
+          roles: [],
         };
       }
 
       // Role ekle
-      if (!subredditPermissions[subredditName].roles.some(r => r.id.toString() === assignment.role._id.toString())) {
+      if (
+        !subredditPermissions[subredditName].roles.some(
+          (r) => r.id.toString() === assignment.role._id.toString(),
+        )
+      ) {
         subredditPermissions[subredditName].roles.push({
           id: assignment.role._id,
           name: assignment.role.name,
-          description: assignment.role.description
+          description: assignment.role.description,
         });
       }
 
@@ -1129,7 +1137,7 @@ const getUserPermissions = asyncHandler(async (req, res, next) => {
       for (const permission of assignment.role.permissions) {
         // Zaten eklenmiş mi kontrol et
         const exists = subredditPermissions[subredditName].permissions.some(
-            p => p.id.toString() === permission._id.toString()
+          (p) => p.id.toString() === permission._id.toString(),
         );
 
         if (!exists) {
@@ -1138,7 +1146,7 @@ const getUserPermissions = asyncHandler(async (req, res, next) => {
             name: permission.name,
             description: permission.description,
             category: permission.category,
-            role: assignment.role.name
+            role: assignment.role.name,
           });
         }
       }
@@ -1150,14 +1158,16 @@ const getUserPermissions = asyncHandler(async (req, res, next) => {
     data: {
       site: {
         permissions: Array.from(sitePermissions),
-        roles: siteRoleAssignments.filter(a => a.isActive).map(a => ({
-          id: a.role._id,
-          name: a.role.name,
-          description: a.role.description
-        }))
+        roles: siteRoleAssignments
+          .filter((a) => a.isActive)
+          .map((a) => ({
+            id: a.role._id,
+            name: a.role.name,
+            description: a.role.description,
+          })),
       },
-      subreddits: Object.values(subredditPermissions)
-    }
+      subreddits: Object.values(subredditPermissions),
+    },
   });
 });
 
@@ -1167,6 +1177,9 @@ const getUserPermissions = asyncHandler(async (req, res, next) => {
  * @access  Private
  */
 const getSubredditPermissions = asyncHandler(async (req, res, next) => {
+  // Varsayılan izinleri ve rolleri kur (bir kez çalıştırılmalı)
+  await setupDefaultPermissions();
+
   const { subredditId } = req.params;
 
   // ID formatı kontrolü
@@ -1184,7 +1197,7 @@ const getSubredditPermissions = asyncHandler(async (req, res, next) => {
   // Subreddit'in rollerini getir
   const roles = await Role.find({
     scope: 'subreddit',
-    _id: { $in: await UserRoleAssignment.distinct('role', { subreddit: subredditId }) }
+    _id: { $in: await UserRoleAssignment.distinct('role', { subreddit: subredditId }) },
   }).populate('permissions');
 
   // Rol bazlı izin haritası oluştur
@@ -1197,14 +1210,14 @@ const getSubredditPermissions = asyncHandler(async (req, res, next) => {
         name: role.name,
         description: role.description,
         isDefault: role.isDefault,
-        isSystem: role.isSystem
+        isSystem: role.isSystem,
       },
-      permissions: role.permissions.map(p => ({
+      permissions: role.permissions.map((p) => ({
         id: p._id,
         name: p.name,
         description: p.description,
-        category: p.category
-      }))
+        category: p.category,
+      })),
     };
   }
 
@@ -1213,10 +1226,10 @@ const getSubredditPermissions = asyncHandler(async (req, res, next) => {
     data: {
       subreddit: {
         id: subreddit._id,
-        name: subreddit.name
+        name: subreddit.name,
       },
-      roles: rolePermissions
-    }
+      roles: rolePermissions,
+    },
   });
 });
 
@@ -1234,5 +1247,6 @@ module.exports = {
   setSubredditPermissions,
   setupDefaultPermissions,
   getUserPermissions,
-  getSubredditPermissions
+  getSubredditPermissions,
+  checkPermission,
 };

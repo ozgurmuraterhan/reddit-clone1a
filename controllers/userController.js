@@ -1019,7 +1019,251 @@ const permanentlyDeleteAccount = asyncHandler(async (req, res, next) => {
     session.endSession();
   }
 });
+// Diğer mevcut controller fonksiyonlarının sonuna eklenecek
 
+/**
+ * @desc    Kullanıcının rollerini getir
+ * @route   GET /api/users/:id/roles
+ * @access  Private (Self or Admin)
+ */
+const getUserRoles = asyncHandler(async (req, res, next) => {
+  const userId = req.params.id;
+
+  // Kullanıcı varlığını kontrol et
+  const user = await User.findById(userId);
+  if (!user) {
+    return next(new ErrorResponse(`${userId} ID'sine sahip kullanıcı bulunamadı`, 404));
+  }
+
+  // Kullanıcının rol atamalarını getir
+  const roleAssignments = await UserRoleAssignment.find({ user: userId })
+    .populate({
+      path: 'role',
+      select: 'name description scope permissions',
+      populate: {
+        path: 'permissions',
+        select: 'name description category',
+      },
+    })
+    .populate('subreddit', 'name title icon');
+
+  // Rolleri site kapsamlı ve subreddit kapsamlı olarak ayır
+  const siteRoles = roleAssignments.filter((ra) => !ra.subreddit);
+  const subredditRoles = roleAssignments.filter((ra) => ra.subreddit);
+
+  res.status(200).json({
+    success: true,
+    data: {
+      siteRoles,
+      subredditRoles,
+    },
+  });
+});
+
+/**
+ * @desc    Kullanıcıya rol ata (site kapsamlı)
+ * @route   POST /api/users/:id/roles
+ * @access  Private (Admin)
+ */
+const assignRoleToUser = asyncHandler(async (req, res, next) => {
+  const userId = req.params.id;
+  const { roleId, expiresAt } = req.body;
+
+  // Kullanıcı ve rol varlığını kontrol et
+  const user = await User.findById(userId);
+  if (!user) {
+    return next(new ErrorResponse(`${userId} ID'sine sahip kullanıcı bulunamadı`, 404));
+  }
+
+  const role = await Role.findById(roleId);
+  if (!role) {
+    return next(new ErrorResponse(`${roleId} ID'sine sahip rol bulunamadı`, 404));
+  }
+
+  // Rol atama kontrolü
+  const existingAssignment = await UserRoleAssignment.findOne({
+    user: userId,
+    role: roleId,
+    subreddit: null, // Site kapsamlı rol için
+  });
+
+  if (existingAssignment) {
+    return next(new ErrorResponse(`Bu kullanıcıya zaten bu rol atanmış`, 400));
+  }
+
+  // Rol atamasını oluştur
+  const roleAssignment = await UserRoleAssignment.create({
+    user: userId,
+    role: roleId,
+    assignedBy: req.user.id,
+    expiresAt: expiresAt || null,
+  });
+
+  // Detaylı bilgilerle birlikte rol atamasını getir
+  const populatedAssignment = await UserRoleAssignment.findById(roleAssignment._id)
+    .populate('role', 'name description')
+    .populate('user', 'username email')
+    .populate('assignedBy', 'username');
+
+  res.status(201).json({
+    success: true,
+    data: populatedAssignment,
+  });
+});
+
+/**
+ * @desc    Kullanıcıdan rol kaldır
+ * @route   DELETE /api/users/:id/roles/:roleId
+ * @access  Private (Admin)
+ */
+const removeRoleFromUser = asyncHandler(async (req, res, next) => {
+  const { id: userId, roleId } = req.params;
+  const { subredditId } = req.query; // Subreddit kapsamlı rolü kaldırmak için opsiyonel
+
+  // Rol atamasını bul
+  const query = {
+    user: userId,
+    role: roleId,
+  };
+
+  // Subreddit belirtilmişse ekle, değilse site kapsamlı rol
+  if (subredditId) {
+    query.subreddit = subredditId;
+  } else {
+    query.subreddit = null;
+  }
+
+  const roleAssignment = await UserRoleAssignment.findOne(query);
+
+  if (!roleAssignment) {
+    return next(new ErrorResponse(`Bu kullanıcı için belirtilen rol ataması bulunamadı`, 404));
+  }
+
+  // Atamanın silinmesini logla ve sil
+  await roleAssignment.remove();
+
+  res.status(200).json({
+    success: true,
+    data: {},
+    message: 'Rol ataması başarıyla kaldırıldı',
+  });
+});
+
+/**
+ * @desc    Kullanıcının izinlerini getir
+ * @route   GET /api/users/:id/permissions
+ * @access  Private (Self or Admin)
+ */
+const getUserPermissions = asyncHandler(async (req, res, next) => {
+  const userId = req.params.id;
+  const { scope, subredditId } = req.query;
+
+  // Kullanıcı varlığını kontrol et
+  const user = await User.findById(userId);
+  if (!user) {
+    return next(new ErrorResponse(`${userId} ID'sine sahip kullanıcı bulunamadı`, 404));
+  }
+
+  // Kullanıcının rol atamalarını getir
+  let roleAssignments;
+
+  if (scope === 'site') {
+    // Sadece site kapsamlı rol atamaları
+    roleAssignments = await UserRoleAssignment.find({
+      user: userId,
+      subreddit: null,
+    }).populate({
+      path: 'role',
+      select: 'name permissions scope',
+      populate: {
+        path: 'permissions',
+        select: 'name description category scope',
+      },
+    });
+  } else if (scope === 'subreddit' && subredditId) {
+    // Belirli bir subreddit için rol atamaları
+    roleAssignments = await UserRoleAssignment.find({
+      user: userId,
+      subreddit: subredditId,
+    })
+      .populate({
+        path: 'role',
+        select: 'name permissions scope',
+        populate: {
+          path: 'permissions',
+          select: 'name description category scope',
+        },
+      })
+      .populate('subreddit', 'name title');
+  } else {
+    // Tüm rol atamaları
+    roleAssignments = await UserRoleAssignment.find({
+      user: userId,
+    })
+      .populate({
+        path: 'role',
+        select: 'name permissions scope',
+        populate: {
+          path: 'permissions',
+          select: 'name description category scope',
+        },
+      })
+      .populate('subreddit', 'name title');
+  }
+
+  // İzinleri birleştir ve tekrarları kaldır
+  const permissionsSet = new Set();
+  const permissionDetails = [];
+
+  roleAssignments.forEach((assignment) => {
+    if (assignment.role && assignment.role.permissions) {
+      assignment.role.permissions.forEach((permission) => {
+        const permissionKey = `${permission.name}-${assignment.subreddit ? assignment.subreddit._id : 'site'}`;
+
+        if (!permissionsSet.has(permissionKey)) {
+          permissionsSet.add(permissionKey);
+
+          permissionDetails.push({
+            name: permission.name,
+            description: permission.description,
+            category: permission.category,
+            scope: permission.scope,
+            subreddit: assignment.subreddit,
+            grantedVia: {
+              role: {
+                id: assignment.role._id,
+                name: assignment.role.name,
+              },
+              scope: assignment.role.scope,
+            },
+          });
+        }
+      });
+    }
+  });
+
+  // İzinleri kategorilere göre grupla
+  const categorizedPermissions = {};
+
+  permissionDetails.forEach((permission) => {
+    if (!categorizedPermissions[permission.category]) {
+      categorizedPermissions[permission.category] = [];
+    }
+
+    categorizedPermissions[permission.category].push(permission);
+  });
+
+  res.status(200).json({
+    success: true,
+    data: {
+      permissions: permissionDetails,
+      categorized: categorizedPermissions,
+      roleAssignments,
+    },
+  });
+});
+
+// Module exports kısmına da bu fonksiyonları ekleyin
 module.exports = {
   getUsers,
   getUser,
@@ -1041,4 +1285,9 @@ module.exports = {
   getUserAwards,
   getUserStorageStats,
   permanentlyDeleteAccount,
+  // Yeni eklenen fonksiyonlar
+  getUserRoles,
+  assignRoleToUser,
+  removeRoleFromUser,
+  getUserPermissions,
 };
