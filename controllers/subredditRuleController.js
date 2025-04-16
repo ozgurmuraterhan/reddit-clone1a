@@ -1,366 +1,563 @@
-const { SubredditRule, Subreddit, ModLog } = require('../models');
+const SubredditRule = require('../models/SubredditRule');
+const SubredditMembership = require('../models/SubredditMembership'); // Assuming this model exists
+const Subreddit = require('../models/Subreddit');
+const asyncHandler = require('../middleware/async');
+const ErrorResponse = require('../utils/errorResponse');
+const mongoose = require('mongoose');
 
 /**
- * Subreddit kurallarını getir
- * @route GET /api/subreddits/:subredditName/rules
- * @access Public
+ * @desc    Subreddit kurallarını getir
+ * @route   GET /api/subreddits/:subredditId/rules
+ * @access  Public
  */
-const getRules = async (req, res) => {
-  try {
-    const { subredditName } = req.params;
+const getSubredditRules = asyncHandler(async (req, res, next) => {
+  const { subredditId } = req.params;
 
-    // Subreddit'i bul
-    const subreddit = await Subreddit.findOne({ name: subredditName });
-
-    if (!subreddit) {
-      return res.status(404).json({
-        success: false,
-        message: 'Subreddit bulunamadı',
-      });
-    }
-
-    // Kuralları getir
-    const rules = await SubredditRule.find({ subreddit: subreddit._id }).sort({
-      order: 1,
-      createdAt: 1,
-    });
-
-    res.status(200).json({
-      success: true,
-      count: rules.length,
-      data: rules,
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Kurallar getirilirken bir hata oluştu',
-      error: error.message,
-    });
+  if (!mongoose.Types.ObjectId.isValid(subredditId)) {
+    return next(new ErrorResponse('Geçersiz subreddit ID formatı', 400));
   }
-};
 
-/**
- * Subreddit kuralı oluştur
- * @route POST /api/subreddits/:subredditName/rules
- * @access Private/Moderator
- */
-const createRule = async (req, res) => {
-  try {
-    const { subredditName } = req.params;
-    const { title, description, appliesTo, reportReason, isRemovalReason } = req.body;
-    const userId = req.user._id;
-
-    // Subreddit'i bul
-    const subreddit = await Subreddit.findOne({ name: subredditName });
-
-    if (!subreddit) {
-      return res.status(404).json({
-        success: false,
-        message: 'Subreddit bulunamadı',
-      });
-    }
-
-    // Kullanıcının moderatör olup olmadığını kontrol et
-    const isModerator = await isUserModerator(userId, subreddit._id);
-    if (!isModerator) {
-      return res.status(403).json({
-        success: false,
-        message: 'Bu işlem için moderatör yetkiniz bulunmamaktadır',
-      });
-    }
-
-    // Mevcut kural sayısını kontrol et
-    const rulesCount = await SubredditRule.countDocuments({ subreddit: subreddit._id });
-
-    if (rulesCount >= 15) {
-      return res.status(400).json({
-        success: false,
-        message: 'Bir subreddit en fazla 15 kurala sahip olabilir',
-      });
-    }
-
-    // Yeni kural oluştur
-    const newRule = await SubredditRule.create({
-      subreddit: subreddit._id,
-      title,
-      description,
-      appliesTo: appliesTo || 'posts_and_comments',
-      reportReason: reportReason || title,
-      isRemovalReason: isRemovalReason || false,
-      createdBy: userId,
-      order: rulesCount + 1,
-    });
-
-    // Mod log oluştur
-    await ModLog.create({
-      subreddit: subreddit._id,
-      moderator: userId,
-      action: 'rule_create',
-      details: `Created rule: ${title}`,
-    });
-
-    res.status(201).json({
-      success: true,
-      message: 'Kural başarıyla oluşturuldu',
-      data: newRule,
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Kural oluşturulurken bir hata oluştu',
-      error: error.message,
-    });
+  // Subreddit'in var olduğunu kontrol et
+  const subreddit = await Subreddit.findById(subredditId);
+  if (!subreddit) {
+    return next(new ErrorResponse('Subreddit bulunamadı', 404));
   }
-};
+
+  // Kuralları pozisyona göre sıralanmış olarak getir
+  const rules = await SubredditRule.find({ subreddit: subredditId })
+    .sort({ position: 1 })
+    .populate('createdBy', 'username')
+    .populate('updatedBy', 'username');
+
+  res.status(200).json({
+    success: true,
+    count: rules.length,
+    data: rules,
+  });
+});
 
 /**
- * Subreddit kuralını güncelle
- * @route PUT /api/subreddits/:subredditName/rules/:ruleId
- * @access Private/Moderator
+ * @desc    Bir subreddit kuralını ID'ye göre getir
+ * @route   GET /api/subreddits/:subredditId/rules/:id
+ * @access  Public
  */
-const updateRule = async (req, res) => {
-  try {
-    const { subredditName, ruleId } = req.params;
-    const { title, description, appliesTo, reportReason, isRemovalReason, order } = req.body;
-    const userId = req.user._id;
+const getSubredditRule = asyncHandler(async (req, res, next) => {
+  const { id, subredditId } = req.params;
 
-    // Subreddit'i bul
-    const subreddit = await Subreddit.findOne({ name: subredditName });
+  if (!mongoose.Types.ObjectId.isValid(id) || !mongoose.Types.ObjectId.isValid(subredditId)) {
+    return next(new ErrorResponse('Geçersiz ID formatı', 400));
+  }
 
-    if (!subreddit) {
-      return res.status(404).json({
-        success: false,
-        message: 'Subreddit bulunamadı',
-      });
-    }
+  // Kuralı bul ve yaratıcı/düzenleyicileri popüle et
+  const rule = await SubredditRule.findOne({
+    _id: id,
+    subreddit: subredditId,
+  })
+    .populate('createdBy', 'username')
+    .populate('updatedBy', 'username')
+    .populate('subreddit', 'name title');
 
-    // Kullanıcının moderatör olup olmadığını kontrol et
-    const isModerator = await isUserModerator(userId, subreddit._id);
-    if (!isModerator) {
-      return res.status(403).json({
-        success: false,
-        message: 'Bu işlem için moderatör yetkiniz bulunmamaktadır',
-      });
-    }
+  if (!rule) {
+    return next(new ErrorResponse('Kural bulunamadı', 404));
+  }
 
-    // Kuralı bul
-    const rule = await SubredditRule.findOne({
-      _id: ruleId,
-      subreddit: subreddit._id,
-    });
+  res.status(200).json({
+    success: true,
+    data: rule,
+  });
+});
 
-    if (!rule) {
-      return res.status(404).json({
-        success: false,
-        message: 'Kural bulunamadı',
-      });
-    }
+/**
+ * @desc    Yeni subreddit kuralı oluştur
+ * @route   POST /api/subreddits/:subredditId/rules
+ * @access  Private (Moderator/Admin)
+ */
+const createSubredditRule = asyncHandler(async (req, res, next) => {
+  const { subredditId } = req.params;
+  const userId = req.user._id;
 
-    // Güncellenecek alanları belirle
-    const updateData = {};
-    if (title !== undefined) updateData.title = title;
-    if (description !== undefined) updateData.description = description;
-    if (appliesTo !== undefined) updateData.appliesTo = appliesTo;
-    if (reportReason !== undefined) updateData.reportReason = reportReason;
-    if (isRemovalReason !== undefined) updateData.isRemovalReason = isRemovalReason;
-    if (order !== undefined) updateData.order = order;
+  if (!mongoose.Types.ObjectId.isValid(subredditId)) {
+    return next(new ErrorResponse('Geçersiz subreddit ID formatı', 400));
+  }
 
-    updateData.updatedAt = Date.now();
-    updateData.updatedBy = userId;
+  // Subreddit'in var olduğunu kontrol et
+  const subreddit = await Subreddit.findById(subredditId);
+  if (!subreddit) {
+    return next(new ErrorResponse('Subreddit bulunamadı', 404));
+  }
 
-    // Kuralı güncelle
-    const updatedRule = await SubredditRule.findByIdAndUpdate(ruleId, updateData, {
+  // Moderatör/Admin yetkisi kontrol et
+  const isModerator = await checkModeratorPermission(userId, subredditId);
+  if (!isModerator) {
+    return next(new ErrorResponse('Bu işlem için moderatör yetkisi gerekiyor', 403));
+  }
+
+  // En son pozisyonu bul
+  const lastRule = await SubredditRule.findOne({ subreddit: subredditId }).sort('-position');
+
+  const nextPosition = lastRule ? lastRule.position + 1 : 0;
+
+  // Kuralı oluştur
+  const rule = await SubredditRule.create({
+    ...req.body,
+    subreddit: subredditId,
+    createdBy: userId,
+    position: nextPosition,
+  });
+
+  res.status(201).json({
+    success: true,
+    data: rule,
+  });
+});
+
+/**
+ * @desc    Subreddit kuralını güncelle
+ * @route   PUT /api/subreddits/:subredditId/rules/:id
+ * @access  Private (Moderator/Admin)
+ */
+const updateSubredditRule = asyncHandler(async (req, res, next) => {
+  const { id, subredditId } = req.params;
+  const userId = req.user._id;
+
+  if (!mongoose.Types.ObjectId.isValid(id) || !mongoose.Types.ObjectId.isValid(subredditId)) {
+    return next(new ErrorResponse('Geçersiz ID formatı', 400));
+  }
+
+  // Moderatör/Admin yetkisi kontrol et
+  const isModerator = await checkModeratorPermission(userId, subredditId);
+  if (!isModerator) {
+    return next(new ErrorResponse('Bu işlem için moderatör yetkisi gerekiyor', 403));
+  }
+
+  // Güncelleme alanlarını hazırla, pozisyon değişimi hariç
+  const updateFields = { ...req.body, updatedBy: userId };
+
+  // Pozisyon elle değiştirilemez, bunun için özel endpoint kullanılmalı
+  if ('position' in updateFields) {
+    delete updateFields.position;
+  }
+
+  // Kuralı güncelle
+  const rule = await SubredditRule.findOneAndUpdate(
+    { _id: id, subreddit: subredditId },
+    updateFields,
+    {
       new: true,
       runValidators: true,
-    });
+    },
+  );
 
-    // Mod log oluştur
-    await ModLog.create({
-      subreddit: subreddit._id,
-      moderator: userId,
-      action: 'rule_update',
-      details: `Updated rule: ${rule.title}`,
-    });
-
-    res.status(200).json({
-      success: true,
-      message: 'Kural başarıyla güncellendi',
-      data: updatedRule,
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Kural güncellenirken bir hata oluştu',
-      error: error.message,
-    });
+  if (!rule) {
+    return next(new ErrorResponse('Kural bulunamadı', 404));
   }
-};
+
+  res.status(200).json({
+    success: true,
+    data: rule,
+  });
+});
 
 /**
- * Subreddit kuralını sil
- * @route DELETE /api/subreddits/:subredditName/rules/:ruleId
- * @access Private/Moderator
+ * @desc    Subreddit kuralını sil
+ * @route   DELETE /api/subreddits/:subredditId/rules/:id
+ * @access  Private (Moderator/Admin)
  */
-const deleteRule = async (req, res) => {
-  try {
-    const { subredditName, ruleId } = req.params;
-    const userId = req.user._id;
+const deleteSubredditRule = asyncHandler(async (req, res, next) => {
+  const { id, subredditId } = req.params;
+  const userId = req.user._id;
 
-    // Subreddit'i bul
-    const subreddit = await Subreddit.findOne({ name: subredditName });
+  if (!mongoose.Types.ObjectId.isValid(id) || !mongoose.Types.ObjectId.isValid(subredditId)) {
+    return next(new ErrorResponse('Geçersiz ID formatı', 400));
+  }
 
-    if (!subreddit) {
-      return res.status(404).json({
-        success: false,
-        message: 'Subreddit bulunamadı',
-      });
-    }
+  // Moderatör/Admin yetkisi kontrol et
+  const isModerator = await checkModeratorPermission(userId, subredditId);
+  if (!isModerator) {
+    return next(new ErrorResponse('Bu işlem için moderatör yetkisi gerekiyor', 403));
+  }
 
-    // Kullanıcının moderatör olup olmadığını kontrol et
-    const isModerator = await isUserModerator(userId, subreddit._id);
-    if (!isModerator) {
-      return res.status(403).json({
-        success: false,
-        message: 'Bu işlem için moderatör yetkiniz bulunmamaktadır',
-      });
-    }
+  // Kuralı bul
+  const rule = await SubredditRule.findOne({ _id: id, subreddit: subredditId });
+  if (!rule) {
+    return next(new ErrorResponse('Kural bulunamadı', 404));
+  }
 
-    // Kuralı bul
-    const rule = await SubredditRule.findOne({
-      _id: ruleId,
-      subreddit: subreddit._id,
-    });
+  // Kuralı sil
+  await rule.remove();
 
-    if (!rule) {
-      return res.status(404).json({
-        success: false,
-        message: 'Kural bulunamadı',
-      });
-    }
+  // Kalan kuralların pozisyonunu yeniden düzenle
+  await reorderRules(subredditId);
 
-    // Kuralı sil
-    await rule.remove();
+  res.status(200).json({
+    success: true,
+    data: {},
+  });
+});
 
-    // Kalan kuralların sırasını güncelle
-    await SubredditRule.updateMany(
-      { subreddit: subreddit._id, order: { $gt: rule.order } },
-      { $inc: { order: -1 } },
+/**
+ * @desc    Subreddit kuralının pozisyonunu değiştir
+ * @route   PUT /api/subreddits/:subredditId/rules/:id/position
+ * @access  Private (Moderator/Admin)
+ */
+const changeRulePosition = asyncHandler(async (req, res, next) => {
+  const { id, subredditId } = req.params;
+  const { newPosition } = req.body;
+  const userId = req.user._id;
+
+  if (!mongoose.Types.ObjectId.isValid(id) || !mongoose.Types.ObjectId.isValid(subredditId)) {
+    return next(new ErrorResponse('Geçersiz ID formatı', 400));
+  }
+
+  if (typeof newPosition !== 'number' || newPosition < 0) {
+    return next(new ErrorResponse('Geçersiz pozisyon değeri', 400));
+  }
+
+  // Moderatör/Admin yetkisi kontrol et
+  const isModerator = await checkModeratorPermission(userId, subredditId);
+  if (!isModerator) {
+    return next(new ErrorResponse('Bu işlem için moderatör yetkisi gerekiyor', 403));
+  }
+
+  // Kuralı bul
+  const rule = await SubredditRule.findOne({ _id: id, subreddit: subredditId });
+  if (!rule) {
+    return next(new ErrorResponse('Kural bulunamadı', 404));
+  }
+
+  // Tüm kuralları al
+  const allRules = await SubredditRule.find({ subreddit: subredditId }).sort({ position: 1 });
+
+  // Geçerli bir pozisyon değeri olduğunu kontrol et
+  if (newPosition >= allRules.length) {
+    return next(
+      new ErrorResponse(`Pozisyon değeri 0 ile ${allRules.length - 1} arasında olmalıdır`, 400),
     );
+  }
 
-    // Mod log oluştur
-    await ModLog.create({
-      subreddit: subreddit._id,
-      moderator: userId,
-      action: 'rule_delete',
-      details: `Deleted rule: ${rule.title}`,
-    });
-
-    res.status(200).json({
+  // Eğer zaten istenen pozisyondaysa işlem yapma
+  if (rule.position === newPosition) {
+    return res.status(200).json({
       success: true,
-      message: 'Kural başarıyla silindi',
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Kural silinirken bir hata oluştu',
-      error: error.message,
+      data: rule,
     });
   }
-};
 
-/**
- * Kuralların sırasını güncelle
- * @route PUT /api/subreddits/:subredditName/rules/reorder
- * @access Private/Moderator
- */
-const reorderRules = async (req, res) => {
-  try {
-    const { subredditName } = req.params;
-    const { ruleOrders } = req.body; // { ruleId: order } şeklinde bir obje
-    const userId = req.user._id;
+  // Sürükleme yönünü belirle
+  const isMovingDown = newPosition > rule.position;
 
-    if (!ruleOrders || typeof ruleOrders !== 'object') {
-      return res.status(400).json({
-        success: false,
-        message: 'Geçersiz kural sıralaması gönderildi',
-      });
-    }
-
-    // Subreddit'i bul
-    const subreddit = await Subreddit.findOne({ name: subredditName });
-
-    if (!subreddit) {
-      return res.status(404).json({
-        success: false,
-        message: 'Subreddit bulunamadı',
-      });
-    }
-
-    // Kullanıcının moderatör olup olmadığını kontrol et
-    const isModerator = await isUserModerator(userId, subreddit._id);
-    if (!isModerator) {
-      return res.status(403).json({
-        success: false,
-        message: 'Bu işlem için moderatör yetkiniz bulunmamaktadır',
-      });
-    }
-
-    // Her kural için sırayı güncelle
-    const updatePromises = Object.entries(ruleOrders).map(([ruleId, order]) => {
-      return SubredditRule.findOneAndUpdate(
-        { _id: ruleId, subreddit: subreddit._id },
-        { order, updatedAt: Date.now(), updatedBy: userId },
-        { new: true },
-      );
-    });
-
-    await Promise.all(updatePromises);
-
-    // Tüm kuralları alıp güncel sırayla döndür
-    const updatedRules = await SubredditRule.find({ subreddit: subreddit._id }).sort({ order: 1 });
-
-    // Mod log oluştur
-    await ModLog.create({
-      subreddit: subreddit._id,
-      moderator: userId,
-      action: 'rules_reorder',
-      details: 'Reordered subreddit rules',
-    });
-
-    res.status(200).json({
-      success: true,
-      message: 'Kural sıralaması başarıyla güncellendi',
-      data: updatedRules,
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Kural sıralaması güncellenirken bir hata oluştu',
-      error: error.message,
-    });
+  // Diğer kuralların pozisyonlarını güncelle
+  if (isMovingDown) {
+    // Aşağı taşınıyorsa, arada kalan kuralları bir yukarı kaydır
+    await SubredditRule.updateMany(
+      {
+        subreddit: subredditId,
+        position: { $gt: rule.position, $lte: newPosition },
+      },
+      { $inc: { position: -1 } },
+    );
+  } else {
+    // Yukarı taşınıyorsa, arada kalan kuralları bir aşağı kaydır
+    await SubredditRule.updateMany(
+      {
+        subreddit: subredditId,
+        position: { $lt: rule.position, $gte: newPosition },
+      },
+      { $inc: { position: 1 } },
+    );
   }
-};
+
+  // Kuralın yeni pozisyonunu ayarla
+  rule.position = newPosition;
+  rule.updatedBy = userId;
+  await rule.save();
+
+  res.status(200).json({
+    success: true,
+    data: rule,
+  });
+});
 
 /**
- * Kullanıcının moderatör olup olmadığını kontrol et
- * @param {ObjectId} userId
- * @param {ObjectId} subredditId
- * @returns {Promise<Boolean>}
+ * @desc    Subreddit'teki tüm kuralları getirme (rapor nedeni olarak işaretlenmiş)
+ * @route   GET /api/subreddits/:subredditId/rules/report-reasons
+ * @access  Public
  */
-const isUserModerator = async (userId, subredditId) => {
+const getReportReasons = asyncHandler(async (req, res, next) => {
+  const { subredditId } = req.params;
+  const { type } = req.query; // 'posts', 'comments', veya her ikisi
+
+  if (!mongoose.Types.ObjectId.isValid(subredditId)) {
+    return next(new ErrorResponse('Geçersiz subreddit ID formatı', 400));
+  }
+
+  // Filtreleme kriterlerini oluştur
+  const filter = {
+    subreddit: subredditId,
+    reportReason: true,
+  };
+
+  // Eğer tip belirtilmişse, appliesTo alanına göre filtrele
+  if (type === 'posts' || type === 'comments') {
+    filter.$or = [{ appliesTo: type }, { appliesTo: 'both' }];
+  }
+
+  // Rapor nedeni olarak işaretlenmiş kuralları getir
+  const rules = await SubredditRule.find(filter)
+    .sort({ position: 1 })
+    .select('title description appliesTo position');
+
+  res.status(200).json({
+    success: true,
+    count: rules.length,
+    data: rules,
+  });
+});
+
+/**
+ * @desc    Kuralları yeniden düzenle (pozisyonlarını sıfırla)
+ * @route   POST /api/subreddits/:subredditId/rules/reorder
+ * @access  Private (Moderator/Admin)
+ */
+const reorderAllRules = asyncHandler(async (req, res, next) => {
+  const { subredditId } = req.params;
+  const userId = req.user._id;
+
+  if (!mongoose.Types.ObjectId.isValid(subredditId)) {
+    return next(new ErrorResponse('Geçersiz subreddit ID formatı', 400));
+  }
+
+  // Moderatör/Admin yetkisi kontrol et
+  const isModerator = await checkModeratorPermission(userId, subredditId);
+  if (!isModerator) {
+    return next(new ErrorResponse('Bu işlem için moderatör yetkisi gerekiyor', 403));
+  }
+
+  // Kuralları yeniden sırala
+  await reorderRules(subredditId);
+
+  // Güncellenmiş kuralları getir
+  const rules = await SubredditRule.find({ subreddit: subredditId }).sort({ position: 1 });
+
+  // ... continued from previous code
+
+  res.status(200).json({
+    success: true,
+    message: 'Kurallar başarıyla yeniden sıralandı',
+    count: rules.length,
+    data: rules,
+  });
+});
+
+// ==================== YARDIMCI FONKSİYONLAR ====================
+
+/**
+ * Moderatör yetkisini kontrol et
+ * @param {ObjectId} userId - Kullanıcı ID
+ * @param {ObjectId} subredditId - Subreddit ID
+ * @returns {Promise<Boolean>} Moderatör yetkisi varsa true
+ */
+const checkModeratorPermission = async (userId, subredditId) => {
+  // Admin her zaman yetkilidir
+  const user = await mongoose.model('User').findById(userId);
+  if (user && user.role === 'admin') {
+    return true;
+  }
+
+  // Subreddit moderatörü mü kontrol et
   const membership = await SubredditMembership.findOne({
     user: userId,
     subreddit: subredditId,
-    status: { $in: ['moderator', 'admin'] },
+    type: { $in: ['moderator', 'admin'] },
+    status: 'active',
   });
 
   return !!membership;
 };
 
+/**
+ * Subreddit kurallarını yeniden sırala
+ * @param {ObjectId} subredditId - Subreddit ID
+ */
+const reorderRules = async (subredditId) => {
+  // Tüm kuralları al
+  const rules = await SubredditRule.find({ subreddit: subredditId }).sort({ position: 1 });
+
+  // Her kurala sırayla yeni pozisyon ver
+  const updateOperations = rules.map((rule, index) => ({
+    updateOne: {
+      filter: { _id: rule._id },
+      update: { position: index },
+    },
+  }));
+
+  if (updateOperations.length > 0) {
+    await SubredditRule.bulkWrite(updateOperations);
+  }
+};
+
+/**
+ * @desc    Bir kural birden çok subreddit'e kopyala
+ * @route   POST /api/subreddits/:subredditId/rules/:id/copy
+ * @access  Private (Admin)
+ */
+const copyRuleToSubreddits = asyncHandler(async (req, res, next) => {
+  const { id, subredditId } = req.params;
+  const { targetSubreddits } = req.body;
+  const userId = req.user._id;
+
+  if (!mongoose.Types.ObjectId.isValid(id) || !mongoose.Types.ObjectId.isValid(subredditId)) {
+    return next(new ErrorResponse('Geçersiz ID formatı', 400));
+  }
+
+  // Admin yetkisi kontrol et
+  const user = await mongoose.model('User').findById(userId);
+  if (!user || user.role !== 'admin') {
+    return next(new ErrorResponse('Bu işlem için admin yetkisi gerekiyor', 403));
+  }
+
+  // Hedef subreddit'lerin geçerli olduğunu kontrol et
+  if (!Array.isArray(targetSubreddits) || targetSubreddits.length === 0) {
+    return next(new ErrorResponse('Geçerli hedef subreddit listesi gerekiyor', 400));
+  }
+
+  // Orijinal kuralı bul
+  const rule = await SubredditRule.findOne({ _id: id, subreddit: subredditId });
+  if (!rule) {
+    return next(new ErrorResponse('Kural bulunamadı', 404));
+  }
+
+  // Her hedef subreddit için kuralı kopyala
+  const results = {
+    success: [],
+    failed: [],
+  };
+
+  for (const targetId of targetSubreddits) {
+    if (!mongoose.Types.ObjectId.isValid(targetId)) {
+      results.failed.push({ id: targetId, error: 'Geçersiz ID formatı' });
+      continue;
+    }
+
+    try {
+      // Hedef subreddit'in var olduğunu kontrol et
+      const targetSubreddit = await Subreddit.findById(targetId);
+      if (!targetSubreddit) {
+        results.failed.push({ id: targetId, error: 'Subreddit bulunamadı' });
+        continue;
+      }
+
+      // Mevcut son pozisyonu bul
+      const lastRule = await SubredditRule.findOne({ subreddit: targetId }).sort('-position');
+
+      const nextPosition = lastRule ? lastRule.position + 1 : 0;
+
+      // Kuralı kopyala
+      const newRule = await SubredditRule.create({
+        subreddit: targetId,
+        title: rule.title,
+        description: rule.description,
+        appliesTo: rule.appliesTo,
+        reportReason: rule.reportReason,
+        createdBy: userId,
+        position: nextPosition,
+      });
+
+      results.success.push({
+        id: targetId,
+        name: targetSubreddit.name,
+        rule: newRule._id,
+      });
+    } catch (error) {
+      results.failed.push({
+        id: targetId,
+        error: error.message || 'Kopyalama sırasında hata oluştu',
+      });
+    }
+  }
+
+  res.status(200).json({
+    success: true,
+    data: results,
+  });
+});
+
+/**
+ * @desc    Kuralları sıralama sırasını değiştir (sürükle & bırak için)
+ * @route   PUT /api/subreddits/:subredditId/rules/reorder-batch
+ * @access  Private (Moderator/Admin)
+ */
+const reorderRulesBatch = asyncHandler(async (req, res, next) => {
+  const { subredditId } = req.params;
+  const { ruleOrder } = req.body;
+  const userId = req.user._id;
+
+  if (!mongoose.Types.ObjectId.isValid(subredditId)) {
+    return next(new ErrorResponse('Geçersiz subreddit ID formatı', 400));
+  }
+
+  // Moderatör/Admin yetkisi kontrol et
+  const isModerator = await checkModeratorPermission(userId, subredditId);
+  if (!isModerator) {
+    return next(new ErrorResponse('Bu işlem için moderatör yetkisi gerekiyor', 403));
+  }
+
+  // Giriş verilerini doğrula
+  if (!Array.isArray(ruleOrder)) {
+    return next(new ErrorResponse('Kural sırası array olarak verilmelidir', 400));
+  }
+
+  // Tüm kuralları al
+  const existingRules = await SubredditRule.find({ subreddit: subredditId });
+
+  // Tüm kuralların var olduğundan emin ol
+  if (ruleOrder.length !== existingRules.length) {
+    return next(new ErrorResponse('Verilen kural sırası mevcut tüm kuralları içermelidir', 400));
+  }
+
+  // Her kurala yeni pozisyon ver
+  const updateOperations = ruleOrder.map((ruleId, index) => {
+    if (!mongoose.Types.ObjectId.isValid(ruleId)) {
+      throw new Error(`Geçersiz kural ID formatı: ${ruleId}`);
+    }
+
+    // Bu ID'nin mevcut kurallar arasında olduğunu kontrol et
+    const ruleExists = existingRules.some((rule) => rule._id.toString() === ruleId);
+    if (!ruleExists) {
+      throw new Error(`Kural bulunamadı: ${ruleId}`);
+    }
+
+    return {
+      updateOne: {
+        filter: { _id: ruleId, subreddit: subredditId },
+        update: { position: index, updatedBy: userId },
+      },
+    };
+  });
+
+  // Toplu güncelleme işlemini gerçekleştir
+  await SubredditRule.bulkWrite(updateOperations);
+
+  // Güncellenmiş kuralları getir
+  const rules = await SubredditRule.find({ subreddit: subredditId }).sort({ position: 1 });
+
+  res.status(200).json({
+    success: true,
+    message: 'Kurallar başarıyla yeniden sıralandı',
+    count: rules.length,
+    data: rules,
+  });
+});
+
 module.exports = {
-  getRules,
-  createRule,
-  updateRule,
-  deleteRule,
-  reorderRules,
+  getSubredditRules,
+  getSubredditRule,
+  createSubredditRule,
+  updateSubredditRule,
+  deleteSubredditRule,
+  changeRulePosition,
+  getReportReasons,
+  reorderAllRules,
+  copyRuleToSubreddits,
+  reorderRulesBatch,
 };

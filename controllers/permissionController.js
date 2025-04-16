@@ -1,1589 +1,1243 @@
-const { Permission, User, Role, Subreddit, SubredditMembership, ModLog } = require('../models');
+
+const Permission = require('../models/Permission');
+const Role = require('../models/Role');
+const User = require('../models/User');
+const UserRoleAssignment = require('../models/UserRoleAssignment');
+const Subreddit = require('../models/Subreddit');
+const SubredditMembership = require('../models/SubredditMembership');
+
+
+
+const asyncHandler = require('../middleware/async');
+const ErrorResponse = require('../utils/errorResponse');
 const mongoose = require('mongoose');
 
 /**
- * @desc    İzin bilgilerini getir
- * @route   GET /api/permissions/:permissionId
- * @access  Private/Admin
- */
-const getPermissionById = async (req, res) => {
-  try {
-    const { permissionId } = req.params;
-
-    if (!mongoose.Types.ObjectId.isValid(permissionId)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Geçersiz izin ID formatı',
-      });
-    }
-
-    // Yetki kontrolü
-    if (req.user.role !== 'admin') {
-      return res.status(403).json({
-        success: false,
-        message: 'Bu bilgilere erişmek için admin yetkileri gerekiyor',
-      });
-    }
-
-    const permission = await Permission.findById(permissionId);
-
-    if (!permission) {
-      return res.status(404).json({
-        success: false,
-        message: 'İzin bulunamadı',
-      });
-    }
-
-    res.status(200).json({
-      success: true,
-      data: permission,
-    });
-  } catch (error) {
-    console.error('Get permission error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'İzin bilgisi getirilirken bir hata oluştu',
-      error: error.message,
-    });
-  }
-};
-
-/**
- * @desc    Tüm izinleri getir
+ * @desc    Tüm izinleri listele
  * @route   GET /api/permissions
- * @access  Private/Admin
+ * @access  Private (Admin)
  */
-const getAllPermissions = async (req, res) => {
-  try {
-    // Yetki kontrolü
-    if (req.user.role !== 'admin') {
-      return res.status(403).json({
-        success: false,
-        message: 'Bu bilgilere erişmek için admin yetkileri gerekiyor',
-      });
-    }
+const getPermissions = asyncHandler(async (req, res, next) => {
+  const { category, scope, isSystem, search } = req.query;
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 50;
+  const skip = (page - 1) * limit;
 
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 50;
-    const skip = (page - 1) * limit;
-    const search = req.query.search || '';
-    const type = req.query.type;
-    const scope = req.query.scope;
-
-    // Filtre oluştur
-    let filter = {};
-
-    if (search) {
-      filter.$or = [
-        { name: { $regex: search, $options: 'i' } },
-        { description: { $regex: search, $options: 'i' } },
-      ];
-    }
-
-    if (type) {
-      filter.type = type;
-    }
-
-    if (scope) {
-      filter.scope = scope;
-    }
-
-    // İzinleri getir
-    const permissions = await Permission.find(filter)
-      .sort({ scope: 1, type: 1, name: 1 })
-      .skip(skip)
-      .limit(limit);
-
-    const totalPermissions = await Permission.countDocuments(filter);
-
-    res.status(200).json({
-      success: true,
-      count: permissions.length,
-      total: totalPermissions,
-      totalPages: Math.ceil(totalPermissions / limit),
-      currentPage: page,
-      data: permissions,
-    });
-  } catch (error) {
-    console.error('Get all permissions error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'İzinler getirilirken bir hata oluştu',
-      error: error.message,
-    });
+  // Yetki kontrolü
+  if (req.user.role !== 'admin') {
+    return next(new ErrorResponse('Bu işlem için admin yetkiniz yok', 403));
   }
-};
+
+  // Sorgu filtresi oluştur
+  const filter = {};
+
+  if (category) {
+    filter.category = category;
+  }
+
+  if (scope) {
+    filter.scope = scope;
+  }
+
+  if (isSystem !== undefined) {
+    filter.isSystem = isSystem === 'true';
+  }
+
+  if (search) {
+    filter.$or = [
+      { name: { $regex: search, $options: 'i' } },
+      { description: { $regex: search, $options: 'i' } }
+    ];
+  }
+
+  // Toplam izin sayısı
+  const total = await Permission.countDocuments(filter);
+
+  // İzinleri getir
+  const permissions = await Permission.find(filter)
+    .sort({ category: 1, name: 1 })
+    .skip(skip)
+    .limit(limit);
+
+  res.status(200).json({
+    success: true,
+    count: permissions.length,
+    total,
+    pagination: {
+      page,
+      limit,
+      pages: Math.ceil(total / limit)
+    },
+    data: permissions
+  });
+});
 
 /**
- * @desc    Yeni izin oluştur
- * @route   POST /api/permissions
- * @access  Private/Admin
+ * @desc    Tek bir izni getir
+ * @route   GET /api/permissions/:id
+ * @access  Private (Admin)
  */
-const createPermission = async (req, res) => {
-  try {
-    // Yetki kontrolü
-    if (req.user.role !== 'admin') {
-      return res.status(403).json({
-        success: false,
-        message: 'Bu işlem için admin yetkileri gerekiyor',
-      });
-    }
+const getPermission = asyncHandler(async (req, res, next) => {
+  const { id } = req.params;
 
-    const { name, description, type, scope, resource, action, defaultRoles, subreddit } = req.body;
-
-    // Eksik alan kontrolü
-    if (!name || !type || !scope || !action) {
-      return res.status(400).json({
-        success: false,
-        message: 'Lütfen gerekli tüm alanları doldurun: name, type, scope, action',
-      });
-    }
-
-    // Subreddit izni için subreddit ID kontrolü
-    if (scope === 'subreddit' && !subreddit) {
-      return res.status(400).json({
-        success: false,
-        message: 'Subreddit kapsamlı izinler için subreddit ID gereklidir',
-      });
-    }
-
-    if (subreddit && !mongoose.Types.ObjectId.isValid(subreddit)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Geçersiz subreddit ID formatı',
-      });
-    }
-
-    // Aynı isimde izin var mı kontrol et
-    const existingPermission = await Permission.findOne({
-      name,
-      scope,
-      subreddit: scope === 'subreddit' ? subreddit : null,
-    });
-
-    if (existingPermission) {
-      return res.status(400).json({
-        success: false,
-        message: 'Bu isimde ve kapsamda bir izin zaten mevcut',
-      });
-    }
-
-    // İzni oluştur
-    const permission = await Permission.create({
-      name,
-      description,
-      type,
-      scope,
-      resource,
-      action,
-      defaultRoles: defaultRoles || [],
-      subreddit: scope === 'subreddit' ? subreddit : null,
-      createdBy: req.user._id,
-    });
-
-    // Eğer default roller belirtilmişse, bu izni rollere ekle
-    if (defaultRoles && defaultRoles.length > 0) {
-      await Role.updateMany(
-        { name: { $in: defaultRoles } },
-        { $addToSet: { permissions: permission._id } },
-      );
-    }
-
-    res.status(201).json({
-      success: true,
-      message: 'İzin başarıyla oluşturuldu',
-      data: permission,
-    });
-  } catch (error) {
-    console.error('Create permission error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'İzin oluşturulurken bir hata oluştu',
-      error: error.message,
-    });
+  // Yetki kontrolü
+  if (req.user.role !== 'admin') {
+    return next(new ErrorResponse('Bu işlem için admin yetkiniz yok', 403));
   }
-};
+
+  // ID formatı kontrolü
+  if (!mongoose.Types.ObjectId.isValid(id)) {
+    return next(new ErrorResponse('Geçersiz izin ID formatı', 400));
+  }
+
+  // İzni bul
+  const permission = await Permission.findById(id);
+
+  if (!permission) {
+    return next(new ErrorResponse('İzin bulunamadı', 404));
+  }
+
+  // İzne sahip rolleri bul
+  const roles = await Role.find({ permissions: id }).select('name description scope');
+
+  res.status(200).json({
+    success: true,
+    data: {
+      permission,
+      roles
+    }
+  });
+});
+
+/**
+ * @desc    Yeni bir izin oluştur
+ * @route   POST /api/permissions
+ * @access  Private (Admin)
+ */
+const createPermission = asyncHandler(async (req, res, next) => {
+  const { name, description, category, scope, isSystem } = req.body;
+
+  // Yetki kontrolü
+  if (req.user.role !== 'admin') {
+    return next(new ErrorResponse('Bu işlem için admin yetkiniz yok', 403));
+  }
+
+  // Zorunlu alanları kontrol et
+  if (!name || !description || !category || !scope) {
+    return next(new ErrorResponse('Lütfen tüm zorunlu alanları doldurun', 400));
+  }
+
+  // İzin adı benzersiz mi kontrol et
+  const existingPermission = await Permission.findOne({ name });
+
+  if (existingPermission) {
+    return next(new ErrorResponse('Bu isimde bir izin zaten mevcut', 400));
+  }
+
+  // İzni oluştur
+  const permission = await Permission.create({
+    name,
+    description,
+    category,
+    scope,
+    isSystem: isSystem || false
+  });
+
+  res.status(201).json({
+    success: true,
+    data: permission
+  });
+});
 
 /**
  * @desc    İzni güncelle
- * @route   PUT /api/permissions/:permissionId
- * @access  Private/Admin
+ * @route   PUT /api/permissions/:id
+ * @access  Private (Admin)
  */
-const updatePermission = async (req, res) => {
-  try {
-    const { permissionId } = req.params;
+const updatePermission = asyncHandler(async (req, res, next) => {
+  const { id } = req.params;
+  const { name, description, category, scope, isSystem } = req.body;
 
-    // Yetki kontrolü
-    if (req.user.role !== 'admin') {
-      return res.status(403).json({
-        success: false,
-        message: 'Bu işlem için admin yetkileri gerekiyor',
-      });
-    }
-
-    if (!mongoose.Types.ObjectId.isValid(permissionId)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Geçersiz izin ID formatı',
-      });
-    }
-
-    const { name, description, type, scope, resource, action, defaultRoles, subreddit, isActive } =
-      req.body;
-
-    // İzni bul
-    const permission = await Permission.findById(permissionId);
-
-    if (!permission) {
-      return res.status(404).json({
-        success: false,
-        message: 'İzin bulunamadı',
-      });
-    }
-
-    // Aynı isimde başka izin var mı kontrol et (güncellenen izin hariç)
-    if (name && name !== permission.name) {
-      const existingPermission = await Permission.findOne({
-        name,
-        scope: scope || permission.scope,
-        subreddit: scope === 'subreddit' ? subreddit || permission.subreddit : null,
-        _id: { $ne: permissionId },
-      });
-
-      if (existingPermission) {
-        return res.status(400).json({
-          success: false,
-          message: 'Bu isimde ve kapsamda bir izin zaten mevcut',
-        });
-      }
-    }
-
-    // Mevcut default rolleri sakla
-    const previousDefaultRoles = [...permission.defaultRoles];
-
-    // İzni güncelle
-    const updateFields = {};
-
-    if (name) updateFields.name = name;
-    if (description !== undefined) updateFields.description = description;
-    if (type) updateFields.type = type;
-    if (scope) updateFields.scope = scope;
-    if (resource) updateFields.resource = resource;
-    if (action) updateFields.action = action;
-    if (defaultRoles) updateFields.defaultRoles = defaultRoles;
-    if (scope === 'subreddit' && subreddit) updateFields.subreddit = subreddit;
-    if (isActive !== undefined) updateFields.isActive = isActive;
-
-    const updatedPermission = await Permission.findByIdAndUpdate(permissionId, updateFields, {
-      new: true,
-      runValidators: true,
-    });
-
-    // Default roller değiştiyse, rolleri güncelle
-    if (defaultRoles && JSON.stringify(defaultRoles) !== JSON.stringify(previousDefaultRoles)) {
-      // Eski rollerden izni kaldır (yeni listede olmayanlar)
-      const rolesToRemove = previousDefaultRoles.filter((role) => !defaultRoles.includes(role));
-
-      if (rolesToRemove.length > 0) {
-        await Role.updateMany(
-          { name: { $in: rolesToRemove } },
-          { $pull: { permissions: permissionId } },
-        );
-      }
-
-      // Yeni rollere izni ekle (eski listede olmayanlar)
-      const rolesToAdd = defaultRoles.filter((role) => !previousDefaultRoles.includes(role));
-
-      if (rolesToAdd.length > 0) {
-        await Role.updateMany(
-          { name: { $in: rolesToAdd } },
-          { $addToSet: { permissions: permissionId } },
-        );
-      }
-    }
-
-    res.status(200).json({
-      success: true,
-      message: 'İzin başarıyla güncellendi',
-      data: updatedPermission,
-    });
-  } catch (error) {
-    console.error('Update permission error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'İzin güncellenirken bir hata oluştu',
-      error: error.message,
-    });
+  // Yetki kontrolü
+  if (req.user.role !== 'admin') {
+    return next(new ErrorResponse('Bu işlem için admin yetkiniz yok', 403));
   }
-};
+
+  // ID formatı kontrolü
+  if (!mongoose.Types.ObjectId.isValid(id)) {
+    return next(new ErrorResponse('Geçersiz izin ID formatı', 400));
+  }
+
+  // İzni bul
+  let permission = await Permission.findById(id);
+
+  if (!permission) {
+    return next(new ErrorResponse('İzin bulunamadı', 404));
+  }
+
+  // Sistem izinlerinin bazı alanlarını korumak için kontrol
+  if (permission.isSystem) {
+    // Sistem izni adını değiştirmeye izin verme
+    if (name && name !== permission.name) {
+      return next(new ErrorResponse('Sistem izinlerinin adı değiştirilemez', 400));
+    }
+
+    // Sistem izni kategorisini değiştirmeye izin verme
+    if (category && category !== permission.category) {
+      return next(new ErrorResponse('Sistem izinlerinin kategorisi değiştirilemez', 400));
+    }
+
+    // Sistem izni kapsamını değiştirmeye izin verme
+    if (scope && scope !== permission.scope) {
+      return next(new ErrorResponse('Sistem izinlerinin kapsamı değiştirilemez', 400));
+    }
+  }
+
+  // İsim değiştiriliyorsa benzersizliği kontrol et
+  if (name && name !== permission.name) {
+    const existingPermission = await Permission.findOne({ name });
+
+    if (existingPermission) {
+      return next(new ErrorResponse('Bu isimde bir izin zaten mevcut', 400));
+    }
+  }
+
+  // İzni güncelle
+  permission = await Permission.findByIdAndUpdate(
+    id,
+    {
+      name: name || permission.name,
+      description: description || permission.description,
+      category: category || permission.category,
+      scope: scope || permission.scope,
+      isSystem: isSystem !== undefined ? isSystem : permission.isSystem
+    },
+    { new: true, runValidators: true }
+  );
+
+  res.status(200).json({
+    success: true,
+    data: permission
+  });
+});
 
 /**
  * @desc    İzni sil
- * @route   DELETE /api/permissions/:permissionId
- * @access  Private/Admin
+ * @route   DELETE /api/permissions/:id
+ * @access  Private (Admin)
  */
-const deletePermission = async (req, res) => {
-  try {
-    const { permissionId } = req.params;
+const deletePermission = asyncHandler(async (req, res, next) => {
+  const { id } = req.params;
 
-    // Yetki kontrolü
-    if (req.user.role !== 'admin') {
-      return res.status(403).json({
-        success: false,
-        message: 'Bu işlem için admin yetkileri gerekiyor',
-      });
-    }
-
-    if (!mongoose.Types.ObjectId.isValid(permissionId)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Geçersiz izin ID formatı',
-      });
-    }
-
-    // İzni bul
-    const permission = await Permission.findById(permissionId);
-
-    if (!permission) {
-      return res.status(404).json({
-        success: false,
-        message: 'İzin bulunamadı',
-      });
-    }
-
-    // İzni rollerde kullanan var mı kontrol et
-    const rolesUsingPermission = await Role.find({ permissions: permissionId });
-
-    if (rolesUsingPermission.length > 0) {
-      // İzni rollerden kaldır
-      await Role.updateMany(
-        { permissions: permissionId },
-        { $pull: { permissions: permissionId } },
-      );
-    }
-
-    // İzni sil
-    await Permission.findByIdAndDelete(permissionId);
-
-    res.status(200).json({
-      success: true,
-      message: 'İzin başarıyla silindi',
-    });
-  } catch (error) {
-    console.error('Delete permission error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'İzin silinirken bir hata oluştu',
-      error: error.message,
-    });
+  // Yetki kontrolü
+  if (req.user.role !== 'admin') {
+    return next(new ErrorResponse('Bu işlem için admin yetkiniz yok', 403));
   }
-};
+
+  // ID formatı kontrolü
+  if (!mongoose.Types.ObjectId.isValid(id)) {
+    return next(new ErrorResponse('Geçersiz izin ID formatı', 400));
+  }
+
+  // İzni bul
+  const permission = await Permission.findById(id);
+
+  if (!permission) {
+    return next(new ErrorResponse('İzin bulunamadı', 404));
+  }
+
+  // Sistem izinlerini silmeye izin verme
+  if (permission.isSystem) {
+    return next(new ErrorResponse('Sistem izinleri silinemez', 400));
+  }
+
+  // İlişkili rolleri kontrol et
+  const usedInRoles = await Role.findOne({ permissions: id });
+
+  if (usedInRoles) {
+    return next(new ErrorResponse('Bu izin bir veya daha fazla rol tarafından kullanılmaktadır ve silinemez', 400));
+  }
+
+  // İzni sil
+  await permission.remove();
+
+  res.status(200).json({
+    success: true,
+    data: {},
+    message: 'İzin başarıyla silindi'
+  });
+});
 
 /**
- * @desc    Kullanıcının izinlerini kontrol et
+ * @desc    İzni bir role ata
+ * @route   POST /api/permissions/:id/roles
+ * @access  Private (Admin)
+ */
+const assignPermissionToRole = asyncHandler(async (req, res, next) => {
+  const { id } = req.params;
+  const { roleId } = req.body;
+
+  // Yetki kontrolü
+  if (req.user.role !== 'admin') {
+    return next(new ErrorResponse('Bu işlem için admin yetkiniz yok', 403));
+  }
+
+  // ID formatı kontrolü
+  if (!mongoose.Types.ObjectId.isValid(id) || !mongoose.Types.ObjectId.isValid(roleId)) {
+    return next(new ErrorResponse('Geçersiz ID formatı', 400));
+  }
+
+  // İzni ve rolü bul
+  const permission = await Permission.findById(id);
+  const role = await Role.findById(roleId);
+
+  if (!permission) {
+    return next(new ErrorResponse('İzin bulunamadı', 404));
+  }
+
+  if (!role) {
+    return next(new ErrorResponse('Rol bulunamadı', 404));
+  }
+
+  // Kapsam uyumluluğunu kontrol et
+  if (permission.scope === 'site' && role.scope === 'subreddit') {
+    return next(new ErrorResponse('Site kapsamlı izin, subreddit rolüne atanamaz', 400));
+  }
+
+  if (permission.scope === 'subreddit' && role.scope === 'site') {
+    return next(new ErrorResponse('Subreddit kapsamlı izin, site rolüne atanamaz', 400));
+  }
+
+  // Rol izni zaten içeriyor mu kontrol et
+  if (role.permissions.includes(id)) {
+    return next(new ErrorResponse('Bu izin zaten role atanmış', 400));
+  }
+
+  // İzni role ekle
+  role.permissions.push(id);
+  await role.save();
+
+  res.status(200).json({
+    success: true,
+    data: role,
+    message: 'İzin başarıyla role atandı'
+  });
+});
+
+/**
+ * @desc    İzni bir rolden kaldır
+ * @route   DELETE /api/permissions/:id/roles/:roleId
+ * @access  Private (Admin)
+ */
+const removePermissionFromRole = asyncHandler(async (req, res, next) => {
+  const { id, roleId } = req.params;
+
+  // Yetki kontrolü
+  if (req.user.role !== 'admin') {
+    return next(new ErrorResponse('Bu işlem için admin yetkiniz yok', 403));
+  }
+
+  // ID formatı kontrolü
+  if (!mongoose.Types.ObjectId.isValid(id) || !mongoose.Types.ObjectId.isValid(roleId)) {
+    return next(new ErrorResponse('Geçersiz ID formatı', 400));
+  }
+
+  // İzni ve rolü bul
+  const permission = await Permission.findById(id);
+  const role = await Role.findById(roleId);
+
+  if (!permission) {
+    return next(new ErrorResponse('İzin bulunamadı', 404));
+  }
+
+  if (!role) {
+    return next(new ErrorResponse('Rol bulunamadı', 404));
+  }
+
+  // Sistem rollerin sahip olduğu sistem izinleri kaldırmaya izin verme
+  if (role.isSystem && permission.isSystem) {
+    return next(new ErrorResponse('Sistem rollerinden sistem izinleri kaldırılamaz', 400));
+  }
+
+  // Rolde izin var mı kontrol et
+  if (!role.permissions.includes(id)) {
+    return next(new ErrorResponse('Bu izin zaten rolde bulunmuyor', 400));
+  }
+
+  // İzni rolden kaldır
+  role.permissions = role.permissions.filter(p => p.toString() !== id);
+  await role.save();
+
+  res.status(200).json({
+    success: true,
+    data: role,
+    message: 'İzin başarıyla rolden kaldırıldı'
+  });
+});
+
+/**
+ * @desc    Kategoriye göre izinleri getir
+ * @route   GET /api/permissions/categories/:category
+ * @access  Private (Admin)
+ */
+const getPermissionsByCategory = asyncHandler(async (req, res, next) => {
+  const { category } = req.params;
+  const { scope } = req.query;
+
+  // Yetki kontrolü
+  if (req.user.role !== 'admin') {
+    return next(new ErrorResponse('Bu işlem için admin yetkiniz yok', 403));
+  }
+
+  // Geçerli kategori mi kontrol et
+  const validCategories = ['post', 'comment', 'user', 'subreddit', 'moderation', 'admin', 'other'];
+
+  if (!validCategories.includes(category)) {
+    return next(new ErrorResponse('Geçersiz kategori', 400));
+  }
+
+  // Sorgu filtresi oluştur
+  const filter = { category };
+
+  if (scope) {
+    filter.scope = scope;
+  }
+
+  // İzinleri getir
+  const permissions = await Permission.find(filter).sort({ name: 1 });
+
+  res.status(200).json({
+    success: true,
+    count: permissions.length,
+    data: permissions
+  });
+});
+
+/**
+ * @desc    Roller için izin şemasını getir
+ * @route   GET /api/permissions/schema
+ * @access  Private (Admin)
+ */
+const getPermissionSchema = asyncHandler(async (req, res, next) => {
+  // Yetki kontrolü
+  if (req.user.role !== 'admin') {
+    return next(new ErrorResponse('Bu işlem için admin yetkiniz yok', 403));
+  }
+
+  // Tüm izinleri kategori ve kapsama göre gruplayarak getir
+  const permissions = await Permission.find().sort({ category: 1, name: 1 });
+
+  // Kategorilere göre grupla
+  const categorizedPermissions = {};
+  const validCategories = ['post', 'comment', 'user', 'subreddit', 'moderation', 'admin', 'other'];
+
+  validCategories.forEach(category => {
+    categorizedPermissions[category] = {
+      site: permissions.filter(p => p.category === category && (p.scope === 'site' || p.scope === 'both')),
+      subreddit: permissions.filter(p => p.category === category && (p.scope === 'subreddit' || p.scope === 'both'))
+    };
+  });
+
+  // Rolleri getir
+  const roles = await Role.find().populate('permissions');
+
+  // Site ve subreddit kapsamına göre grupla
+  const rolesBySite = roles.filter(role => role.scope === 'site');
+  const rolesBySubreddit = roles.filter(role => role.scope === 'subreddit');
+
+  res.status(200).json({
+    success: true,
+    data: {
+      permissions: categorizedPermissions,
+      roles: {
+        site: rolesBySite,
+        subreddit: rolesBySubreddit
+      }
+    }
+  });
+});
+
+/**
+ * @desc    Kullanıcı izinlerini kontrol et
  * @route   GET /api/permissions/check
  * @access  Private
  */
-const checkUserPermissions = async (req, res) => {
-  try {
-    const { resource, action, subredditId } = req.query;
-    const userId = req.user._id;
+const checkUserPermissions = asyncHandler(async (req, res, next) => {
+  const userId = req.user._id;
+  const { permission, subredditId } = req.query;
 
-    if (!resource || !action) {
-      return res.status(400).json({
-        success: false,
-        message: 'Kaynak (resource) ve eylem (action) parametreleri gereklidir',
-      });
+  if (!permission) {
+    return next(new ErrorResponse('Kontrol edilecek izin belirtilmelidir', 400));
+  }
+
+  // İzin bilgisini al
+  const permissionObj = await Permission.findOne({ name: permission });
+
+  if (!permissionObj) {
+    return next(new ErrorResponse('Belirtilen izin bulunamadı', 404));
+  }
+
+  // Admin kullanıcısı tüm izinlere sahiptir
+  if (req.user.role === 'admin') {
+    return res.status(200).json({
+      success: true,
+      hasPermission: true,
+      message: 'Admin kullanıcısı tüm izinlere sahiptir'
+    });
+  }
+
+  // Subreddit kapsamlı izin için subreddit ID gerekli
+  if (permissionObj.scope === 'subreddit' && !subredditId) {
+    return next(new ErrorResponse('Subreddit kapsamlı izin kontrolü için subreddit ID gereklidir', 400));
+  }
+
+  // Subreddit ID formatı kontrolü
+  if (subredditId && !mongoose.Types.ObjectId.isValid(subredditId)) {
+    return next(new ErrorResponse('Geçersiz subreddit ID formatı', 400));
+  }
+
+  // Kullanıcının rollerini getir
+  let userRoles;
+
+  if (subredditId) {
+    // Subreddit kapsamlı roller
+    userRoles = await UserRoleAssignment.find({
+      user: userId,
+      scope: 'subreddit',
+      subreddit: subredditId
+    }).populate({
+      path: 'role',
+      populate: {
+        path: 'permissions'
+      }
+    });
+  } else {
+    // Site kapsamlı roller
+    userRoles = await UserRoleAssignment.find({
+      user: userId,
+      scope: 'site'
+    }).populate({
+      path: 'role',
+      populate: {
+        path: 'permissions'
+      }
+    });
+  }
+
+  // İzinleri kontrol et
+  let hasPermission = false;
+
+  for (const roleAssignment of userRoles) {
+    const role = roleAssignment.role;
+
+    // Rol aktif değilse atla
+    if (roleAssignment.isActive !== true) {
+      continue;
     }
 
-    // Site-çapındaki izinleri kontrol et (rol-bazlı)
-    const user = await User.findById(userId).populate('role');
-
-    if (!user) {
-      return res.status(404).json({
-        success: false,
-        message: 'Kullanıcı bulunamadı',
-      });
-    }
-
-    // Admin rolü her şeye izin verir
-    if (user.role && user.role.name === 'admin') {
-      return res.status(200).json({
-        success: true,
-        hasPermission: true,
-        message: 'Admin kullanıcısı tüm izinlere sahiptir',
-      });
-    }
-
-    // Site-çapındaki izinleri kontrol et
-    let hasPermission = false;
-
-    if (user.role && user.role.permissions && user.role.permissions.length > 0) {
-      // Rol ile ilişkilendirilmiş izinleri getir
-      const rolePermissions = await Permission.find({
-        _id: { $in: user.role.permissions },
-        resource,
-        action,
-        scope: 'site',
-        isActive: true,
-      });
-
-      if (rolePermissions.length > 0) {
+    // Rol izinlerini kontrol et
+    for (const perm of role.permissions) {
+      if (perm.name === permission) {
         hasPermission = true;
+        break;
       }
     }
 
-    // Subreddit izinlerini kontrol et (eğer subredditId verilmişse)
-    if (subredditId && !hasPermission) {
-      if (!mongoose.Types.ObjectId.isValid(subredditId)) {
-        return res.status(400).json({
-          success: false,
-          message: 'Geçersiz subreddit ID formatı',
-        });
-      }
-
-      // Kullanıcının subreddit üyeliğini kontrol et
-      const membership = await SubredditMembership.findOne({
-        user: userId,
-        subreddit: subredditId,
-      });
-
-      if (membership) {
-        // Moderatör mü?
-        if (membership.isModerator) {
-          // Subreddit yöneticileri için genellikle özel izinler vardır
-          const modPermissions = await Permission.find({
-            resource,
-            action,
-            scope: 'subreddit',
-            subreddit: subredditId,
-            defaultRoles: 'moderator',
-            isActive: true,
-          });
-
-          if (modPermissions.length > 0) {
-            hasPermission = true;
-          }
-        }
-
-        // Kullanıcıya özel verilmiş subreddit izinleri var mı?
-        if (!hasPermission && membership.permissions && membership.permissions.length > 0) {
-          const specificPermissions = await Permission.find({
-            _id: { $in: membership.permissions },
-            resource,
-            action,
-            scope: 'subreddit',
-            subreddit: subredditId,
-            isActive: true,
-          });
-
-          if (specificPermissions.length > 0) {
-            hasPermission = true;
-          }
-        }
-
-        // Subreddit üyeleri için varsayılan izinler
-        if (!hasPermission) {
-          const memberPermissions = await Permission.find({
-            resource,
-            action,
-            scope: 'subreddit',
-            subreddit: subredditId,
-            defaultRoles: 'member',
-            isActive: true,
-          });
-
-          if (memberPermissions.length > 0) {
-            hasPermission = true;
-          }
-        }
-      } else {
-        // Üye olmayan ziyaretçiler için varsayılan izinler
-        const visitorPermissions = await Permission.find({
-          resource,
-          action,
-          scope: 'subreddit',
-          subreddit: subredditId,
-          defaultRoles: 'visitor',
-          isActive: true,
-        });
-
-        if (visitorPermissions.length > 0) {
-          hasPermission = true;
-        }
-      }
+    if (hasPermission) {
+      break;
     }
-
-    res.status(200).json({
-      success: true,
-      hasPermission,
-      resource,
-      action,
-      subreddit: subredditId || null,
-    });
-  } catch (error) {
-    console.error('Check user permissions error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'İzinler kontrol edilirken bir hata oluştu',
-      error: error.message,
-    });
   }
-};
+
+  res.status(200).json({
+    success: true,
+    hasPermission,
+    message: hasPermission ?
+        'Kullanıcı bu izne sahip' :
+        'Kullanıcı bu izne sahip değil'
+  });
+});
 
 /**
- * @desc    Subreddit için izinleri getir
- * @route   GET /api/subreddits/:subredditId/permissions
- * @access  Private/Moderator
+ * @desc    Subreddit izinlerini ayarla
+ * @route   PUT /api/permissions/subreddit/:subredditId
+ * @access  Private (Subreddit Sahibi veya Admin)
  */
-const getSubredditPermissions = async (req, res) => {
-  try {
-    const { subredditId } = req.params;
-    const userId = req.user._id;
+const setSubredditPermissions = asyncHandler(async (req, res, next) => {
+  const { subredditId } = req.params;
+  const { roleId, permissions } = req.body;
+  const userId = req.user._id;
 
-    if (!mongoose.Types.ObjectId.isValid(subredditId)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Geçersiz subreddit ID formatı',
-      });
-    }
+  // ID formatı kontrolü
+  if (!mongoose.Types.ObjectId.isValid(subredditId) || !mongoose.Types.ObjectId.isValid(roleId)) {
+    return next(new ErrorResponse('Geçersiz ID formatı', 400));
+  }
 
-    // Subreddit'i kontrol et
-    const subreddit = await Subreddit.findById(subredditId);
-    if (!subreddit) {
-      return res.status(404).json({
-        success: false,
-        message: 'Subreddit bulunamadı',
-      });
-    }
+  // Subreddit'i kontrol et
+  const subreddit = await Subreddit.findById(subredditId);
 
-    // Yetki kontrolü (admin veya moderatör olmalı)
-    if (req.user.role !== 'admin') {
-      const membership = await SubredditMembership.findOne({
-        user: userId,
-        subreddit: subredditId,
-        isModerator: true,
-      });
+  if (!subreddit) {
+    return next(new ErrorResponse('Subreddit bulunamadı', 404));
+  }
 
-      if (!membership) {
-        return res.status(403).json({
-          success: false,
-          message: 'Bu bilgilere erişmek için moderatör yetkileri gerekiyor',
-        });
-      }
-    }
+  // Yetki kontrolü - Admin veya subreddit kurucusu olmalı
+  const isAdmin = req.user.role === 'admin';
+  const isCreator = subreddit.creator.toString() === userId.toString();
 
-    // Subreddit izinlerini getir
-    const permissions = await Permission.find({
-      scope: 'subreddit',
+  if (!isAdmin && !isCreator) {
+    // Moderatör kontrolü (sadece kurucu veya üst düzey moderatörler izinleri değiştirebilir)
+    const membership = await SubredditMembership.findOne({
+      user: userId,
       subreddit: subredditId,
-    }).sort({ type: 1, resource: 1, action: 1 });
-
-    // İzinleri rollere göre grupla
-    const groupedPermissions = {
-      moderator: permissions.filter((p) => p.defaultRoles.includes('moderator')),
-      member: permissions.filter((p) => p.defaultRoles.includes('member')),
-      visitor: permissions.filter((p) => p.defaultRoles.includes('visitor')),
-      other: permissions.filter(
-        (p) =>
-          !p.defaultRoles.includes('moderator') &&
-          !p.defaultRoles.includes('member') &&
-          !p.defaultRoles.includes('visitor'),
-      ),
-    };
-
-    res.status(200).json({
-      success: true,
-      count: permissions.length,
-      data: {
-        all: permissions,
-        grouped: groupedPermissions,
-      },
+      type: 'moderator'
     });
-  } catch (error) {
-    console.error('Get subreddit permissions error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Subreddit izinleri getirilirken bir hata oluştu',
-      error: error.message,
-    });
+
+    if (!membership || !membership.isFounder) {
+      return next(new ErrorResponse('Bu işlem için subreddit sahibi veya kurucu moderatör yetkiniz olmalı', 403));
+    }
   }
-};
 
-/**
- * @desc    Subreddit için izin oluştur veya güncelle
- * @route   POST /api/subreddits/:subredditId/permissions
- * @access  Private/Moderator
- */
-const manageSubredditPermission = async (req, res) => {
-  try {
-    const { subredditId } = req.params;
-    const userId = req.user._id;
-    const { name, description, resource, action, defaultRoles, isActive } = req.body;
+  // Rolü kontrol et
+  const role = await Role.findById(roleId);
 
-    if (!mongoose.Types.ObjectId.isValid(subredditId)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Geçersiz subreddit ID formatı',
-      });
-    }
-
-    // Eksik alan kontrolü
-    if (!name || !resource || !action || !defaultRoles) {
-      return res.status(400).json({
-        success: false,
-        message: 'Lütfen gerekli tüm alanları doldurun: name, resource, action, defaultRoles',
-      });
-    }
-
-    // Subreddit'i kontrol et
-    const subreddit = await Subreddit.findById(subredditId);
-    if (!subreddit) {
-      return res.status(404).json({
-        success: false,
-        message: 'Subreddit bulunamadı',
-      });
-    }
-
-    // Yetki kontrolü (admin veya kurucu moderatör olmalı)
-    if (req.user.role !== 'admin') {
-      const membership = await SubredditMembership.findOne({
-        user: userId,
-        subreddit: subredditId,
-        isModerator: true,
-      });
-
-      if (!membership || !membership.isFounder) {
-        return res.status(403).json({
-          success: false,
-          message: 'Bu işlem için kurucu moderatör yetkileri gerekiyor',
-        });
-      }
-    }
-
-    // Aynı isimde izin var mı kontrol et (varsa güncelle, yoksa oluştur)
-    let permission = await Permission.findOne({
-      name,
-      scope: 'subreddit',
-      subreddit: subredditId,
-    });
-
-    if (permission) {
-      // İzni güncelle
-      permission.description = description || permission.description;
-      permission.resource = resource;
-      permission.action = action;
-      permission.defaultRoles = defaultRoles;
-      permission.isActive = isActive !== undefined ? isActive : permission.isActive;
-      permission.updatedAt = Date.now();
-      permission.updatedBy = userId;
-
-      await permission.save();
-
-      // Moderasyon kaydı oluştur
-      await ModLog.create({
-        subreddit: subredditId,
-        action: 'permission_updated',
-        targetType: 'permission',
-        targetId: permission._id,
-        moderator: userId,
-        details: `İzin güncellendi: ${name} (${resource}.${action})`,
-      });
-
-      res.status(200).json({
-        success: true,
-        message: 'İzin başarıyla güncellendi',
-        data: permission,
-      });
-    } else {
-      // Yeni izin oluştur
-      permission = await Permission.create({
-        name,
-        description,
-        type: 'custom', // Subreddit izinleri özel olarak işaretlenebilir
-        scope: 'subreddit',
-        subreddit: subredditId,
-        resource,
-        action,
-        defaultRoles,
-        isActive: isActive !== undefined ? isActive : true,
-        createdBy: userId,
-      });
-
-      // Moderasyon kaydı oluştur
-      await ModLog.create({
-        subreddit: subredditId,
-        action: 'permission_created',
-        targetType: 'permission',
-        targetId: permission._id,
-        moderator: userId,
-        details: `İzin oluşturuldu: ${name} (${resource}.${action})`,
-      });
-
-      res.status(201).json({
-        success: true,
-        message: 'İzin başarıyla oluşturuldu',
-        data: permission,
-      });
-    }
-  } catch (error) {
-    console.error('Manage subreddit permission error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Subreddit izni yönetilirken bir hata oluştu',
-      error: error.message,
-    });
+  if (!role) {
+    return next(new ErrorResponse('Rol bulunamadı', 404));
   }
-};
 
-/**
- * @desc    Kullanıcıya özel izin atama
- * @route   POST /api/users/:userId/permissions
- * @access  Private/Admin
- */
-const assignUserPermission = async (req, res) => {
-  try {
-    const { userId } = req.params;
-    const { permissionId, subredditId, granted } = req.body;
+  // Rolün kapsamını kontrol et
+  if (role.scope !== 'subreddit') {
+    return next(new ErrorResponse('Sadece subreddit kapsamlı roller için izinler ayarlanabilir', 400));
+  }
 
-    // Yetki kontrolü
-    if (req.user.role !== 'admin') {
-      // Subreddit izni ise moderatör kontrolü yap
-      if (subredditId) {
-        const membership = await SubredditMembership.findOne({
-          user: req.user._id,
-          subreddit: subredditId,
-          isModerator: true,
-        });
+  // Sistem rollerinin izinlerini değiştirmeye izin verme
+  if (role.isSystem) {
+    return next(new ErrorResponse('Sistem rollerinin izinleri değiştirilemez', 400));
+  }
 
-        if (!membership) {
-          return res.status(403).json({
-            success: false,
-            message: 'Bu işlem için moderatör yetkileri gerekiyor',
-          });
-        }
-      } else {
-        return res.status(403).json({
-          success: false,
-          message: 'Bu işlem için admin yetkileri gerekiyor',
-        });
-      }
-    }
+  // İzinleri doğrula
+  if (!permissions || !Array.isArray(permissions)) {
+    return next(new ErrorResponse('Geçerli bir izin listesi sağlanmalıdır', 400));
+  }
 
-    if (!mongoose.Types.ObjectId.isValid(userId)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Geçersiz kullanıcı ID formatı',
-      });
-    }
+  // Her izni kontrol et
+  const validPermissions = [];
 
+  for (const permissionId of permissions) {
     if (!mongoose.Types.ObjectId.isValid(permissionId)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Geçersiz izin ID formatı',
-      });
-    }
-
-    // Kullanıcıyı ve izni kontrol et
-    const user = await User.findById(userId);
-    if (!user) {
-      return res.status(404).json({
-        success: false,
-        message: 'Kullanıcı bulunamadı',
-      });
+      continue;
     }
 
     const permission = await Permission.findById(permissionId);
+
     if (!permission) {
-      return res.status(404).json({
-        success: false,
-        message: 'İzin bulunamadı',
-      });
+      continue;
     }
 
-    // Subreddit izni ise, subreddit üyeliğini bulup güncelle
-    if (permission.scope === 'subreddit' && permission.subreddit) {
-      // Subreddit ID kontrol et
-      if (!subredditId || !permission.subreddit.equals(subredditId)) {
-        return res.status(400).json({
-          success: false,
-          message: 'İzin ve subreddit eşleşmiyor',
-        });
-      }
-
-      let membership = await SubredditMembership.findOne({
-        user: userId,
-        subreddit: subredditId,
-      });
-
-      if (!membership) {
-        // Eğer üye değilse ve izin veriliyorsa, üyelik oluştur
-        if (granted) {
-          membership = await SubredditMembership.create({
-            user: userId,
-            subreddit: subredditId,
-            permissions: [permissionId],
-            joinedAt: Date.now(),
-          });
-
-          // Moderasyon kaydı oluştur
-          await ModLog.create({
-            subreddit: subredditId,
-            action: 'user_added_with_permission',
-            targetType: 'user',
-            targetId: userId,
-            moderator: req.user._id,
-            details: `Kullanıcı ${user.username} subreddit'e eklendi ve özel izin verildi: ${permission.name}`,
-          });
-        } else {
-          return res.status(404).json({
-            success: false,
-            message: "Kullanıcı bu subreddit'e üye değil",
-          });
-        }
-      } else {
-        // Üyelik varsa, izinleri güncelle
-        if (granted) {
-          // İzni ekle
-          if (!membership.permissions.includes(permissionId)) {
-            membership.permissions.push(permissionId);
-            await membership.save();
-
-            // Moderasyon kaydı oluştur
-            await ModLog.create({
-              subreddit: subredditId,
-              action: 'permission_granted',
-              targetType: 'user',
-              targetId: userId,
-              moderator: req.user._id,
-              details: `Kullanıcı ${user.username}'a özel izin verildi: ${permission.name}`,
-            });
-          }
-        } else {
-          // İzni kaldır
-          if (membership.permissions.includes(permissionId)) {
-            membership.permissions = membership.permissions.filter(
-              (p) => p.toString() !== permissionId.toString(),
-            );
-            await membership.save();
-
-            // Moderasyon kaydı oluştur
-            await ModLog.create({
-              subreddit: subredditId,
-              action: 'permission_revoked',
-              targetType: 'user',
-              targetId: userId,
-              moderator: req.user._id,
-              details: `Kullanıcı ${user.username}'dan özel izin kaldırıldı: ${permission.name}`,
-            });
-          }
-        }
-      }
+    // Subreddit kapsamlı veya her iki kapsama uygun izinleri ekle
+    if (permission.scope === 'subreddit' || permission.scope === 'both') {
+      validPermissions.push(permissionId);
     }
-    // Site-çapında özel kullanıcı izni ise user.customPermissions'a ekle/çıkar
-    else if (permission.scope === 'site') {
-      user.customPermissions = user.customPermissions || [];
-
-      if (granted) {
-        // İzni ekle
-        if (!user.customPermissions.includes(permissionId)) {
-          user.customPermissions.push(permissionId);
-          await user.save();
-        }
-      } else {
-        // İzni kaldır
-        if (user.customPermissions.includes(permissionId)) {
-          user.customPermissions = user.customPermissions.filter(
-            (p) => p.toString() !== permissionId.toString(),
-          );
-          await user.save();
-        }
-      }
-    }
-
-    res.status(200).json({
-      success: true,
-      message: granted
-        ? 'İzin kullanıcıya başarıyla atandı'
-        : 'İzin kullanıcıdan başarıyla kaldırıldı',
-      data: {
-        user: {
-          _id: user._id,
-          username: user.username,
-        },
-        permission: {
-          _id: permission._id,
-          name: permission.name,
-          scope: permission.scope,
-        },
-        granted,
-      },
-    });
-  } catch (error) {
-    console.error('Assign user permission error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Kullanıcıya izin atanırken bir hata oluştu',
-      error: error.message,
-    });
   }
-};
+
+  // Rolün izinlerini güncelle
+  role.permissions = validPermissions;
+  await role.save();
+
+  res.status(200).json({
+    success: true,
+    data: role,
+    message: 'Subreddit rol izinleri başarıyla güncellendi'
+  });
+});
 
 /**
- * @desc    Rol izinlerini düzenle
- * @route   POST /api/roles/:roleId/permissions
- * @access  Private/Admin
+ * @desc    Varsayılan izinleri kurulum
+ * @route   POST /api/permissions/setup
+ * @access  Private (Admin)
  */
-const manageRolePermissions = async (req, res) => {
-  try {
-    const { roleId } = req.params;
-    const { permissionIds, action } = req.body;
-
-    // Yetki kontrolü
-    if (req.user.role !== 'admin') {
-      return res.status(403).json({
-        success: false,
-        message: 'Bu işlem için admin yetkileri gerekiyor',
-      });
-    }
-
-    if (!mongoose.Types.ObjectId.isValid(roleId)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Geçersiz rol ID formatı',
-      });
-    }
-
-    if (!permissionIds || !Array.isArray(permissionIds)) {
-      return res.status(400).json({
-        success: false,
-        message: "İzin ID'leri bir dizi olarak belirtilmelidir",
-      });
-    }
-
-    if (!action || !['add', 'remove', 'set'].includes(action)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Geçerli bir işlem belirtmelisiniz: add, remove, veya set',
-      });
-    }
-
-    // Geçersiz ID'leri filtrele
-    const validPermissionIds = permissionIds.filter((id) => mongoose.Types.ObjectId.isValid(id));
-
-    // Rol ve izinlerin varlığını kontrol et
-    const role = await Role.findById(roleId);
-    if (!role) {
-      return res.status(404).json({
-        success: false,
-        message: 'Rol bulunamadı',
-      });
-    }
-
-    // İzinlerin varlığını kontrol et
-    const existingPermissions = await Permission.find({
-      _id: { $in: validPermissionIds },
-    });
-
-    if (existingPermissions.length !== validPermissionIds.length) {
-      return res.status(400).json({
-        success: false,
-        message: 'Bazı izinler bulunamadı',
-      });
-    }
-
-    // İşlemi gerçekleştir
-    let updatedRole;
-
-    if (action === 'add') {
-      updatedRole = await Role.findByIdAndUpdate(
-        roleId,
-        { $addToSet: { permissions: { $each: validPermissionIds } } },
-        { new: true },
-      );
-    } else if (action === 'remove') {
-      updatedRole = await Role.findByIdAndUpdate(
-        roleId,
-        { $pull: { permissions: { $in: validPermissionIds } } },
-        { new: true },
-      );
-    } else if (action === 'set') {
-      updatedRole = await Role.findByIdAndUpdate(
-        roleId,
-        { $set: { permissions: validPermissionIds } },
-        { new: true },
-      );
-    }
-
-    // İzin adlarını getir
-    const permissionNames = existingPermissions.map((p) => p.name);
-
-    res.status(200).json({
-      success: true,
-      message: `Rol izinleri başarıyla ${action === 'add' ? 'eklendi' : action === 'remove' ? 'kaldırıldı' : 'güncellendi'}`,
-      data: {
-        role: {
-          _id: updatedRole._id,
-          name: updatedRole.name,
-          permissions: updatedRole.permissions,
-        },
-        affectedPermissions: permissionNames,
-      },
-    });
-  } catch (error) {
-    console.error('Manage role permissions error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Rol izinleri düzenlenirken bir hata oluştu',
-      error: error.message,
-    });
+const setupDefaultPermissions = asyncHandler(async (req, res, next) => {
+  // Yetki kontrolü
+  if (req.user.role !== 'admin') {
+    return next(new ErrorResponse('Bu işlem için admin yetkiniz yok', 403));
   }
-};
 
-/**
- * @desc    Bir kaynağın erişim kontrollerini getir
- * @route   GET /api/permissions/resource/:resourceType
- * @access  Private/Admin
- */
-const getResourcePermissions = async (req, res) => {
-  try {
-    const { resourceType } = req.params;
+  // Temel rolleri bul veya oluştur
+  let adminRole = await Role.findOne({ name: 'admin', scope: 'site' });
+  let moderatorRole = await Role.findOne({ name: 'moderator', scope: 'subreddit' });
+  let userRole = await Role.findOne({ name: 'user', scope: 'site' });
 
-    // Yetki kontrolü
-    if (req.user.role !== 'admin') {
-      return res.status(403).json({
-        success: false,
-        message: 'Bu bilgilere erişmek için admin yetkileri gerekiyor',
-      });
-    }
-
-    // Geçerli kaynak tipi kontrolü
-    const validResources = ['post', 'comment', 'subreddit', 'user', 'media', 'message'];
-    if (!validResources.includes(resourceType)) {
-      return res.status(400).json({
-        success: false,
-        message: `Geçersiz kaynak tipi. Geçerli tipler: ${validResources.join(', ')}`,
-      });
-    }
-
-    // Kaynak için izinleri getir
-    const permissions = await Permission.find({
-      resource: resourceType,
+  if (!adminRole) {
+    adminRole = await Role.create({
+      name: 'admin',
+      description: 'Site yöneticisi',
       scope: 'site',
-    }).sort({ action: 1 });
+      isDefault: false,
+      isSystem: true
+    });
+  }
 
-    // İzinleri gruplara ayır (rol bazlı)
-    const rolePermissionMap = {};
+  if (!moderatorRole) {
+    moderatorRole = await Role.create({
+      name: 'moderator',
+      description: 'Subreddit moderatörü',
+      scope: 'subreddit',
+      isDefault: false,
+      isSystem: true
+    });
+  }
 
-    for (const permission of permissions) {
-      if (permission.defaultRoles && permission.defaultRoles.length > 0) {
-        for (const roleName of permission.defaultRoles) {
-          if (!rolePermissionMap[roleName]) {
-            rolePermissionMap[roleName] = [];
-          }
-          rolePermissionMap[roleName].push({
-            _id: permission._id,
-            name: permission.name,
-            action: permission.action,
-            description: permission.description,
-          });
-        }
+  if (!userRole) {
+    userRole = await Role.create({
+      name: 'user',
+      description: 'Standart kullanıcı',
+      scope: 'site',
+      isDefault: true,
+      isSystem: true
+    });
+  }
+
+  // Varsayılan izin kategorileri
+  const defaultPermissionCategories = {
+    'post': 'Post işlemleri',
+    'comment': 'Yorum işlemleri',
+    'user': 'Kullanıcı işlemleri',
+    'subreddit': 'Subreddit işlemleri',
+    'moderation': 'Moderasyon işlemleri',
+    'admin': 'Admin işlemleri',
+    'other': 'Diğer işlemler'
+  };
+
+  // Temel izinleri tanımla ve oluştur
+  const defaultPermissions = [
+    // Post izinleri
+    {
+      name: 'post:create',
+      description: 'Gönderi oluşturma',
+      category: 'post',
+      scope: 'both',
+      isSystem: true,
+      roles: ['user', 'admin']
+    },
+    {
+      name: 'post:read',
+      description: 'Gönderi okuma',
+      category: 'post',
+      scope: 'both',
+      isSystem: true,
+      roles: ['user', 'moderator', 'admin']
+    },
+    {
+      name: 'post:update_own',
+      description: 'Kendi gönderisini düzenleme',
+      category: 'post',
+      scope: 'both',
+      isSystem: true,
+      roles: ['user', 'admin']
+    },
+    {
+      name: 'post:update_any',
+      description: 'Herhangi bir gönderiyi düzenleme',
+      category: 'post',
+      scope: 'subreddit',
+      isSystem: true,
+      roles: ['moderator', 'admin']
+    },
+    {
+      name: 'post:delete_own',
+      description: 'Kendi gönderisini silme',
+      category: 'post',
+      scope: 'both',
+      isSystem: true,
+      roles: ['user', 'admin']
+    },
+    {
+      name: 'post:delete_any',
+      description: 'Herhangi bir gönderiyi silme',
+      category: 'post',
+      scope: 'subreddit',
+      isSystem: true,
+      roles: ['moderator', 'admin']
+    },
+    {
+      name: 'post:vote',
+      description: 'Gönderi oylaması',
+      category: 'post',
+      scope: 'both',
+      isSystem: true,
+      roles: ['user', 'admin']
+    },
+
+    // Yorum izinleri
+    {
+      name: 'comment:create',
+      description: 'Yorum oluşturma',
+      category: 'comment',
+      scope: 'both',
+      isSystem: true,
+      roles: ['user', 'admin']
+    },
+    {
+      name: 'comment:read',
+      description: 'Yorum okuma',
+      category: 'comment',
+      scope: 'both',
+      isSystem: true,
+      roles: ['user', 'moderator', 'admin']
+    },
+    {
+      name: 'comment:update_own',
+      description: 'Kendi yorumunu düzenleme',
+      category: 'comment',
+      scope: 'both',
+      isSystem: true,
+      roles: ['user', 'admin']
+    },
+    {
+      name: 'comment:update_any',
+      description: 'Herhangi bir yorumu düzenleme',
+      category: 'comment',
+      scope: 'subreddit',
+      isSystem: true,
+      roles: ['moderator', 'admin']
+    },
+    {
+      name: 'comment:delete_own',
+      description: 'Kendi yorumunu silme',
+      category: 'comment',
+      scope: 'both',
+      isSystem: true,
+      roles: ['user', 'admin']
+    },
+    {
+      name: 'comment:delete_any',
+      description: 'Herhangi bir yorumu silme',
+      category: 'comment',
+      scope: 'subreddit',
+      isSystem: true,
+      roles: ['moderator', 'admin']
+    },
+    {
+      name: 'comment:vote',
+      description: 'Yorum oylaması',
+      category: 'comment',
+      scope: 'both',
+      isSystem: true,
+      roles: ['user', 'admin']
+    },
+
+    // Moderasyon izinleri
+    {
+      name: 'moderation:approve',
+      description: 'İçerik onaylama',
+      category: 'moderation',
+      scope: 'subreddit',
+      isSystem: true,
+      roles: ['moderator', 'admin']
+    },
+    {
+      name: 'moderation:remove',
+      description: 'İçerik kaldırma',
+      category: 'moderation',
+      scope: 'subreddit',
+      isSystem: true,
+      roles: ['moderator', 'admin']
+    },
+    {
+      name: 'moderation:ban',
+      description: 'Kullanıcı yasaklama',
+      category: 'moderation',
+      scope: 'subreddit',
+      isSystem: true,
+      roles: ['moderator', 'admin']
+    },
+    {
+      name: 'moderation:unban',
+      description: 'Kullanıcı yasağı kaldırma',
+      category: 'moderation',
+      scope: 'subreddit',
+      isSystem: true,
+      roles: ['moderator', 'admin']
+    },
+    {
+      name: 'moderation:lock',
+      description: 'Gönderi/yorum kilitleme',
+      category: 'moderation',
+      scope: 'subreddit',
+      isSystem: true,
+      roles: ['moderator', 'admin']
+    },
+    {
+      name: 'moderation:config',
+      description: 'Subreddit ayarlarını yapılandırma',
+      category: 'moderation',
+      scope: 'subreddit',
+      isSystem: true,
+      roles: ['moderator', 'admin']
+    },
+    {
+      name: 'moderation:flair',
+      description: 'Etiket yönetimi',
+      category: 'moderation',
+      scope: 'subreddit',
+      isSystem: true,
+      roles: ['moderator', 'admin']
+    },
+    {
+      name: 'moderation:wiki',
+      description: 'Wiki sayfalarını yönetme',
+      category: 'moderation',
+      scope: 'subreddit',
+      isSystem: true,
+      roles: ['moderator', 'admin']
+    },
+    {
+      name: 'moderation:manage_moderators',
+      description: 'Moderatörleri yönetme (sadece kurucular)',
+      category: 'moderation',
+      scope: 'subreddit',
+      isSystem: true,
+      roles: ['admin']
+    },
+
+    // Subreddit izinleri
+    {
+      name: 'subreddit:create',
+      description: 'Subreddit oluşturma',
+      category: 'subreddit',
+      scope: 'site',
+      isSystem: true,
+      roles: ['user', 'admin']
+    },
+    {
+      name: 'subreddit:subscribe',
+      description: 'Subreddit'e abone olma',
+      category: 'subreddit',
+      scope: 'both',
+      isSystem: true,
+      roles: ['user', 'admin']
+    },
+    {
+      name: 'subreddit:update_own',
+      description: 'Kendi subreddit\'ini güncelleme',
+      category: 'subreddit',
+      scope: 'subreddit',
+      isSystem: true,
+      roles: ['moderator', 'admin']
+    },
+    {
+      name: 'subreddit:delete_own',
+      description: 'Kendi subreddit\'ini silme (sadece kurucular)',
+      category: 'subreddit',
+      scope: 'subreddit',
+      isSystem: true,
+      roles: ['admin']
+    },
+
+    // Kullanıcı izinleri
+    {
+      name: 'user:update_own',
+      description: 'Kendi profilini güncelleme',
+      category: 'user',
+      scope: 'site',
+      isSystem: true,
+      roles: ['user', 'admin']
+    },
+    {
+      name: 'user:read',
+      description: 'Kullanıcı profillerini görüntüleme',
+      category: 'user',
+      scope: 'site',
+      isSystem: true,
+      roles: ['user', 'moderator', 'admin']
+    },
+    {
+      name: 'user:manage_any',
+      description: 'Herhangi bir kullanıcıyı yönetme',
+      category: 'user',
+      scope: 'site',
+      isSystem: true,
+      roles: ['admin']
+    },
+
+    // Admin izinleri
+    {
+      name: 'admin:manage_roles',
+      description: 'Rolleri yönetme',
+      category: 'admin',
+      scope: 'site',
+      isSystem: true,
+      roles: ['admin']
+    },
+    {
+      name: 'admin:manage_permissions',
+      description: 'İzinleri yönetme',
+      category: 'admin',
+      scope: 'site',
+      isSystem: true,
+      roles: ['admin']
+    },
+    {
+      name: 'admin:manage_site',
+      description: 'Site ayarlarını yönetme',
+      category: 'admin',
+      scope: 'site',
+      isSystem: true,
+      roles: ['admin']
+    },
+    {
+      name: 'admin:view_logs',
+      description: 'Sistem kayıtlarını görüntüleme',
+      category: 'admin',
+      scope: 'site',
+      isSystem: true,
+      roles: ['admin']
+    }
+  ];
+
+  // İzinleri oluştur ve rollere ata
+  const roleMap = {
+    'admin': adminRole,
+    'moderator': moderatorRole,
+    'user': userRole
+  };
+
+  const createdPermissions = [];
+
+  for (const permissionData of defaultPermissions) {
+    // İzin zaten var mı kontrol et
+    let permission = await Permission.findOne({ name: permissionData.name });
+
+    // Yoksa oluştur
+    if (!permission) {
+      permission = await Permission.create({
+        name: permissionData.name,
+        description: permissionData.description,
+        category: permissionData.category,
+        scope: permissionData.scope,
+        isSystem: permissionData.isSystem
+      });
+
+      createdPermissions.push(permission);
+    }
+
+    // Rollere ata
+    for (const roleName of permissionData.roles) {
+      const role = roleMap[roleName];
+
+      if (role && !role.permissions.includes(permission._id)) {
+        role.permissions.push(permission._id);
+        await role.save();
       }
     }
-
-    res.status(200).json({
-      success: true,
-      count: permissions.length,
-      data: {
-        resource: resourceType,
-        permissions,
-        rolePermissions: rolePermissionMap,
-      },
-    });
-  } catch (error) {
-    console.error('Get resource permissions error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Kaynak izinleri getirilirken bir hata oluştu',
-      error: error.message,
-    });
   }
-};
+
+  res.status(200).json({
+    success: true,
+    message: `${createdPermissions.length} varsayılan izin oluşturuldu ve rollere atandı`,
+    data: {
+      createdPermissions,
+      roles: Object.values(roleMap)
+    }
+  });
+});
 
 /**
- * @desc    Toplu izin yönetimi
- * @route   POST /api/permissions/batch
- * @access  Private/Admin
+ * @desc    Kullanıcı izinlerini getir
+ * @route   GET /api/permissions/user/:userId
+ * @access  Private
  */
-const batchPermissionOperation = async (req, res) => {
-  try {
-    const { operation, permissions, defaultRoles, targetRoles, isActive } = req.body;
+const getUserPermissions = asyncHandler(async (req, res, next) => {
+  const { userId } = req.params;
+  const requestingUserId = req.user._id;
 
-    // Yetki kontrolü
-    if (req.user.role !== 'admin') {
-      return res.status(403).json({
-        success: false,
-        message: 'Bu işlem için admin yetkileri gerekiyor',
-      });
-    }
-
-    if (!operation || !['activate', 'deactivate', 'update_roles', 'delete'].includes(operation)) {
-      return res.status(400).json({
-        success: false,
-        message:
-          'Geçerli bir işlem belirtmelisiniz: activate, deactivate, update_roles, veya delete',
-      });
-    }
-
-    if (!permissions || !Array.isArray(permissions) || permissions.length === 0) {
-      return res.status(400).json({
-        success: false,
-        message: "İşlem için en az bir izin ID'si gereklidir",
-      });
-    }
-
-    // Geçersiz ID'leri filtrele
-    const validPermissionIds = permissions.filter((id) => mongoose.Types.ObjectId.isValid(id));
-
-    // İzinleri bul
-    const foundPermissions = await Permission.find({
-      _id: { $in: validPermissionIds },
-    });
-
-    if (foundPermissions.length === 0) {
-      return res.status(404).json({
-        success: false,
-        message: 'Belirtilen izinler bulunamadı',
-      });
-    }
-
-    let result;
-    let updatedCount = 0;
-    let message = '';
-
-    // İşlemi gerçekleştir
-    switch (operation) {
-      case 'activate':
-        result = await Permission.updateMany(
-          { _id: { $in: validPermissionIds } },
-          { $set: { isActive: true } },
-        );
-        updatedCount = result.modifiedCount;
-        message = `${updatedCount} izin başarıyla aktifleştirildi`;
-        break;
-
-      case 'deactivate':
-        result = await Permission.updateMany(
-          { _id: { $in: validPermissionIds } },
-          { $set: { isActive: false } },
-        );
-        updatedCount = result.modifiedCount;
-        message = `${updatedCount} izin başarıyla deaktifleştirildi`;
-        break;
-
-      case 'update_roles':
-        if (!defaultRoles || !Array.isArray(defaultRoles)) {
-          return res.status(400).json({
-            success: false,
-            message: 'Varsayılan roller bir dizi olarak belirtilmelidir',
-          });
-        }
-
-        result = await Permission.updateMany(
-          { _id: { $in: validPermissionIds } },
-          { $set: { defaultRoles } },
-        );
-        updatedCount = result.modifiedCount;
-        message = `${updatedCount} izin için varsayılan roller güncellendi`;
-
-        // İzinleri rollere ekle/çıkar
-        if (targetRoles && Array.isArray(targetRoles) && targetRoles.length > 0) {
-          // Önce rolleri bul
-          const roles = await Role.find({ name: { $in: targetRoles } });
-
-          if (roles.length > 0) {
-            for (const role of roles) {
-              await Role.updateOne(
-                { _id: role._id },
-                { $addToSet: { permissions: { $each: validPermissionIds } } },
-              );
-            }
-            message += ` ve ${roles.length} role atandı`;
-          }
-        }
-        break;
-
-      case 'delete':
-        // Önce rollerdeki referansları temizle
-        const permissionIdsToDelete = foundPermissions.map((p) => p._id);
-        await Role.updateMany(
-          { permissions: { $in: permissionIdsToDelete } },
-          { $pull: { permissions: { $in: permissionIdsToDelete } } },
-        );
-
-        // Sonra izinleri sil
-        result = await Permission.deleteMany({ _id: { $in: validPermissionIds } });
-        updatedCount = result.deletedCount;
-        message = `${updatedCount} izin başarıyla silindi`;
-        break;
-    }
-
-    res.status(200).json({
-      success: true,
-      message,
-      data: {
-        operation,
-        affectedCount: updatedCount,
-        permissions: foundPermissions.map((p) => ({
-          _id: p._id,
-          name: p.name,
-          scope: p.scope,
-          resource: p.resource,
-          action: p.action,
-        })),
-      },
-    });
-  } catch (error) {
-    console.error('Batch permission operation error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Toplu izin işlemi gerçekleştirilirken bir hata oluştu',
-      error: error.message,
-    });
+  // ID formatı kontrolü
+  if (!mongoose.Types.ObjectId.isValid(userId)) {
+    return next(new ErrorResponse('Geçersiz kullanıcı ID formatı', 400));
   }
-};
 
-/**
- * @desc    Yeni kullanıcılar için varsayılan izinler oluştur
- * @route   POST /api/permissions/defaults
- * @access  Private/Admin
- */
-const setupDefaultPermissions = async (req, res) => {
-  try {
-    // Yetki kontrolü
-    if (req.user.role !== 'admin') {
-      return res.status(403).json({
-        success: false,
-        message: 'Bu işlem için admin yetkileri gerekiyor',
-      });
+  // Yetki kontrolü (kendi izinlerini herkes görebilir, başkalarınınkini sadece admin)
+  if (userId !== requestingUserId.toString() && req.user.role !== 'admin') {
+    return next(new ErrorResponse('Başka kullanıcıların izinlerini görüntüleme yetkiniz yok', 403));
+  }
+
+  // Kullanıcıyı kontrol et
+  const user = await User.findById(userId);
+
+  if (!user) {
+    return next(new ErrorResponse('Kullanıcı bulunamadı', 404));
+  }
+
+  // Kullanıcının site kapsamlı rollerini getir
+  const siteRoleAssignments = await UserRoleAssignment.find({
+    user: userId,
+    scope: 'site'
+  }).populate({
+    path: 'role',
+    populate: {
+      path: 'permissions'
     }
+  });
 
-    // Temel rolleri bul
-    const adminRole = await Role.findOne({ name: 'admin' });
-    const moderatorRole = await Role.findOne({ name: 'moderator' });
-    const userRole = await Role.findOne({ name: 'user' });
+  // Site kapsamlı izinleri çıkart
+  const sitePermissions = new Set();
 
-    if (!adminRole || !moderatorRole || !userRole) {
-      return res.status(404).json({
-        success: false,
-        message: 'Temel roller (admin, moderator, user) bulunamadı. Önce rolleri oluşturun.',
-      });
-    }
-
-    // Varsayılan izinleri tanımla
-    const defaultPermissions = [
-      // Post izinleri
-      {
-        name: 'Gönderi Oluşturma',
-        description: 'Kullanıcı yeni gönderi oluşturabilir',
-        type: 'core',
-        scope: 'site',
-        resource: 'post',
-        action: 'create',
-        defaultRoles: ['user', 'moderator', 'admin'],
-      },
-      {
-        name: 'Gönderi Okuma',
-        description: 'Kullanıcı gönderileri görüntüleyebilir',
-        type: 'core',
-        scope: 'site',
-        resource: 'post',
-        action: 'read',
-        defaultRoles: ['visitor', 'user', 'moderator', 'admin'],
-      },
-      {
-        name: 'Kendi Gönderisini Düzenleme',
-        description: 'Kullanıcı kendi gönderilerini düzenleyebilir',
-        type: 'core',
-        scope: 'site',
-        resource: 'post',
-        action: 'update_own',
-        defaultRoles: ['user', 'moderator', 'admin'],
-      },
-      {
-        name: 'Tüm Gönderileri Düzenleme',
-        description: 'Kullanıcı tüm gönderileri düzenleyebilir',
-        type: 'core',
-        scope: 'site',
-        resource: 'post',
-        action: 'update_any',
-        defaultRoles: ['admin'],
-      },
-      {
-        name: 'Kendi Gönderisini Silme',
-        description: 'Kullanıcı kendi gönderilerini silebilir',
-        type: 'core',
-        scope: 'site',
-        resource: 'post',
-        action: 'delete_own',
-        defaultRoles: ['user', 'moderator', 'admin'],
-      },
-      {
-        name: 'Tüm Gönderileri Silme',
-        description: 'Kullanıcı tüm gönderileri silebilir',
-        type: 'core',
-        scope: 'site',
-        resource: 'post',
-        action: 'delete_any',
-        defaultRoles: ['admin'],
-      },
-
-      // Yorum izinleri
-      {
-        name: 'Yorum Oluşturma',
-        description: 'Kullanıcı yorum yapabilir',
-        type: 'core',
-        scope: 'site',
-        resource: 'comment',
-        action: 'create',
-        defaultRoles: ['user', 'moderator', 'admin'],
-      },
-      {
-        name: 'Yorum Okuma',
-        description: 'Kullanıcı yorumları görüntüleyebilir',
-        type: 'core',
-        scope: 'site',
-        resource: 'comment',
-        action: 'read',
-        defaultRoles: ['visitor', 'user', 'moderator', 'admin'],
-      },
-      {
-        name: 'Kendi Yorumunu Düzenleme',
-        description: 'Kullanıcı kendi yorumlarını düzenleyebilir',
-        type: 'core',
-        scope: 'site',
-        resource: 'comment',
-        action: 'update_own',
-        defaultRoles: ['user', 'moderator', 'admin'],
-      },
-      {
-        name: 'Tüm Yorumları Düzenleme',
-        description: 'Kullanıcı tüm yorumları düzenleyebilir',
-        type: 'core',
-        scope: 'site',
-        resource: 'comment',
-        action: 'update_any',
-        defaultRoles: ['admin'],
-      },
-      {
-        name: 'Kendi Yorumunu Silme',
-        description: 'Kullanıcı kendi yorumlarını silebilir',
-        type: 'core',
-        scope: 'site',
-        resource: 'comment',
-        action: 'delete_own',
-        defaultRoles: ['user', 'moderator', 'admin'],
-      },
-      {
-        name: 'Tüm Yorumları Silme',
-        description: 'Kullanıcı tüm yorumları silebilir',
-        type: 'core',
-        scope: 'site',
-        resource: 'comment',
-        action: 'delete_any',
-        defaultRoles: ['admin'],
-      },
-
-      // Subreddit izinleri
-      {
-        name: 'Subreddit Oluşturma',
-        description: 'Kullanıcı yeni subreddit oluşturabilir',
-        type: 'core',
-        scope: 'site',
-        resource: 'subreddit',
-        action: 'create',
-        defaultRoles: ['user', 'moderator', 'admin'],
-      },
-      {
-        name: 'Subreddit Okuma',
-        description: "Kullanıcı subreddit'leri görüntüleyebilir",
-        type: 'core',
-        scope: 'site',
-        resource: 'subreddit',
-        action: 'read',
-        defaultRoles: ['visitor', 'user', 'moderator', 'admin'],
-      },
-      {
-        name: "Kendi Subreddit'ini Düzenleme",
-        description: "Kullanıcı kurduğu subreddit'leri düzenleyebilir",
-        type: 'core',
-        scope: 'site',
-        resource: 'subreddit',
-        action: 'update_own',
-        defaultRoles: ['user', 'moderator', 'admin'],
-      },
-      {
-        name: "Tüm Subreddit'leri Düzenleme",
-        description: "Kullanıcı tüm subreddit'leri düzenleyebilir",
-        type: 'core',
-        scope: 'site',
-        resource: 'subreddit',
-        action: 'update_any',
-        defaultRoles: ['admin'],
-      },
-
-      // Kullanıcı izinleri
-      {
-        name: 'Kullanıcı Profili Görüntüleme',
-        description: 'Kullanıcı profilleri görüntülenebilir',
-        type: 'core',
-        scope: 'site',
-        resource: 'user',
-        action: 'read',
-        defaultRoles: ['visitor', 'user', 'moderator', 'admin'],
-      },
-      {
-        name: 'Kendi Profilini Düzenleme',
-        description: 'Kullanıcı kendi profilini düzenleyebilir',
-        type: 'core',
-        scope: 'site',
-        resource: 'user',
-        action: 'update_own',
-        defaultRoles: ['user', 'moderator', 'admin'],
-      },
-      {
-        name: 'Tüm Profilleri Düzenleme',
-        description: 'Kullanıcı tüm profilleri düzenleyebilir',
-        type: 'core',
-        scope: 'site',
-        resource: 'user',
-        action: 'update_any',
-        defaultRoles: ['admin'],
-      },
-
-      // Medya izinleri
-      {
-        name: 'Medya Yükleme',
-        description: 'Kullanıcı medya yükleyebilir',
-        type: 'core',
-        scope: 'site',
-        resource: 'media',
-        action: 'create',
-        defaultRoles: ['user', 'moderator', 'admin'],
-      },
-      {
-        name: 'Medya Görüntüleme',
-        description: 'Kullanıcı medya görüntüleyebilir',
-        type: 'core',
-        scope: 'site',
-        resource: 'media',
-        action: 'read',
-        defaultRoles: ['visitor', 'user', 'moderator', 'admin'],
-      },
-      {
-        name: 'Kendi Medyasını Yönetme',
-        description: 'Kullanıcı kendi yüklediği medyayı yönetebilir',
-        type: 'core',
-        scope: 'site',
-        resource: 'media',
-        action: 'manage_own',
-        defaultRoles: ['user', 'moderator', 'admin'],
-      },
-      {
-        name: 'Tüm Medyaları Yönetme',
-        description: 'Kullanıcı tüm medyaları yönetebilir',
-        type: 'core',
-        scope: 'site',
-        resource: 'media',
-        action: 'manage_any',
-        defaultRoles: ['admin'],
-      },
-    ];
-
-    let createdCount = 0;
-    let updatedCount = 0;
-
-    // İzinleri ekle - varsa güncelle, yoksa oluştur
-    for (const permDef of defaultPermissions) {
-      // Aynı isimde ve kapsamda izin var mı kontrol et
-      let permission = await Permission.findOne({
-        name: permDef.name,
-        scope: permDef.scope,
-      });
-
-      if (permission) {
-        // İzin varsa güncelle
-        permission.description = permDef.description;
-        permission.defaultRoles = permDef.defaultRoles;
-        permission.type = permDef.type;
-        permission.resource = permDef.resource;
-        permission.action = permDef.action;
-        permission.updatedAt = Date.now();
-        permission.updatedBy = req.user._id;
-
-        await permission.save();
-        updatedCount++;
-      } else {
-        // İzin yoksa oluştur
-        permission = await Permission.create({
-          ...permDef,
-          createdBy: req.user._id,
+  for (const assignment of siteRoleAssignments) {
+    if (assignment.isActive && assignment.role) {
+      for (const permission of assignment.role.permissions) {
+        sitePermissions.add({
+          id: permission._id,
+          name: permission.name,
+          description: permission.description,
+          category: permission.category,
+          role: assignment.role.name
         });
-        createdCount++;
+      }
+    }
+  }
+
+  // Kullanıcının subreddit kapsamlı rollerini getir
+  const subredditRoleAssignments = await UserRoleAssignment.find({
+    user: userId,
+    scope: 'subreddit'
+  }).populate({
+    path: 'role',
+    populate: {
+      path: 'permissions'
+    }
+  }).populate('subreddit', 'name');
+
+  // Subreddit kapsamlı izinleri çıkart
+  const subredditPermissions = {};
+
+  for (const assignment of subredditRoleAssignments) {
+    if (assignment.isActive && assignment.role && assignment.subreddit) {
+      const subredditName = assignment.subreddit.name;
+
+      if (!subredditPermissions[subredditName]) {
+        subredditPermissions[subredditName] = {
+          subredditId: assignment.subreddit._id,
+          subredditName,
+          permissions: [],
+          roles: []
+        };
       }
 
-      // İzni ilgili rollere ekle
-      for (const roleName of permDef.defaultRoles) {
-        if (roleName === 'admin') {
-          await Role.updateOne(
-            { _id: adminRole._id },
-            { $addToSet: { permissions: permission._id } },
-          );
-        } else if (roleName === 'moderator') {
-          await Role.updateOne(
-            { _id: moderatorRole._id },
-            { $addToSet: { permissions: permission._id } },
-          );
-        } else if (roleName === 'user') {
-          await Role.updateOne(
-            { _id: userRole._id },
-            { $addToSet: { permissions: permission._id } },
-          );
+      // Role ekle
+      if (!subredditPermissions[subredditName].roles.some(r => r.id.toString() === assignment.role._id.toString())) {
+        subredditPermissions[subredditName].roles.push({
+          id: assignment.role._id,
+          name: assignment.role.name,
+          description: assignment.role.description
+        });
+      }
+
+      // İzinleri ekle
+      for (const permission of assignment.role.permissions) {
+        // Zaten eklenmiş mi kontrol et
+        const exists = subredditPermissions[subredditName].permissions.some(
+            p => p.id.toString() === permission._id.toString()
+        );
+
+        if (!exists) {
+          subredditPermissions[subredditName].permissions.push({
+            id: permission._id,
+            name: permission.name,
+            description: permission.description,
+            category: permission.category,
+            role: assignment.role.name
+          });
         }
       }
     }
-
-    res.status(200).json({
-      success: true,
-      message: `Varsayılan izinler başarıyla oluşturuldu: ${createdCount} yeni izin, ${updatedCount} güncellenen izin`,
-      data: {
-        totalSetup: defaultPermissions.length,
-        created: createdCount,
-        updated: updatedCount,
-      },
-    });
-  } catch (error) {
-    console.error('Setup default permissions error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Varsayılan izinler oluşturulurken bir hata oluştu',
-      error: error.message,
-    });
   }
-};
+
+  res.status(200).json({
+    success: true,
+    data: {
+      site: {
+        permissions: Array.from(sitePermissions),
+        roles: siteRoleAssignments.filter(a => a.isActive).map(a => ({
+          id: a.role._id,
+          name: a.role.name,
+          description: a.role.description
+        }))
+      },
+      subreddits: Object.values(subredditPermissions)
+    }
+  });
+});
+
+/**
+ * @desc    Subreddit izinlerini getir
+ * @route   GET /api/permissions/subreddit/:subredditId
+ * @access  Private
+ */
+const getSubredditPermissions = asyncHandler(async (req, res, next) => {
+  const { subredditId } = req.params;
+
+  // ID formatı kontrolü
+  if (!mongoose.Types.ObjectId.isValid(subredditId)) {
+    return next(new ErrorResponse('Geçersiz subreddit ID formatı', 400));
+  }
+
+  // Subreddit'i kontrol et
+  const subreddit = await Subreddit.findById(subredditId);
+
+  if (!subreddit) {
+    return next(new ErrorResponse('Subreddit bulunamadı', 404));
+  }
+
+  // Subreddit'in rollerini getir
+  const roles = await Role.find({
+    scope: 'subreddit',
+    _id: { $in: await UserRoleAssignment.distinct('role', { subreddit: subredditId }) }
+  }).populate('permissions');
+
+  // Rol bazlı izin haritası oluştur
+  const rolePermissions = {};
+
+  for (const role of roles) {
+    rolePermissions[role._id] = {
+      role: {
+        id: role._id,
+        name: role.name,
+        description: role.description,
+        isDefault: role.isDefault,
+        isSystem: role.isSystem
+      },
+      permissions: role.permissions.map(p => ({
+        id: p._id,
+        name: p.name,
+        description: p.description,
+        category: p.category
+      }))
+    };
+  }
+
+  res.status(200).json({
+    success: true,
+    data: {
+      subreddit: {
+        id: subreddit._id,
+        name: subreddit.name
+      },
+      roles: rolePermissions
+    }
+  });
+});
 
 module.exports = {
-  getPermissionById,
-  getAllPermissions,
+  getPermissions,
+  getPermission,
   createPermission,
   updatePermission,
   deletePermission,
+  assignPermissionToRole,
+  removePermissionFromRole,
+  getPermissionsByCategory,
+  getPermissionSchema,
   checkUserPermissions,
-  getSubredditPermissions,
-  manageSubredditPermission,
-  assignUserPermission,
-  manageRolePermissions,
-  getResourcePermissions,
-  batchPermissionOperation,
+  setSubredditPermissions,
   setupDefaultPermissions,
+  getUserPermissions,
+  getSubredditPermissions
 };

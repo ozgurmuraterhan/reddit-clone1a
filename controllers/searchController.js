@@ -1,675 +1,1072 @@
-const { Post, Comment, Subreddit, User, Tag } = require('../models');
+const Post = require('../models/Post');
+const Comment = require('../models/Comment');
+const Subreddit = require('../models/Subreddit');
+const User = require('../models/User');
+const Tag = require('../models/Tag');
 const mongoose = require('mongoose');
+const asyncHandler = require('../middleware/async');
+const ErrorResponse = require('../utils/errorResponse');
 
 /**
- * @desc    Perform a comprehensive search across the platform
+ * @desc    Genel arama fonksiyonu (tüm içerik tipleri)
  * @route   GET /api/search
  * @access  Public
  */
-const search = async (req, res) => {
-  try {
-    const {
-      q, // Search query text
-      type = 'posts', // Content type: posts, comments, subreddits, users, all
-      sort = 'relevance', // Sort options: relevance, new, top, comments
-      timeRange, // Time filter: hour, day, week, month, year, all
-      subreddit, // Optional subreddit to search within
-      nsfw = 'false', // Include NSFW content: true, false
-      page = 1, // Pagination page
-      limit = 25, // Results per page
-    } = req.query;
+const searchAll = asyncHandler(async (req, res, next) => {
+  const { query, type, sort, time, nsfw, subreddit } = req.query;
 
-    // Validate required search query
-    if (!q || q.trim() === '') {
-      return res.status(400).json({
-        success: false,
-        message: 'Arama sorgusu gereklidir',
-      });
-    }
+  // Arama sorgusu kontrolü
+  if (!query || query.trim().length < 3) {
+    return next(new ErrorResponse('Arama sorgusu en az 3 karakter olmalıdır', 400));
+  }
 
-    const searchQuery = q.trim();
-    const pageNum = parseInt(page, 10);
-    const limitNum = parseInt(limit, 10);
-    const skip = (pageNum - 1) * limitNum;
-    const includeNsfw = nsfw === 'true';
+  // Sayfalama için
+  const page = parseInt(req.query.page, 10) || 1;
+  const limit = parseInt(req.query.limit, 10) || 25;
+  const startIndex = (page - 1) * limit;
 
-    // Time filter configuration
-    let dateFilter = {};
-    if (timeRange) {
-      const now = new Date();
-      let startDate;
+  // İçerik tipi kontrolü
+  const validTypes = ['all', 'post', 'comment', 'subreddit', 'user', 'tag'];
+  const searchType = validTypes.includes(type) ? type : 'all';
 
-      switch (timeRange) {
-        case 'hour':
-          startDate = new Date(now.getTime() - 60 * 60 * 1000);
-          break;
-        case 'day':
-          startDate = new Date(now.getTime() - 24 * 60 * 60 * 1000);
-          break;
-        case 'week':
-          startDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
-          break;
-        case 'month':
-          startDate = new Date(now.setMonth(now.getMonth() - 1));
-          break;
-        case 'year':
-          startDate = new Date(now.setFullYear(now.getFullYear() - 1));
-          break;
-        default:
-          startDate = null;
-      }
-
-      if (startDate) {
-        dateFilter = { createdAt: { $gte: startDate } };
-      }
-    }
-
-    // Sort configuration
-    let sortOptions = {};
-    switch (sort) {
-      case 'new':
-        sortOptions = { createdAt: -1 };
+  // Zaman filtresi
+  const timeFilter = {};
+  if (time) {
+    const now = new Date();
+    switch (time) {
+      case 'day':
+        timeFilter.createdAt = { $gte: new Date(now.setDate(now.getDate() - 1)) };
         break;
-      case 'old':
-        sortOptions = { createdAt: 1 };
+      case 'week':
+        timeFilter.createdAt = { $gte: new Date(now.setDate(now.getDate() - 7)) };
         break;
-      case 'top':
-        sortOptions = { voteScore: -1, commentCount: -1, createdAt: -1 };
+      case 'month':
+        timeFilter.createdAt = { $gte: new Date(now.setMonth(now.getMonth() - 1)) };
         break;
-      case 'comments':
-        sortOptions = { commentCount: -1, createdAt: -1 };
-        break;
-      case 'relevance':
-      default:
-        // For text search, MongoDB will sort by text score by default
-        sortOptions = { score: { $meta: 'textScore' }, createdAt: -1 };
+      case 'year':
+        timeFilter.createdAt = { $gte: new Date(now.setFullYear(now.getFullYear() - 1)) };
         break;
     }
+  }
 
-    // Subreddit filter setup
-    let subredditFilter = {};
-    if (subreddit) {
+  // NSFW içerik kontrolü
+  const nsfwFilter = {};
+  if (nsfw !== undefined) {
+    if (nsfw === 'false' || nsfw === '0') {
+      nsfwFilter.isNSFW = false;
+      nsfwFilter.nsfw = false;
+    } else if (nsfw === 'true' || nsfw === '1') {
+      nsfwFilter.isNSFW = true;
+      nsfwFilter.nsfw = true;
+    }
+  } else if (!req.user || !req.user.showNSFW) {
+    // Kullanıcı giriş yapmadıysa veya NSFW ayarı kapalıysa, NSFW içeriği gösterme
+    nsfwFilter.isNSFW = false;
+    nsfwFilter.nsfw = false;
+  }
+
+  // Subreddit filtresi
+  const subredditFilter = {};
+  if (subreddit) {
+    // Subreddit ID veya isim olabilir
+    if (mongoose.Types.ObjectId.isValid(subreddit)) {
+      subredditFilter.subreddit = subreddit;
+    } else {
       const foundSubreddit = await Subreddit.findOne({ name: subreddit.toLowerCase() });
       if (foundSubreddit) {
-        subredditFilter = { subreddit: foundSubreddit._id };
+        subredditFilter.subreddit = foundSubreddit._id;
       } else {
-        // If specified subreddit doesn't exist, return empty results
-        return res.status(200).json({
-          success: true,
-          count: 0,
-          total: 0,
-          totalPages: 0,
-          currentPage: pageNum,
-          data: [],
-        });
+        return next(new ErrorResponse('Belirtilen subreddit bulunamadı', 404));
       }
     }
-
-    // NSFW filter
-    const nsfwFilter = includeNsfw ? {} : { nsfw: false };
-
-    let results;
-    let totalResults;
-    let searchProjection;
-
-    // Perform search based on content type
-    if (type === 'posts' || type === 'all') {
-      // Post search
-      const postSearchFilter = {
-        $text: { $search: searchQuery },
-        isDeleted: false,
-        isRemoved: false,
-        ...dateFilter,
-        ...subredditFilter,
-        ...nsfwFilter,
-      };
-
-      searchProjection = {
-        score: { $meta: 'textScore' },
-        title: 1,
-        content: 1,
-        author: 1,
-        subreddit: 1,
-        createdAt: 1,
-        voteScore: 1,
-        commentCount: 1,
-        contentType: 1,
-        nsfw: 1,
-        tags: 1,
-      };
-
-      results = await Post.find(postSearchFilter, searchProjection)
-        .skip(type === 'all' ? 0 : skip)
-        .limit(type === 'all' ? Math.min(limitNum, 10) : limitNum)
-        .sort(sortOptions)
-        .populate('author', 'username profilePicture displayName')
-        .populate('subreddit', 'name description icon color')
-        .populate('tags', 'name color');
-
-      // Add content type identifier
-      results = results.map((post) => {
-        const postObj = post.toObject();
-        postObj.contentType = 'post';
-        return postObj;
-      });
-
-      totalResults = await Post.countDocuments(postSearchFilter);
-
-      if (type === 'all') {
-        // For 'all' type search, we'll be combining results, so store posts for now
-        allResults = [...results];
-      }
-    }
-
-    if (type === 'comments' || type === 'all') {
-      // Comment search
-      const commentSearchFilter = {
-        $text: { $search: searchQuery },
-        isDeleted: false,
-        isRemoved: false,
-        ...dateFilter,
-      };
-
-      // If filtering by subreddit, find posts in that subreddit first
-      if (Object.keys(subredditFilter).length > 0) {
-        const relatedPosts = await Post.find(subredditFilter).select('_id');
-        commentSearchFilter.post = { $in: relatedPosts.map((p) => p._id) };
-      }
-
-      searchProjection = {
-        score: { $meta: 'textScore' },
-        content: 1,
-        author: 1,
-        post: 1,
-        createdAt: 1,
-        voteScore: 1,
-      };
-
-      const comments = await Comment.find(commentSearchFilter, searchProjection)
-        .skip(type === 'all' ? 0 : skip)
-        .limit(type === 'all' ? Math.min(limitNum, 10) : limitNum)
-        .sort(sortOptions)
-        .populate('author', 'username profilePicture displayName')
-        .populate({
-          path: 'post',
-          select: 'title subreddit',
-          populate: {
-            path: 'subreddit',
-            select: 'name icon color',
-          },
-        });
-
-      // Add content type identifier
-      const commentResults = comments.map((comment) => {
-        const commentObj = comment.toObject();
-        commentObj.contentType = 'comment';
-        return commentObj;
-      });
-
-      if (type === 'comments') {
-        results = commentResults;
-        totalResults = await Comment.countDocuments(commentSearchFilter);
-      } else if (type === 'all') {
-        allResults = [...allResults, ...commentResults];
-      }
-    }
-
-    if (type === 'subreddits' || type === 'all') {
-      // Subreddit search
-      const subredditSearchFilter = {
-        $text: { $search: searchQuery },
-        status: 'active',
-        isDeleted: false,
-        ...dateFilter,
-        ...nsfwFilter,
-      };
-
-      searchProjection = {
-        score: { $meta: 'textScore' },
-        name: 1,
-        title: 1,
-        description: 1,
-        icon: 1,
-        banner: 1,
-        color: 1,
-        subscriberCount: 1,
-        createdAt: 1,
-        nsfw: 1,
-      };
-
-      const subreddits = await Subreddit.find(subredditSearchFilter, searchProjection)
-        .skip(type === 'all' ? 0 : skip)
-        .limit(type === 'all' ? Math.min(limitNum, 5) : limitNum)
-        .sort(sortOptions);
-
-      // Add content type identifier
-      const subredditResults = subreddits.map((sub) => {
-        const subObj = sub.toObject();
-        subObj.contentType = 'subreddit';
-        return subObj;
-      });
-
-      if (type === 'subreddits') {
-        results = subredditResults;
-        totalResults = await Subreddit.countDocuments(subredditSearchFilter);
-      } else if (type === 'all') {
-        allResults = [...allResults, ...subredditResults];
-      }
-    }
-
-    if (type === 'users' || type === 'all') {
-      // User search
-      const userSearchFilter = {
-        $text: { $search: searchQuery },
-        isDeleted: false,
-        accountStatus: 'active',
-        ...dateFilter,
-      };
-
-      searchProjection = {
-        score: { $meta: 'textScore' },
-        username: 1,
-        displayName: 1,
-        bio: 1,
-        profilePicture: 1,
-        totalKarma: 1,
-        createdAt: 1,
-      };
-
-      const users = await User.find(userSearchFilter, searchProjection)
-        .skip(type === 'all' ? 0 : skip)
-        .limit(type === 'all' ? Math.min(limitNum, 5) : limitNum)
-        .sort(sortOptions);
-
-      // Add content type identifier
-      const userResults = users.map((user) => {
-        const userObj = user.toObject();
-        userObj.contentType = 'user';
-        return userObj;
-      });
-
-      if (type === 'users') {
-        results = userResults;
-        totalResults = await User.countDocuments(userSearchFilter);
-      } else if (type === 'all') {
-        allResults = [...allResults, ...userResults];
-      }
-    }
-
-    // For 'all' type, combine and sort results based on text score
-    if (type === 'all') {
-      // Sort by relevance (MongoDB text score) and take top results
-      allResults.sort((a, b) => b.score - a.score);
-
-      // Apply pagination to combined results
-      totalResults = allResults.length;
-      results = allResults.slice(skip, skip + limitNum);
-    }
-
-    // Return the search results
-    return res.status(200).json({
-      success: true,
-      query: searchQuery,
-      count: results.length,
-      total: totalResults,
-      totalPages: Math.ceil(totalResults / limitNum),
-      currentPage: pageNum,
-      data: results,
-    });
-  } catch (error) {
-    console.error('Search error:', error);
-    return res.status(500).json({
-      success: false,
-      message: 'Arama gerçekleştirilirken bir hata oluştu',
-      error: error.message,
-    });
   }
-};
 
-/**
- * @desc    Search within a specific subreddit
- * @route   GET /api/subreddits/:subredditName/search
- * @access  Public
- */
-const searchInSubreddit = async (req, res) => {
-  try {
-    const { subredditName } = req.params;
+  // Sıralama seçenekleri
+  const sortOptions = {
+    relevance: { score: { $meta: 'textScore' } },
+    new: { createdAt: -1 },
+    top: { voteScore: -1 },
+    comments: { commentCount: -1 },
+  };
 
-    // Validate subreddit exists
-    const subreddit = await Subreddit.findOne({
-      name: subredditName.toLowerCase(),
-      status: 'active',
+  const sortBy = sortOptions[sort] || sortOptions.relevance;
+
+  // Toplam sonuç sayısı
+  let total = 0;
+
+  // İçerik tipine göre farklı aramalar gerçekleştir
+  const results = {
+    posts: [],
+    comments: [],
+    subreddits: [],
+    users: [],
+    tags: [],
+  };
+
+  // Arama işlemlerini paralel olarak yap
+  if (searchType === 'all' || searchType === 'post') {
+    const postQuery = {
+      $text: { $search: query },
       isDeleted: false,
-    });
+      ...timeFilter,
+      ...nsfwFilter,
+      ...subredditFilter,
+    };
 
-    if (!subreddit) {
-      return res.status(404).json({
-        success: false,
-        message: 'Subreddit bulunamadı',
-      });
+    const posts = await Post.find(postQuery, { score: { $meta: 'textScore' } })
+      .select(
+        'title content type author subreddit createdAt upvotes downvotes voteScore commentCount isNSFW',
+      )
+      .sort(sortBy)
+      .skip(searchType === 'post' ? startIndex : 0)
+      .limit(searchType === 'post' ? limit : 5)
+      .populate('author', 'username profilePicture')
+      .populate('subreddit', 'name title');
+
+    results.posts = posts;
+
+    if (searchType === 'post') {
+      total = await Post.countDocuments(postQuery);
     }
-
-    // Add subreddit to query and call main search function
-    req.query.subreddit = subredditName;
-
-    // Default to searching posts if type not specified
-    if (!req.query.type) {
-      req.query.type = 'posts';
-    }
-
-    await search(req, res);
-  } catch (error) {
-    console.error('Subreddit search error:', error);
-    return res.status(500).json({
-      success: false,
-      message: 'Subreddit içinde arama gerçekleştirilirken bir hata oluştu',
-      error: error.message,
-    });
   }
-};
 
-/**
- * @desc    Get search suggestions as user types
- * @route   GET /api/search/suggest
- * @access  Public
- */
-const getSearchSuggestions = async (req, res) => {
-  try {
-    const { q, limit = 10 } = req.query;
-
-    if (!q || q.trim() === '') {
-      return res.status(200).json({
-        success: true,
-        data: [],
-      });
-    }
-
-    const searchQuery = q.trim();
-    const limitNum = parseInt(limit, 10);
-
-    // Search for subreddits
-    const subreddits = await Subreddit.find({
-      $or: [
-        { name: { $regex: `^${searchQuery}`, $options: 'i' } },
-        { title: { $regex: searchQuery, $options: 'i' } },
-      ],
-      status: 'active',
+  if (searchType === 'all' || searchType === 'comment') {
+    const commentQuery = {
+      $text: { $search: query },
       isDeleted: false,
-    })
-      .select('name title icon subscriberCount')
-      .sort({ subscriberCount: -1 })
-      .limit(Math.ceil(limitNum / 2));
+      ...timeFilter,
+      ...subredditFilter,
+    };
 
-    // Search for users
-    const users = await User.find({
-      $or: [
-        { username: { $regex: `^${searchQuery}`, $options: 'i' } },
-        { displayName: { $regex: searchQuery, $options: 'i' } },
-      ],
-      isDeleted: false,
-      accountStatus: 'active',
-    })
-      .select('username displayName profilePicture')
-      .sort({ totalKarma: -1 })
-      .limit(Math.floor(limitNum / 2));
-
-    // Format the suggestions
-    const subredditSuggestions = subreddits.map((sub) => ({
-      type: 'subreddit',
-      id: sub._id,
-      name: sub.name,
-      title: sub.title || sub.name,
-      icon: sub.icon,
-      subscriberCount: sub.subscriberCount,
-    }));
-
-    const userSuggestions = users.map((user) => ({
-      type: 'user',
-      id: user._id,
-      username: user.username,
-      displayName: user.displayName || user.username,
-      profilePicture: user.profilePicture,
-    }));
-
-    // Combine and return suggestions
-    const suggestions = [...subredditSuggestions, ...userSuggestions];
-
-    return res.status(200).json({
-      success: true,
-      query: searchQuery,
-      count: suggestions.length,
-      data: suggestions,
-    });
-  } catch (error) {
-    console.error('Search suggestions error:', error);
-    return res.status(500).json({
-      success: false,
-      message: 'Arama önerileri getirilirken bir hata oluştu',
-      error: error.message,
-    });
-  }
-};
-
-/**
- * @desc    Get trending search terms
- * @route   GET /api/search/trending
- * @access  Public
- */
-const getTrendingSearches = async (req, res) => {
-  try {
-    const { limit = 10 } = req.query;
-    const limitNum = parseInt(limit, 10);
-
-    // Get trending searches from analytics or cache
-    // This would typically be implemented with a separate service/collection that tracks popular searches
-    // For now, we'll simulate with popular tags or recent posts
-
-    const trendingPosts = await Post.aggregate([
-      {
-        $match: {
-          createdAt: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) },
-          isDeleted: false,
+    const comments = await Comment.find(commentQuery, { score: { $meta: 'textScore' } })
+      .select('content author post createdAt upvotes downvotes voteScore')
+      .sort(sortBy)
+      .skip(searchType === 'comment' ? startIndex : 0)
+      .limit(searchType === 'comment' ? limit : 5)
+      .populate('author', 'username profilePicture')
+      .populate({
+        path: 'post',
+        select: 'title subreddit',
+        populate: {
+          path: 'subreddit',
+          select: 'name title',
         },
-      },
-      { $sort: { voteScore: -1, commentCount: -1 } },
-      { $limit: limitNum },
-      { $project: { title: 1, voteScore: 1, commentCount: 1 } },
+      });
+
+    results.comments = comments;
+
+    if (searchType === 'comment') {
+      total = await Comment.countDocuments(commentQuery);
+    }
+  }
+
+  if (searchType === 'all' || searchType === 'subreddit') {
+    const subredditQuery = {
+      $or: [{ $text: { $search: query } }, { name: { $regex: query, $options: 'i' } }],
+      isDeleted: false,
+      ...nsfwFilter,
+      ...timeFilter,
+    };
+
+    const subreddits = await Subreddit.find(subredditQuery, { score: { $meta: 'textScore' } })
+      .select('name title description icon banner memberCount createdAt')
+      .sort(sortBy)
+      .skip(searchType === 'subreddit' ? startIndex : 0)
+      .limit(searchType === 'subreddit' ? limit : 5);
+
+    results.subreddits = subreddits;
+
+    if (searchType === 'subreddit') {
+      total = await Subreddit.countDocuments(subredditQuery);
+    }
+  }
+
+  if (searchType === 'all' || searchType === 'user') {
+    const userQuery = {
+      $or: [{ $text: { $search: query } }, { username: { $regex: query, $options: 'i' } }],
+      isDeleted: false,
+      ...timeFilter,
+    };
+
+    const users = await User.find(userQuery, { score: { $meta: 'textScore' } })
+      .select('username profilePicture bio createdAt karma')
+      .sort(sortBy)
+      .skip(searchType === 'user' ? startIndex : 0)
+      .limit(searchType === 'user' ? limit : 5);
+
+    results.users = users;
+
+    if (searchType === 'user') {
+      total = await User.countDocuments(userQuery);
+    }
+  }
+
+  if (searchType === 'all' || searchType === 'tag') {
+    const tagQuery = {
+      $or: [{ $text: { $search: query } }, { name: { $regex: query, $options: 'i' } }],
+      isActive: true,
+      ...subredditFilter,
+    };
+
+    const tags = await Tag.find(tagQuery, { score: { $meta: 'textScore' } })
+      .select('name color description scope subreddit')
+      .sort(sortBy)
+      .skip(searchType === 'tag' ? startIndex : 0)
+      .limit(searchType === 'tag' ? limit : 5)
+      .populate('subreddit', 'name title');
+
+    results.tags = tags;
+
+    if (searchType === 'tag') {
+      total = await Tag.countDocuments(tagQuery);
+    }
+  }
+
+  // Tüm içerik tiplerinde arama yapılıyorsa, toplam sonuç sayısını hesapla
+  if (searchType === 'all') {
+    const counts = await Promise.all([
+      Post.countDocuments({
+        $text: { $search: query },
+        isDeleted: false,
+        ...nsfwFilter,
+        ...subredditFilter,
+      }),
+      Comment.countDocuments({ $text: { $search: query }, isDeleted: false, ...subredditFilter }),
+      Subreddit.countDocuments({ $text: { $search: query }, isDeleted: false, ...nsfwFilter }),
+      User.countDocuments({
+        $or: [{ $text: { $search: query } }, { username: { $regex: query, $options: 'i' } }],
+        isDeleted: false,
+      }),
+      Tag.countDocuments({
+        $or: [{ $text: { $search: query } }, { name: { $regex: query, $options: 'i' } }],
+        isActive: true,
+        ...subredditFilter,
+      }),
     ]);
 
-    const trendingTerms = trendingPosts.map((post) => {
-      // Extract likely search terms from post titles
-      const words = post.title.split(/\s+/).filter((word) => word.length > 3);
-      return {
-        term: words[0] || post.title.substring(0, 15),
-        score: post.voteScore + post.commentCount,
-      };
-    });
-
-    return res.status(200).json({
-      success: true,
-      count: trendingTerms.length,
-      data: trendingTerms,
-    });
-  } catch (error) {
-    console.error('Trending searches error:', error);
-    return res.status(500).json({
-      success: false,
-      message: 'Trend aramalar getirilirken bir hata oluştu',
-      error: error.message,
-    });
+    total = counts.reduce((acc, count) => acc + count, 0);
   }
-};
+
+  // Arama sorgusu loglaması (opsiyonel)
+  if (req.user) {
+    // Kullanıcı arama geçmişi kaydedilebilir (ayrı bir model olarak oluşturulabilir)
+  }
+
+  // Sayfalama bilgisi
+  const pagination = {
+    page,
+    limit,
+    totalPages: Math.ceil(total / limit),
+    totalResults: total,
+  };
+
+  if (startIndex + limit < total) {
+    pagination.nextPage = page + 1;
+  }
+
+  if (startIndex > 0) {
+    pagination.prevPage = page - 1;
+  }
+
+  res.status(200).json({
+    success: true,
+    data: searchType === 'all' ? results : results[`${searchType}s`],
+    pagination,
+    query,
+    type: searchType,
+  });
+});
 
 /**
- * @desc    Search posts by tags
+ * @desc    Post araması
+ * @route   GET /api/search/posts
+ * @access  Public
+ */
+const searchPosts = asyncHandler(async (req, res, next) => {
+  req.query.type = 'post';
+  return searchAll(req, res, next);
+});
+
+/**
+ * @desc    Yorum araması
+ * @route   GET /api/search/comments
+ * @access  Public
+ */
+const searchComments = asyncHandler(async (req, res, next) => {
+  req.query.type = 'comment';
+  return searchAll(req, res, next);
+});
+
+/**
+ * @desc    Subreddit araması
+ * @route   GET /api/search/subreddits
+ * @access  Public
+ */
+const searchSubreddits = asyncHandler(async (req, res, next) => {
+  req.query.type = 'subreddit';
+  return searchAll(req, res, next);
+});
+
+/**
+ * @desc    Kullanıcı araması
+ * @route   GET /api/search/users
+ * @access  Public
+ */
+const searchUsers = asyncHandler(async (req, res, next) => {
+  req.query.type = 'user';
+  return searchAll(req, res, next);
+});
+
+/**
+ * @desc    Etiket araması
  * @route   GET /api/search/tags
  * @access  Public
  */
-const searchByTags = async (req, res) => {
-  try {
-    const { tags, sort = 'new', page = 1, limit = 25 } = req.query;
-
-    if (!tags) {
-      return res.status(400).json({
-        success: false,
-        message: 'En az bir etiket belirtilmelidir',
-      });
-    }
-
-    const tagList = Array.isArray(tags) ? tags : tags.split(',');
-    const pageNum = parseInt(page, 10);
-    const limitNum = parseInt(limit, 10);
-    const skip = (pageNum - 1) * limitNum;
-
-    // Find tag IDs first
-    const tagDocs = await Tag.find({ name: { $in: tagList } }).select('_id');
-    const tagIds = tagDocs.map((tag) => tag._id);
-
-    if (tagIds.length === 0) {
-      return res.status(200).json({
-        success: true,
-        count: 0,
-        total: 0,
-        totalPages: 0,
-        currentPage: pageNum,
-        data: [],
-      });
-    }
-
-    // Set up sort options
-    let sortOptions = {};
-    switch (sort) {
-      case 'new':
-        sortOptions = { createdAt: -1 };
-        break;
-      case 'top':
-        sortOptions = { voteScore: -1, createdAt: -1 };
-        break;
-      case 'comments':
-        sortOptions = { commentCount: -1, createdAt: -1 };
-        break;
-      default:
-        sortOptions = { createdAt: -1 };
-    }
-
-    // Find posts with all the specified tags
-    const posts = await Post.find({
-      tags: { $all: tagIds },
-      isDeleted: false,
-      isRemoved: false,
-    })
-      .skip(skip)
-      .limit(limitNum)
-      .sort(sortOptions)
-      .populate('author', 'username profilePicture displayName')
-      .populate('subreddit', 'name description icon color')
-      .populate('tags', 'name color');
-
-    const totalPosts = await Post.countDocuments({
-      tags: { $all: tagIds },
-      isDeleted: false,
-      isRemoved: false,
-    });
-
-    return res.status(200).json({
-      success: true,
-      count: posts.length,
-      total: totalPosts,
-      totalPages: Math.ceil(totalPosts / limitNum),
-      currentPage: pageNum,
-      tags: tagList,
-      data: posts,
-    });
-  } catch (error) {
-    console.error('Tag search error:', error);
-    return res.status(500).json({
-      success: false,
-      message: 'Etiketlerle arama gerçekleştirilirken bir hata oluştu',
-      error: error.message,
-    });
-  }
-};
+const searchTags = asyncHandler(async (req, res, next) => {
+  req.query.type = 'tag';
+  return searchAll(req, res, next);
+});
 
 /**
- * @desc    Get search statistics (for admins)
- * @route   GET /api/search/stats
- * @access  Private/Admin
+ * @desc    Otomatik tamamlama önerileri
+ * @route   GET /api/search/autocomplete
+ * @access  Public
  */
-const getSearchStats = async (req, res) => {
-  try {
-    // Verify admin privileges
-    if (!req.user || req.user.role !== 'admin') {
-      return res.status(403).json({
-        success: false,
-        message: 'Bu işlem için admin yetkileri gereklidir',
-      });
-    }
+const autocomplete = asyncHandler(async (req, res, next) => {
+  const { query, type } = req.query;
 
-    const { timeRange = 'week' } = req.query;
-
-    // Determine time filter
-    let startDate;
-    const now = new Date();
-
-    switch (timeRange) {
-      case 'day':
-        startDate = new Date(now.getTime() - 24 * 60 * 60 * 1000);
-        break;
-      case 'week':
-        startDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
-        break;
-      case 'month':
-        startDate = new Date(now.setMonth(now.getMonth() - 1));
-        break;
-      case 'year':
-        startDate = new Date(now.setFullYear(now.getFullYear() - 1));
-        break;
-      default:
-        startDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
-    }
-
-    // This would typically use a SearchLog model to track searches
-    // For now, we'll return simulated data
-    const stats = {
-      totalSearches: Math.floor(Math.random() * 10000),
-      uniqueUsers: Math.floor(Math.random() * 5000),
-      averageDuration: Math.round(Math.random() * 1000) / 1000,
-      topSearchTerms: [
-        { term: 'reddit', count: Math.floor(Math.random() * 1000) },
-        { term: 'news', count: Math.floor(Math.random() * 800) },
-        { term: 'games', count: Math.floor(Math.random() * 700) },
-        { term: 'help', count: Math.floor(Math.random() * 600) },
-        { term: 'javascript', count: Math.floor(Math.random() * 500) },
-      ],
-      searchesByType: {
-        posts: Math.floor(Math.random() * 6000),
-        comments: Math.floor(Math.random() * 2000),
-        subreddits: Math.floor(Math.random() * 1500),
-        users: Math.floor(Math.random() * 500),
-        all: Math.floor(Math.random() * 1000),
-      },
-    };
-
+  if (!query || query.trim().length < 2) {
     return res.status(200).json({
       success: true,
-      timeRange,
-      data: stats,
-    });
-  } catch (error) {
-    console.error('Search stats error:', error);
-    return res.status(500).json({
-      success: false,
-      message: 'Arama istatistikleri getirilirken bir hata oluştu',
-      error: error.message,
+      data: [],
     });
   }
-};
+
+  const limit = 10;
+  let suggestions = [];
+
+  switch (type) {
+    case 'subreddit':
+      suggestions = await Subreddit.find({
+        name: { $regex: `^${query}`, $options: 'i' },
+        isDeleted: false,
+      })
+        .select('name title icon memberCount')
+        .sort({ memberCount: -1 })
+        .limit(limit);
+      break;
+
+    case 'user':
+      suggestions = await User.find({
+        username: { $regex: `^${query}`, $options: 'i' },
+        isDeleted: false,
+      })
+        .select('username profilePicture')
+        .sort({ createdAt: -1 })
+        .limit(limit);
+      break;
+
+    case 'tag':
+      suggestions = await Tag.find({
+        name: { $regex: `^${query}`, $options: 'i' },
+        isActive: true,
+      })
+        .select('name color description scope')
+        .sort({ name: 1 })
+        .limit(limit);
+      break;
+
+    default:
+      // Karma sonuçlar (varsayılan)
+      const [subreddits, users, tags] = await Promise.all([
+        Subreddit.find({
+          name: { $regex: `^${query}`, $options: 'i' },
+          isDeleted: false,
+        })
+          .select('name title icon memberCount')
+          .sort({ memberCount: -1 })
+          .limit(5),
+
+        User.find({
+          username: { $regex: `^${query}`, $options: 'i' },
+          isDeleted: false,
+        })
+          .select('username profilePicture')
+          .sort({ createdAt: -1 })
+          .limit(5),
+
+        Tag.find({
+          name: { $regex: `^${query}`, $options: 'i' },
+          isActive: true,
+        })
+          .select('name color description scope')
+          .sort({ name: 1 })
+          .limit(5),
+      ]);
+
+      suggestions = {
+        subreddits,
+        users,
+        tags,
+      };
+      break;
+  }
+
+  res.status(200).json({
+    success: true,
+    data: suggestions,
+  });
+});
+
+/**
+ * @desc    Bir subreddit içinde arama
+ * @route   GET /api/subreddits/:subredditId/search
+ * @access  Public
+ */
+const searchInSubreddit = asyncHandler(async (req, res, next) => {
+  const { subredditId } = req.params;
+
+  if (!mongoose.Types.ObjectId.isValid(subredditId)) {
+    return next(new ErrorResponse('Geçersiz subreddit ID formatı', 400));
+  }
+
+  // Subreddit'in varlığını kontrol et
+  const subreddit = await Subreddit.findById(subredditId);
+  if (!subreddit) {
+    return next(new ErrorResponse('Subreddit bulunamadı', 404));
+  }
+
+  // Subreddit filtresi ekle
+  req.query.subreddit = subredditId;
+
+  // Aranan içerik tipini kontrol et
+  if (!req.query.type || req.query.type === 'subreddit') {
+    req.query.type = 'post'; // Subreddit içinde varsayılan olarak post ara
+  }
+
+  // Global arama fonksiyonunu çağır
+  return searchAll(req, res, next);
+});
+
+/**
+ * @desc    Gelişmiş arama
+ * @route   POST /api/search/advanced
+ * @access  Public
+ */
+const advancedSearch = asyncHandler(async (req, res, next) => {
+  const {
+    query,
+    includeKeywords,
+    excludeKeywords,
+    author,
+    subreddit,
+    dateRange,
+    scoreRange,
+    commentCountRange,
+    flairs,
+    contentTypes,
+    nsfw,
+    sort,
+  } = req.body;
+
+  // Ana arama sorgusu
+  if (!query && !includeKeywords?.length && !author && !subreddit) {
+    return next(new ErrorResponse('En az bir arama kriteri belirtilmelidir', 400));
+  }
+
+  // Sayfalama için
+  const page = parseInt(req.query.page, 10) || 1;
+  const limit = parseInt(req.query.limit, 10) || 25;
+  const startIndex = (page - 1) * limit;
+
+  // MongoDB sorguları oluştur
+  let postQuery = { isDeleted: false };
+  let commentQuery = { isDeleted: false };
+
+  // Ana arama sorgusu
+  if (query) {
+    postQuery.$text = { $search: query };
+    commentQuery.$text = { $search: query };
+  }
+
+  // Dahil edilecek anahtar kelimeler
+  if (includeKeywords && includeKeywords.length > 0) {
+    const keywordRegex = includeKeywords.map(
+      (keyword) => new RegExp(keyword.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&'), 'i'),
+    );
+
+    if (!postQuery.$and) postQuery.$and = [];
+    if (!commentQuery.$and) commentQuery.$and = [];
+
+    postQuery.$and.push({
+      $or: [{ title: { $in: keywordRegex } }, { content: { $in: keywordRegex } }],
+    });
+
+    commentQuery.$and.push({
+      content: { $in: keywordRegex },
+    });
+  }
+
+  // Hariç tutulacak anahtar kelimeler
+  if (excludeKeywords && excludeKeywords.length > 0) {
+    const keywordRegex = excludeKeywords.map(
+      (keyword) => new RegExp(keyword.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&'), 'i'),
+    );
+
+    if (!postQuery.$and) postQuery.$and = [];
+    if (!commentQuery.$and) commentQuery.$and = [];
+
+    postQuery.$and.push({
+      $nor: [{ title: { $in: keywordRegex } }, { content: { $in: keywordRegex } }],
+    });
+
+    commentQuery.$and.push({
+      $nor: [{ content: { $in: keywordRegex } }],
+    });
+  }
+
+  // Yazar filtresi
+  if (author) {
+    if (mongoose.Types.ObjectId.isValid(author)) {
+      postQuery.author = author;
+      commentQuery.author = author;
+    } else {
+      // Kullanıcı adı ile arama
+      const authorUser = await User.findOne({ username: author });
+      if (authorUser) {
+        postQuery.author = authorUser._id;
+        commentQuery.author = authorUser._id;
+      } else {
+        return next(new ErrorResponse('Belirtilen yazar bulunamadı', 404));
+      }
+    }
+  }
+
+  // Subreddit filtresi
+  if (subreddit) {
+    if (mongoose.Types.ObjectId.isValid(subreddit)) {
+      postQuery.subreddit = subreddit;
+      // Yorumlar için post->subreddit ilişkisi kurulacak
+    } else {
+      // Subreddit adı ile arama
+      const subredditDoc = await Subreddit.findOne({ name: subreddit.toLowerCase() });
+      if (subredditDoc) {
+        postQuery.subreddit = subredditDoc._id;
+        // Yorumlar için post->subreddit ilişkisi kurulacak
+      } else {
+        return next(new ErrorResponse('Belirtilen subreddit bulunamadı', 404));
+      }
+    }
+  }
+
+  // Tarih aralığı filtresi
+  if (dateRange) {
+    const dateFilter = {};
+
+    if (dateRange.from) {
+      dateFilter.$gte = new Date(dateRange.from);
+    }
+
+    if (dateRange.to) {
+      dateFilter.$lte = new Date(dateRange.to);
+    }
+
+    if (Object.keys(dateFilter).length > 0) {
+      postQuery.createdAt = dateFilter;
+      commentQuery.createdAt = dateFilter;
+    }
+  }
+
+  // Skor aralığı filtresi (upvotes - downvotes)
+  if (scoreRange) {
+    const scoreFilter = {};
+
+    if (scoreRange.min !== undefined) {
+      scoreFilter.$gte = scoreRange.min;
+    }
+
+    if (scoreRange.max !== undefined) {
+      scoreFilter.$lte = scoreRange.max;
+    }
+
+    if (Object.keys(scoreFilter).length > 0) {
+      postQuery.voteScore = scoreFilter;
+      commentQuery.voteScore = scoreFilter;
+    }
+  }
+
+  // Yorum sayısı aralığı filtresi (sadece gönderiler için)
+  if (commentCountRange) {
+    const commentFilter = {};
+
+    if (commentCountRange.min !== undefined) {
+      commentFilter.$gte = commentCountRange.min;
+    }
+
+    if (commentCountRange.max !== undefined) {
+      commentFilter.$lte = commentCountRange.max;
+    }
+
+    if (Object.keys(commentFilter).length > 0) {
+      postQuery.commentCount = commentFilter;
+    }
+  }
+
+  // Flair filtresi (sadece gönderiler için)
+  if (flairs && flairs.length > 0) {
+    postQuery.flair = { $in: flairs };
+  }
+
+  // İçerik tipi filtresi (sadece gönderiler için)
+  if (contentTypes && contentTypes.length > 0) {
+    postQuery.type = { $in: contentTypes };
+  }
+
+  // NSFW içerik filtresi
+  if (nsfw !== undefined) {
+    postQuery.isNSFW = nsfw;
+  }
+
+  // Sıralama seçenekleri
+  const sortOptions = {
+    relevance: { score: { $meta: 'textScore' } },
+    new: { createdAt: -1 },
+    old: { createdAt: 1 },
+    top: { voteScore: -1 },
+    bottom: { voteScore: 1 },
+    comments: { commentCount: -1 },
+  };
+
+  const sortBy = sort ? sortOptions[sort] : sortOptions.relevance;
+
+  // İçerik tipine göre arama sonuçlarını getir
+  const results = {};
+  let total = 0;
+
+  // Aranacak içerik tiplerini belirle
+  const searchTypes = contentTypes || ['post', 'comment'];
+
+  // Post araması
+  if (searchTypes.includes('post')) {
+    const projection = query ? { score: { $meta: 'textScore' } } : {};
+
+    results.posts = await Post.find(postQuery, projection)
+      .select(
+        'title content type author subreddit createdAt upvotes downvotes voteScore commentCount isNSFW flair',
+      )
+      .sort(sortBy)
+      .skip(startIndex)
+      .limit(limit)
+      .populate('author', 'username profilePicture')
+      .populate('subreddit', 'name title')
+      .populate('flair', 'name color');
+
+    total += await Post.countDocuments(postQuery);
+  }
+
+  // Yorum araması
+  if (searchTypes.includes('comment')) {
+    const projection = query ? { score: { $meta: 'textScore' } } : {};
+
+    // Subreddit filtresi varsa, yorumların bağlı olduğu postları filtrelememiz gerekiyor
+    if (subreddit) {
+      const subredditId = mongoose.Types.ObjectId.isValid(subreddit)
+        ? subreddit
+        : (await Subreddit.findOne({ name: subreddit.toLowerCase() }))._id;
+
+      const postsInSubreddit = await Post.find({ subreddit: subredditId }).select('_id');
+      const postIds = postsInSubreddit.map((post) => post._id);
+
+      commentQuery.post = { $in: postIds };
+    }
+
+    results.comments = await Comment.find(commentQuery, projection)
+      .select('content author post createdAt upvotes downvotes voteScore')
+      .sort(sortBy)
+      .skip(startIndex)
+      .limit(limit)
+      .populate('author', 'username profilePicture')
+      .populate({
+        path: 'post',
+        select: 'title subreddit',
+        populate: {
+          path: 'subreddit',
+          select: 'name title',
+        },
+      });
+
+    total += await Comment.countDocuments(commentQuery);
+  }
+
+  // Sayfalama bilgisi
+  const pagination = {
+    page,
+    limit,
+    totalPages: Math.ceil(total / limit),
+    totalResults: total,
+  };
+
+  if (startIndex + limit < total) {
+    pagination.nextPage = page + 1;
+  }
+
+  if (startIndex > 0) {
+    pagination.prevPage = page - 1;
+  }
+
+  res.status(200).json({
+    success: true,
+    data: results,
+    pagination,
+    filters: {
+      query,
+      includeKeywords,
+      excludeKeywords,
+      author,
+      subreddit,
+      dateRange,
+      scoreRange,
+      commentCountRange,
+      flairs,
+      contentTypes,
+      nsfw,
+      sort,
+    },
+  });
+});
+
+/**
+ * @desc    Popüler arama terimlerini getir
+ * @route   GET /api/search/trending
+ * @access  Public
+ */
+const getTrendingSearches = asyncHandler(async (req, res, next) => {
+  // Not: Bu fonksiyon için ayrı bir model oluşturulabilir (SearchAnalytics)
+  // Burada örnek olarak sabit bir liste dönüyoruz
+
+  // Gerçek bir uygulamada, son aramaların istatistiklerini tutmak için
+  // bir koleksiyon oluşturulabilir ve bu veriler düzenli olarak güncellenebilir
+
+  const trending = [
+    { term: 'yeni başlayanlar', count: 258 },
+    { term: 'en iyi oyunlar', count: 187 },
+    { term: 'güncel haberler', count: 153 },
+    { term: 'resim paylaşımı', count: 129 },
+    { term: 'podcast önerileri', count: 112 },
+    { term: 'yemek tarifleri', count: 98 },
+    { term: 'programlama', count: 87 },
+    { term: 'film önerileri', count: 76 },
+    { term: 'spor haberleri', count: 71 },
+    { term: 'müzik listeleri', count: 65 },
+  ];
+
+  res.status(200).json({
+    success: true,
+    data: trending,
+  });
+});
+
+/**
+ * @desc    Kullanıcının geçmiş aramalarını getir
+ * @route   GET /api/search/history
+ * @access  Private
+ */
+const getSearchHistory = asyncHandler(async (req, res, next) => {
+  // Not: Bu fonksiyon için ayrı bir model oluşturulabilir (UserSearchHistory)
+
+  // Eğer kullanıcı oturum açmamışsa
+  if (!req.user) {
+    return next(new ErrorResponse('Bu işlem için oturum açmanız gerekiyor', 401));
+  }
+
+  // Örnek olarak sabit bir liste dönüyoruz
+  // Gerçek bir uygulamada, kullanıcı aramalarını kaydetmek için
+  // bir koleksiyon oluşturulabilir (örneğin UserSearchHistory)
+
+  // Temsili kullanıcı arama geçmişi
+  const history = [
+    { query: 'programlama dilleri', timestamp: new Date(Date.now() - 86400000 * 2), type: 'all' },
+    { query: 'javascript', timestamp: new Date(Date.now() - 86400000), type: 'post' },
+    { query: 'react hooks', timestamp: new Date(Date.now() - 3600000 * 5), type: 'post' },
+    { query: 'node.js', timestamp: new Date(Date.now() - 1800000), type: 'subreddit' },
+  ];
+
+  res.status(200).json({
+    success: true,
+    data: history,
+  });
+});
+
+/**
+ * @desc    Arama geçmişini temizle
+ * @route   DELETE /api/search/history
+ * @access  Private
+ */
+const clearSearchHistory = asyncHandler(async (req, res, next) => {
+  // Eğer kullanıcı oturum açmamışsa
+  if (!req.user) {
+    return next(new ErrorResponse('Bu işlem için oturum açmanız gerekiyor', 401));
+  }
+
+  // Gerçek bir uygulamada, kullanıcının arama geçmişini temizler
+  // Örnek: await UserSearchHistory.deleteMany({ user: req.user._id });
+
+  res.status(200).json({
+    success: true,
+    message: 'Arama geçmişiniz başarıyla temizlendi',
+  });
+});
+
+/**
+ * @desc    Gelişmiş arama için kullanılabilecek filtreleri getir
+ * @route   GET /api/search/filters
+ * @access  Public
+ */
+const getSearchFilters = asyncHandler(async (req, res, next) => {
+  // Filtreleme seçeneklerini getir
+  const [postTypes, flairsList, popularSubreddits] = await Promise.all([
+    // Post tipleri
+    [
+      { value: 'text', label: 'Metin' },
+      { value: 'link', label: 'Bağlantı' },
+      { value: 'image', label: 'Resim' },
+      { value: 'video', label: 'Video' },
+      { value: 'poll', label: 'Anket' },
+    ],
+
+    // En popüler flairler
+    Tag.find({})
+      .sort({ usageCount: -1 })
+      .limit(20)
+      .select('name color description scope subreddit')
+      .populate('subreddit', 'name'),
+
+    // En popüler subredditler
+    Subreddit.find({}).sort({ memberCount: -1 }).limit(20).select('name title icon'),
+  ]);
+
+  // Sıralama seçenekleri
+  const sortOptions = [
+    { value: 'relevance', label: 'Alaka Düzeyi' },
+    { value: 'new', label: 'En Yeni' },
+    { value: 'old', label: 'En Eski' },
+    { value: 'top', label: 'En Çok Oy Alan' },
+    { value: 'bottom', label: 'En Az Oy Alan' },
+    { value: 'comments', label: 'En Çok Yorum Alan' },
+  ];
+
+  // Zaman filtresi seçenekleri
+  const timeOptions = [
+    { value: 'hour', label: 'Son 1 saat' },
+    { value: 'day', label: 'Son 24 saat' },
+    { value: 'week', label: 'Son 1 hafta' },
+    { value: 'month', label: 'Son 1 ay' },
+    { value: 'year', label: 'Son 1 yıl' },
+    { value: 'all', label: 'Tüm zamanlar' },
+  ];
+
+  res.status(200).json({
+    success: true,
+    data: {
+      postTypes,
+      flairs: flairsList,
+      subreddits: popularSubreddits,
+      sortOptions,
+      timeOptions,
+    },
+  });
+});
+
+/**
+ * @desc    Belirli bir kullanıcının gönderilerini ve yorumlarını ara
+ * @route   GET /api/users/:username/search
+ * @access  Public
+ */
+const searchUserContent = asyncHandler(async (req, res, next) => {
+  const { username } = req.params;
+  const { query, type, sort, time } = req.query;
+
+  // Kullanıcıyı bul
+  const user = await User.findOne({ username });
+
+  if (!user) {
+    return next(new ErrorResponse('Kullanıcı bulunamadı', 404));
+  }
+
+  // Arama tipi (post, comment veya all)
+  const contentType = ['post', 'comment'].includes(type) ? type : 'all';
+
+  // Arama sorgusu
+  const searchQuery = query && query.trim().length >= 3 ? query : '';
+
+  // Sayfalama için
+  const page = parseInt(req.query.page, 10) || 1;
+  const limit = parseInt(req.query.limit, 10) || 25;
+  const startIndex = (page - 1) * limit;
+
+  // Zaman filtresi
+  const timeFilter = {};
+  if (time) {
+    const now = new Date();
+    switch (time) {
+      case 'hour':
+        timeFilter.createdAt = { $gte: new Date(now.setHours(now.getHours() - 1)) };
+        break;
+      case 'day':
+        timeFilter.createdAt = { $gte: new Date(now.setDate(now.getDate() - 1)) };
+        break;
+      case 'week':
+        timeFilter.createdAt = { $gte: new Date(now.setDate(now.getDate() - 7)) };
+        break;
+      case 'month':
+        timeFilter.createdAt = { $gte: new Date(now.setMonth(now.getMonth() - 1)) };
+        break;
+      case 'year':
+        timeFilter.createdAt = { $gte: new Date(now.setFullYear(now.getFullYear() - 1)) };
+        break;
+    }
+  }
+
+  // Sıralama seçenekleri
+  const sortOptions = {
+    relevance: searchQuery ? { score: { $meta: 'textScore' } } : { createdAt: -1 },
+    new: { createdAt: -1 },
+    old: { createdAt: 1 },
+    top: { voteScore: -1 },
+    comments: { commentCount: -1 },
+  };
+
+  const sortBy = sortOptions[sort] || sortOptions.new;
+
+  // Sonuçlar
+  const results = {};
+  let total = 0;
+
+  // Postları ara
+  if (contentType === 'all' || contentType === 'post') {
+    const postQuery = {
+      author: user._id,
+      isDeleted: false,
+      ...timeFilter,
+    };
+
+    if (searchQuery) {
+      postQuery.$text = { $search: searchQuery };
+    }
+
+    const projection = searchQuery ? { score: { $meta: 'textScore' } } : {};
+
+    const posts = await Post.find(postQuery, projection)
+      .select(
+        'title content type subreddit createdAt upvotes downvotes voteScore commentCount isNSFW',
+      )
+      .sort(sortBy)
+      .skip(contentType === 'post' ? startIndex : 0)
+      .limit(contentType === 'post' ? limit : 5)
+      .populate('subreddit', 'name title');
+
+    results.posts = posts;
+
+    if (contentType === 'post') {
+      total = await Post.countDocuments(postQuery);
+    }
+  }
+
+  // Yorumları ara
+  if (contentType === 'all' || contentType === 'comment') {
+    const commentQuery = {
+      author: user._id,
+      isDeleted: false,
+      ...timeFilter,
+    };
+
+    if (searchQuery) {
+      commentQuery.$text = { $search: searchQuery };
+    }
+
+    const projection = searchQuery ? { score: { $meta: 'textScore' } } : {};
+
+    const comments = await Comment.find(commentQuery, projection)
+      .select('content post createdAt upvotes downvotes voteScore')
+      .sort(sortBy)
+      .skip(contentType === 'comment' ? startIndex : 0)
+      .limit(contentType === 'comment' ? limit : 5)
+      .populate({
+        path: 'post',
+        select: 'title subreddit',
+        populate: {
+          path: 'subreddit',
+          select: 'name title',
+        },
+      });
+
+    results.comments = comments;
+
+    if (contentType === 'comment') {
+      total = await Comment.countDocuments(commentQuery);
+    }
+  }
+
+  // Toplam sayı (all için)
+  if (contentType === 'all') {
+    const postCount = await Post.countDocuments({
+      author: user._id,
+      isDeleted: false,
+      ...timeFilter,
+      ...(searchQuery && { $text: { $search: searchQuery } }),
+    });
+
+    const commentCount = await Comment.countDocuments({
+      author: user._id,
+      isDeleted: false,
+      ...timeFilter,
+      ...(searchQuery && { $text: { $search: searchQuery } }),
+    });
+
+    total = postCount + commentCount;
+  }
+
+  // Sayfalama bilgisi
+  const pagination = {
+    page,
+    limit,
+    totalPages: Math.ceil(total / limit),
+    totalResults: total,
+  };
+
+  if (startIndex + limit < total) {
+    pagination.nextPage = page + 1;
+  }
+
+  if (startIndex > 0) {
+    pagination.prevPage = page - 1;
+  }
+
+  res.status(200).json({
+    success: true,
+    data: contentType === 'all' ? results : results[`${contentType}s`],
+    pagination,
+    query: searchQuery,
+    user: {
+      username: user.username,
+      profilePicture: user.profilePicture,
+    },
+  });
+});
 
 module.exports = {
-  search,
+  searchAll,
+  searchPosts,
+  searchComments,
+  searchSubreddits,
+  searchUsers,
+  searchTags,
+  autocomplete,
   searchInSubreddit,
-  getSearchSuggestions,
+  advancedSearch,
   getTrendingSearches,
-  searchByTags,
-  getSearchStats,
+  getSearchHistory,
+  clearSearchHistory,
+  getSearchFilters,
+  searchUserContent,
 };

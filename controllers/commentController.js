@@ -1,745 +1,743 @@
-const {
-  Comment,
-  Post,
-  Vote,
-  User,
-  SavedItem,
-  SubredditMembership,
-  ModLog,
-  Report,
-  Notification,
-} = require('../models');
+const Comment = require('../models/Comment');
+const Post = require('../models/Post');
+const User = require('../models/User');
+const Vote = require('../models/Vote');
+const Notification = require('../models/Notification');
+const SavedItem = require('../models/SavedItem');
+const ModLog = require('../models/ModLog');
+const EditHistory = require('../models/EditHistory');
 const mongoose = require('mongoose');
+const asyncHandler = require('../middleware/async');
+const ErrorResponse = require('../utils/errorResponse');
+
+/**
+ * @desc    Yorumu ID'ye göre getir
+ * @route   GET /api/comments/:commentId
+ * @access  Public
+ */
+const getCommentById = asyncHandler(async (req, res, next) => {
+  const { commentId } = req.params;
+
+  if (!mongoose.Types.ObjectId.isValid(commentId)) {
+    return next(new ErrorResponse('Geçersiz yorum ID formatı', 400));
+  }
+
+  const comment = await Comment.findById(commentId)
+    .populate('author', 'username avatar isDeleted')
+    .populate('post', 'title subreddit')
+    .populate({
+      path: 'post',
+      populate: {
+        path: 'subreddit',
+        select: 'name isPrivate',
+      },
+    });
+
+  if (!comment) {
+    return next(new ErrorResponse('Yorum bulunamadı', 404));
+  }
+
+  // Kullanıcı oyunu kontrol et
+  let userVote = null;
+  let isSaved = false;
+
+  if (req.user) {
+    const vote = await Vote.findOne({
+      user: req.user._id,
+      comment: commentId,
+    });
+
+    userVote = vote ? vote.value : null;
+
+    // Kaydedilme durumunu kontrol et
+    const savedItem = await SavedItem.findOne({
+      user: req.user._id,
+      comment: commentId,
+    });
+
+    isSaved = !!savedItem;
+  }
+
+  // Yanıt verilerini dahil et ve doğru yanıt sayısını al
+  const replyCount = await Comment.countDocuments({
+    parent: commentId,
+    isDeleted: false,
+  });
+
+  const commentData = {
+    ...comment.toJSON(),
+    userVote,
+    isSaved,
+    replyCount,
+  };
+
+  res.status(200).json({
+    success: true,
+    data: commentData,
+  });
+});
 
 /**
  * @desc    Yeni yorum oluştur
  * @route   POST /api/comments
  * @access  Private
  */
-const createComment = async (req, res) => {
-  try {
-    const { content, postId, parentId } = req.body;
-    const userId = req.user._id;
+const createComment = asyncHandler(async (req, res, next) => {
+  const { content, postId, parentId } = req.body;
+  const userId = req.user._id;
 
-    // Gerekli alan kontrolü
-    if (!content || !content.trim()) {
-      return res.status(400).json({
-        success: false,
-        message: 'Yorum içeriği zorunludur',
-      });
+  if (!content || !postId) {
+    return next(new ErrorResponse('İçerik ve gönderi ID zorunludur', 400));
+  }
+
+  // Post kontrolü
+  const post = await Post.findById(postId);
+  if (!post) {
+    return next(new ErrorResponse('Gönderi bulunamadı', 404));
+  }
+
+  // Kilitli gönderiye yorum kontrolü
+  if (post.isLocked) {
+    return next(new ErrorResponse('Bu gönderi kilitlenmiş, yorum yapamazsınız', 403));
+  }
+
+  // Parent comment kontrolü ve derinlik hesaplaması
+  let depth = 0;
+  let parentComment = null;
+
+  if (parentId) {
+    if (!mongoose.Types.ObjectId.isValid(parentId)) {
+      return next(new ErrorResponse('Geçersiz üst yorum ID formatı', 400));
     }
 
-    if (!postId) {
-      return res.status(400).json({
-        success: false,
-        message: 'Post ID zorunludur',
-      });
+    parentComment = await Comment.findById(parentId);
+    if (!parentComment) {
+      return next(new ErrorResponse('Üst yorum bulunamadı', 404));
     }
 
-    // Post'un var olup olmadığını kontrol et
-    const post = await Post.findById(postId);
-    if (!post || post.isDeleted || post.isRemoved) {
-      return res.status(404).json({
-        success: false,
-        message: 'Gönderi bulunamadı',
-      });
+    // Üst yorumun kilitli olup olmadığını kontrol et
+    if (parentComment.isLocked) {
+      return next(new ErrorResponse('Bu yorum kilitlenmiş, yanıt veremezsiniz', 403));
     }
 
-    // Post kilitlenmişse yorum yapılamaz
-    if (post.isLocked) {
-      return res.status(403).json({
-        success: false,
-        message: 'Bu gönderi kilitlenmiş, yorum yapılamaz',
-      });
+    depth = parentComment.depth + 1;
+
+    // Maksimum derinlik kontrolü
+    if (depth > 10) {
+      return next(new ErrorResponse('Maksimum yorum derinliği aşıldı (10)', 400));
     }
+  }
 
-    // Eğer ebeveyn yorum varsa kontrol et
-    if (parentId) {
-      const parentComment = await Comment.findById(parentId);
-      if (!parentComment || parentComment.isDeleted || parentComment.isRemoved) {
-        return res.status(404).json({
-          success: false,
-          message: 'Ebeveyn yorum bulunamadı',
-        });
-      }
+  // Yeni yorum oluştur
+  const comment = await Comment.create({
+    content,
+    author: userId,
+    post: postId,
+    parent: parentId || null,
+    depth,
+  });
 
-      // Ebeveyn yorumun aynı post'a ait olduğundan emin ol
-      if (parentComment.post.toString() !== postId) {
-        return res.status(400).json({
-          success: false,
-          message: 'Ebeveyn yorum belirtilen gönderiye ait değil',
-        });
-      }
-    }
-
-    // Kullanıcının subreddit'ten banlanıp banlanmadığını kontrol et
-    const subredditId = post.subreddit;
-    const membership = await SubredditMembership.findOne({
-      user: userId,
-      subreddit: subredditId,
-    });
-
-    if (membership && membership.status === 'banned') {
-      return res.status(403).json({
-        success: false,
-        message: 'Bu topluluktan banlandınız, yorum yapamazsınız',
-      });
-    }
-
-    // Yeni yorumu oluştur
-    const newComment = new Comment({
-      content,
-      author: userId,
-      post: postId,
-      parentId: parentId || null,
-      depth: parentId ? 1 : 0, // Derinlik hesabı daha sonra düzeltilecek
-    });
-
-    // Yorum derinliğini hesapla
-    if (parentId) {
-      const parentComment = await Comment.findById(parentId);
-      newComment.depth = (parentComment.depth || 0) + 1;
-    }
-
-    await newComment.save();
-
-    // Post'un yorum sayısını güncelle
-    post.commentCount = (post.commentCount || 0) + 1;
-    await post.save();
-
-    // Yeni oluşturulan yorumu popüle edilmiş şekilde getir
-    const populatedComment = await Comment.findById(newComment._id)
-      .populate('author', 'username profilePicture displayName')
-      .populate({
-        path: 'post',
-        select: 'title',
-        populate: {
-          path: 'subreddit',
-          select: 'name',
-        },
-      });
-
-    // Bildirim oluştur (kendi yorumuna yanıt vermiyorsa)
-    if (parentId) {
-      const parentComment = await Comment.findById(parentId);
-      if (parentComment.author.toString() !== userId.toString()) {
-        await Notification.create({
-          recipient: parentComment.author,
-          sender: userId,
-          type: 'comment_reply',
-          relatedPost: postId,
-          relatedComment: newComment._id,
-          message: `${req.user.username} yorumunuza yanıt verdi`,
-        });
-      }
-    } else if (post.author.toString() !== userId.toString()) {
-      // Ana gönderi sahibine bildirim gönder (kendisi değilse)
-      await Notification.create({
-        recipient: post.author,
-        sender: userId,
-        type: 'post_comment',
-        relatedPost: postId,
-        relatedComment: newComment._id,
-        message: `${req.user.username} gönderinize yorum yaptı`,
-      });
-    }
-
-    // Başarılı yanıt
-    res.status(201).json({
-      success: true,
-      message: 'Yorum başarıyla oluşturuldu',
-      data: populatedComment,
-    });
-  } catch (error) {
-    console.error('Create comment error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Yorum oluşturulurken bir hata oluştu',
-      error: error.message,
+  // Yanıt sayısını güncelle
+  if (parentId) {
+    await Comment.findByIdAndUpdate(parentId, {
+      $inc: { replyCount: 1 },
     });
   }
-};
+
+  // Post yorum sayısını güncelle
+  await Post.findByIdAndUpdate(postId, {
+    $inc: { commentCount: 1 },
+  });
+
+  // Bildirim gönder (kendi yorumuna yanıt vermiyorsa)
+  if (parentComment && !parentComment.author.equals(userId)) {
+    await Notification.create({
+      recipient: parentComment.author,
+      sender: userId,
+      type: 'comment_reply',
+      comment: comment._id,
+      post: postId,
+    });
+  } else if (!parentComment && !post.author.equals(userId)) {
+    // Post'a yorum yapılmışsa ve kendi postu değilse bildirim oluştur
+    await Notification.create({
+      recipient: post.author,
+      sender: userId,
+      type: 'post_comment',
+      comment: comment._id,
+      post: postId,
+    });
+  }
+
+  // Yanıt için verilen yorumu popüle et
+  const populatedComment = await Comment.findById(comment._id)
+    .populate('author', 'username avatar')
+    .populate('post', 'title');
+
+  res.status(201).json({
+    success: true,
+    data: populatedComment,
+  });
+});
 
 /**
  * @desc    Yorumu güncelle
  * @route   PUT /api/comments/:commentId
- * @access  Private (Sadece yorum sahibi veya moderatör)
+ * @access  Private (yorum sahibi)
  */
-const updateComment = async (req, res) => {
-  try {
-    const { commentId } = req.params;
-    const { content, moderatorNote } = req.body;
-    const userId = req.user._id;
+const updateComment = asyncHandler(async (req, res, next) => {
+  const { commentId } = req.params;
+  const { content } = req.body;
+  const userId = req.user._id;
 
-    // Geçerli ID kontrolü
-    if (!mongoose.Types.ObjectId.isValid(commentId)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Geçersiz yorum ID formatı',
-      });
-    }
-
-    // Yorumu bul
-    const comment = await Comment.findById(commentId).populate({
-      path: 'post',
-      select: 'subreddit isLocked',
-      populate: {
-        path: 'subreddit',
-        select: 'name',
-      },
-    });
-
-    if (!comment || comment.isDeleted) {
-      return res.status(404).json({
-        success: false,
-        message: 'Yorum bulunamadı',
-      });
-    }
-
-    // Yorumun kilitli bir gönderiye ait olup olmadığını kontrol et
-    if (comment.post.isLocked) {
-      return res.status(403).json({
-        success: false,
-        message: 'Bu gönderi kilitlenmiş, yorumlar düzenlenemez',
-      });
-    }
-
-    // Kullanıcının yetkisini kontrol et
-    const isAuthor = comment.author.toString() === userId.toString();
-    const isModerator = await SubredditMembership.exists({
-      user: userId,
-      subreddit: comment.post.subreddit._id,
-      status: { $in: ['moderator', 'admin'] },
-    });
-
-    if (!isAuthor && !isModerator) {
-      return res.status(403).json({
-        success: false,
-        message: 'Bu yorumu düzenleme yetkiniz yok',
-      });
-    }
-
-    // Yazarlar sadece belirli süre içinde düzenleyebilir
-    if (isAuthor && !isModerator) {
-      // 5 dakikalık düzenleme süresi (Reddit kuralı)
-      const editTimeLimit = 5 * 60 * 1000; // 5 dakika
-      const isEditable = Date.now() - comment.createdAt < editTimeLimit;
-
-      if (!isEditable) {
-        return res.status(403).json({
-          success: false,
-          message: 'Yorum düzenleme süresi dolmuştur (5 dakika)',
-        });
-      }
-
-      // İçeriği güncelle
-      if (!content || !content.trim()) {
-        return res.status(400).json({
-          success: false,
-          message: 'Yorum içeriği boş olamaz',
-        });
-      }
-
-      comment.content = content;
-      comment.isEdited = true;
-      comment.lastEditedAt = Date.now();
-    }
-    // Moderatör güncellemesi
-    else if (isModerator) {
-      if (content !== undefined) {
-        comment.content = content;
-        comment.isEdited = true;
-        comment.lastEditedAt = Date.now();
-      }
-
-      // Moderatör işlemi olarak kaydet
-      if (moderatorNote) {
-        await ModLog.create({
-          subreddit: comment.post.subreddit._id,
-          moderator: userId,
-          targetType: 'comment',
-          targetId: commentId,
-          action: 'edit',
-          reason: moderatorNote,
-        });
-      }
-    }
-
-    await comment.save();
-
-    // Güncellenmiş yorumu getir
-    const updatedComment = await Comment.findById(commentId)
-      .populate('author', 'username profilePicture displayName')
-      .populate({
-        path: 'post',
-        select: 'title',
-        populate: {
-          path: 'subreddit',
-          select: 'name',
-        },
-      });
-
-    res.status(200).json({
-      success: true,
-      message: 'Yorum başarıyla güncellendi',
-      data: updatedComment,
-    });
-  } catch (error) {
-    console.error('Update comment error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Yorum güncellenirken bir hata oluştu',
-      error: error.message,
-    });
+  if (!content) {
+    return next(new ErrorResponse('İçerik zorunludur', 400));
   }
-};
+
+  const comment = await Comment.findById(commentId);
+
+  if (!comment) {
+    return next(new ErrorResponse('Yorum bulunamadı', 404));
+  }
+
+  // Silinen yorumlar düzenlenemez
+  if (comment.isDeleted) {
+    return next(new ErrorResponse('Silinmiş yorumlar düzenlenemez', 400));
+  }
+
+  // Yorum sahibi kontrolü (middleware yapıyor olsa da, güvenlik için tekrar kontrol)
+  if (!comment.author.equals(userId) && req.user.role !== 'admin') {
+    return next(new ErrorResponse('Bu işlem için yetkiniz bulunmamaktadır', 403));
+  }
+
+  // Orijinal içeriği kaydet
+  const originalContent = comment.content;
+
+  // Düzenleme geçmişi oluştur
+  const editHistory = await EditHistory.create({
+    contentType: 'comment',
+    contentId: commentId,
+    oldContent: originalContent,
+    newContent: content,
+    editedBy: userId,
+    editedAt: new Date(),
+  });
+
+  // Yorumu güncelle
+  comment.content = content;
+  comment.editedAt = Date.now();
+  comment.editHistory.push(editHistory._id);
+  await comment.save();
+
+  res.status(200).json({
+    success: true,
+    data: comment,
+  });
+});
 
 /**
  * @desc    Yorumu sil (soft delete)
  * @route   DELETE /api/comments/:commentId
- * @access  Private (Sadece yorum sahibi veya moderatör)
+ * @access  Private (yorum sahibi)
  */
-const deleteComment = async (req, res) => {
-  try {
-    const { commentId } = req.params;
-    const { reason } = req.body;
-    const userId = req.user._id;
+const deleteComment = asyncHandler(async (req, res, next) => {
+  const { commentId } = req.params;
+  const userId = req.user._id;
 
-    // Geçerli ID kontrolü
-    if (!mongoose.Types.ObjectId.isValid(commentId)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Geçersiz yorum ID formatı',
-      });
-    }
+  const comment = await Comment.findById(commentId);
 
-    // Yorumu bul
-    const comment = await Comment.findById(commentId).populate({
-      path: 'post',
-      select: 'subreddit isLocked',
-      populate: {
-        path: 'subreddit',
-        select: 'name',
-      },
-    });
+  if (!comment) {
+    return next(new ErrorResponse('Yorum bulunamadı', 404));
+  }
 
-    if (!comment || comment.isDeleted) {
-      return res.status(404).json({
-        success: false,
-        message: 'Yorum bulunamadı',
-      });
-    }
+  if (comment.isDeleted) {
+    return next(new ErrorResponse('Bu yorum zaten silinmiş', 400));
+  }
 
-    // Yorumun kilitli bir gönderiye ait olup olmadığını kontrol et
-    if (comment.post.isLocked) {
-      return res.status(403).json({
-        success: false,
-        message: 'Bu gönderi kilitlenmiş, yorumlar silinemez',
-      });
-    }
+  // Yorum sahibi kontrolü (middleware yapıyor olsa da, güvenlik için tekrar kontrol)
+  if (!comment.author.equals(userId) && req.user.role !== 'admin') {
+    return next(new ErrorResponse('Bu işlem için yetkiniz bulunmamaktadır', 403));
+  }
 
-    // Kullanıcının yetkisini kontrol et
-    const isAuthor = comment.author.toString() === userId.toString();
-    const isModerator = await SubredditMembership.exists({
-      user: userId,
-      subreddit: comment.post.subreddit._id,
-      status: { $in: ['moderator', 'admin'] },
-    });
+  // Yorumu soft delete yap
+  comment.isDeleted = true;
+  comment.deletedAt = Date.now();
+  comment.deletedBy = userId;
+  await comment.save();
 
-    if (!isAuthor && !isModerator) {
-      return res.status(403).json({
-        success: false,
-        message: 'Bu yorumu silme yetkiniz yok',
-      });
-    }
+  res.status(200).json({
+    success: true,
+    data: { message: 'Yorum başarıyla silindi' },
+  });
+});
 
-    // Moderatör veya admin siliyorsa, "removed" olarak işaretle
-    if (isModerator && !isAuthor) {
-      comment.isRemoved = true;
-      comment.removedAt = Date.now();
-      comment.removedBy = userId;
-      comment.removalReason = reason || 'Moderatör tarafından kaldırıldı';
+/**
+ * @desc    Yoruma yanıt ver
+ * @route   POST /api/comments/:commentId/replies
+ * @access  Private
+ */
+const replyToComment = asyncHandler(async (req, res, next) => {
+  const { commentId } = req.params;
+  const { content } = req.body;
+  const userId = req.user._id;
 
-      // Moderatör log'u tut
-      await ModLog.create({
-        subreddit: comment.post.subreddit._id,
-        moderator: userId,
-        targetType: 'comment',
-        targetId: commentId,
-        action: 'remove',
-        reason: reason || 'Moderatör tarafından kaldırıldı',
-      });
-    }
-    // Kullanıcı kendi yorumunu siliyorsa, "deleted" olarak işaretle
-    else if (isAuthor) {
-      comment.isDeleted = true;
-      comment.deletedAt = Date.now();
-      comment.deletedBy = userId;
-    }
+  if (!content) {
+    return next(new ErrorResponse('İçerik zorunludur', 400));
+  }
 
-    await comment.save();
+  const parentComment = await Comment.findById(commentId);
 
-    res.status(200).json({
-      success: true,
-      message: isAuthor ? 'Yorum başarıyla silindi' : 'Yorum başarıyla kaldırıldı',
-    });
-  } catch (error) {
-    console.error('Delete comment error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Yorum silinirken bir hata oluştu',
-      error: error.message,
+  if (!parentComment) {
+    return next(new ErrorResponse('Yorum bulunamadı', 404));
+  }
+
+  if (parentComment.isDeleted) {
+    return next(new ErrorResponse('Silinmiş yorumlara yanıt verilemez', 400));
+  }
+
+  if (parentComment.isLocked) {
+    return next(new ErrorResponse('Bu yorum kilitlenmiş, yanıt veremezsiniz', 403));
+  }
+
+  // Derinlik kontrolü
+  const depth = parentComment.depth + 1;
+  if (depth > 10) {
+    return next(new ErrorResponse('Maksimum yorum derinliği aşıldı (10)', 400));
+  }
+
+  // Post'un kilitli olup olmadığını kontrol et
+  const post = await Post.findById(parentComment.post);
+  if (post.isLocked) {
+    return next(new ErrorResponse('Bu gönderi kilitlenmiş, yorum yapamazsınız', 403));
+  }
+
+  // Yanıt oluştur
+  const reply = await Comment.create({
+    content,
+    author: userId,
+    post: parentComment.post,
+    parent: commentId,
+    depth,
+  });
+
+  // Yanıt sayısını güncelle
+  await Comment.findByIdAndUpdate(commentId, {
+    $inc: { replyCount: 1 },
+  });
+
+  // Post yorum sayısını güncelle
+  await Post.findByIdAndUpdate(parentComment.post, {
+    $inc: { commentCount: 1 },
+  });
+
+  // Bildirim oluştur (kendi yorumuna yanıt vermiyorsa)
+  if (!parentComment.author.equals(userId)) {
+    await Notification.create({
+      recipient: parentComment.author,
+      sender: userId,
+      type: 'comment_reply',
+      comment: reply._id,
+      post: parentComment.post,
     });
   }
-};
+
+  // Yanıt için verilen yorumu popüle et
+  const populatedReply = await Comment.findById(reply._id)
+    .populate('author', 'username avatar')
+    .populate('post', 'title');
+
+  res.status(201).json({
+    success: true,
+    data: populatedReply,
+  });
+});
 
 /**
  * @desc    Yorum yanıtlarını getir
  * @route   GET /api/comments/:commentId/replies
  * @access  Public
  */
-const getCommentReplies = async (req, res) => {
-  try {
-    const { commentId } = req.params;
-    const { sort = 'top' } = req.query;
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 20;
-    const skip = (page - 1) * limit;
-    const userId = req.user ? req.user._id : null;
+const getCommentReplies = asyncHandler(async (req, res, next) => {
+  const { commentId } = req.params;
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 10;
+  const sortBy = req.query.sort || 'best'; // 'best', 'new', 'old', 'controversial'
+  const skip = (page - 1) * limit;
 
-    // Geçerli ID kontrolü
-    if (!mongoose.Types.ObjectId.isValid(commentId)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Geçersiz yorum ID formatı',
-      });
-    }
+  if (!mongoose.Types.ObjectId.isValid(commentId)) {
+    return next(new ErrorResponse('Geçersiz yorum ID formatı', 400));
+  }
 
-    // Ebeveyn yorumu kontrol et
-    const parentComment = await Comment.exists({ _id: commentId, isDeleted: false });
-    if (!parentComment) {
-      return res.status(404).json({
-        success: false,
-        message: 'Ebeveyn yorum bulunamadı',
-      });
-    }
+  const comment = await Comment.findById(commentId);
+  if (!comment) {
+    return next(new ErrorResponse('Yorum bulunamadı', 404));
+  }
 
-    // Sıralama seçenekleri
-    let sortOptions = {};
-    switch (sort) {
-      case 'new':
-        sortOptions = { createdAt: -1 };
-        break;
-      case 'old':
-        sortOptions = { createdAt: 1 };
-        break;
-      case 'top':
-        sortOptions = { voteScore: -1 };
-        break;
-      case 'controversial':
-        sortOptions = { controversyScore: -1 };
-        break;
-      default:
-        sortOptions = { voteScore: -1 };
-    }
+  let sortOption = {};
+  switch (sortBy) {
+    case 'new':
+      sortOption = { createdAt: -1 };
+      break;
+    case 'old':
+      sortOption = { createdAt: 1 };
+      break;
+    case 'controversial':
+      sortOption = { voteScore: 1, upvotes: -1 };
+      break;
+    case 'best':
+    default:
+      sortOption = { voteScore: -1, createdAt: -1 };
+  }
 
-    // Yanıtları getir
-    const replies = await Comment.find({
-      parentId: commentId,
-      isDeleted: false,
-      isRemoved: false,
-    })
-      .skip(skip)
-      .limit(limit)
-      .sort(sortOptions)
-      .populate('author', 'username profilePicture displayName')
-      .lean();
+  const replies = await Comment.find({
+    parent: commentId,
+  })
+    .sort(sortOption)
+    .skip(skip)
+    .limit(limit)
+    .populate('author', 'username avatar isDeleted')
+    .populate('post', 'title');
 
-    const totalReplies = await Comment.countDocuments({
-      parentId: commentId,
-      isDeleted: false,
-      isRemoved: false,
-    });
+  // Kullanıcı oylarını ekle
+  const repliesWithUserData = await Promise.all(
+    replies.map(async (reply) => {
+      let userVote = null;
+      let isSaved = false;
 
-    // Kullanıcı giriş yapmışsa, oy bilgilerini ekle
-    if (userId) {
-      const commentIds = replies.map((reply) => reply._id);
+      if (req.user) {
+        const vote = await Vote.findOne({
+          user: req.user._id,
+          comment: reply._id,
+        });
 
-      const userVotes = await Vote.find({
-        user: userId,
-        comment: { $in: commentIds },
-      }).select('comment voteType');
+        userVote = vote ? vote.value : null;
 
-      const voteMap = new Map();
-      userVotes.forEach((vote) => {
-        voteMap.set(vote.comment.toString(), vote.voteType);
-      });
+        // Kaydedilme durumunu kontrol et
+        const savedItem = await SavedItem.findOne({
+          user: req.user._id,
+          comment: reply._id,
+        });
 
-      // Her yanıt için kullanıcının oyunu ekle
-      replies.forEach((reply) => {
-        reply.userVote = voteMap.get(reply._id.toString()) || null;
-      });
-    }
+        isSaved = !!savedItem;
+      }
 
-    res.status(200).json({
-      success: true,
-      count: replies.length,
-      total: totalReplies,
+      const replyData = reply.toJSON();
+      replyData.userVote = userVote;
+      replyData.isSaved = isSaved;
+
+      return replyData;
+    }),
+  );
+
+  // Toplam yanıt sayısını getir
+  const totalReplies = await Comment.countDocuments({
+    parent: commentId,
+  });
+
+  res.status(200).json({
+    success: true,
+    data: repliesWithUserData,
+    pagination: {
+      page,
+      limit,
       totalPages: Math.ceil(totalReplies / limit),
-      currentPage: page,
-      data: replies,
-    });
-  } catch (error) {
-    console.error('Get comment replies error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Yanıtlar getirilirken bir hata oluştu',
-      error: error.message,
-    });
-  }
-};
+      totalItems: totalReplies,
+    },
+  });
+});
 
 /**
- * @desc    Bir yorumu raporla
- * @route   POST /api/comments/:commentId/report
+ * @desc    Yorumu oyla
+ * @route   POST /api/comments/:commentId/vote
  * @access  Private
  */
-const reportComment = async (req, res) => {
-  try {
-    const { commentId } = req.params;
-    const { reason, details } = req.body;
-    const userId = req.user._id;
+const voteComment = asyncHandler(async (req, res, next) => {
+  const { commentId } = req.params;
+  const { value } = req.body; // 1 veya -1
+  const userId = req.user._id;
 
-    // Geçerli ID kontrolü
-    if (!mongoose.Types.ObjectId.isValid(commentId)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Geçersiz yorum ID formatı',
-      });
-    }
-
-    // Neden kontrolü
-    if (!reason) {
-      return res.status(400).json({
-        success: false,
-        message: 'Raporlama nedeni belirtilmelidir',
-      });
-    }
-
-    // Yorumu kontrol et
-    const comment = await Comment.findById(commentId).populate({
-      path: 'post',
-      select: 'subreddit',
-      populate: {
-        path: 'subreddit',
-        select: 'name',
-      },
-    });
-
-    if (!comment || comment.isDeleted) {
-      return res.status(404).json({
-        success: false,
-        message: 'Yorum bulunamadı',
-      });
-    }
-
-    // Kullanıcının daha önce bu yorumu raporlayıp raporlamadığını kontrol et
-    const existingReport = await Report.findOne({
-      reporter: userId,
-      comment: commentId,
-    });
-
-    if (existingReport) {
-      return res.status(400).json({
-        success: false,
-        message: 'Bu yorumu zaten raporladınız',
-      });
-    }
-
-    // Yeni rapor oluştur
-    const report = await Report.create({
-      type: 'comment',
-      comment: commentId,
-      reporter: userId,
-      subreddit: comment.post.subreddit._id,
-      reason,
-      details: details || '',
-    });
-
-    // Yorum rapor sayısını güncelle
-    comment.reportCount = (comment.reportCount || 0) + 1;
-    await comment.save();
-
-    res.status(201).json({
-      success: true,
-      message: 'Yorum başarıyla raporlandı',
-      data: {
-        reportId: report._id,
-      },
-    });
-  } catch (error) {
-    console.error('Report comment error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Yorum raporlanırken bir hata oluştu',
-      error: error.message,
-    });
+  if (value !== 1 && value !== -1 && value !== 0) {
+    return next(new ErrorResponse('Geçersiz oy değeri. 1, -1 veya 0 olmalıdır', 400));
   }
-};
 
-/**
- * @desc    Yoruma ödül ver
- * @route   POST /api/comments/:commentId/award
- * @access  Private
- */
-const awardComment = async (req, res) => {
-  try {
-    const { commentId } = req.params;
-    const { awardType, message, anonymous = false } = req.body;
-    const userId = req.user._id;
+  const comment = await Comment.findById(commentId);
+  if (!comment) {
+    return next(new ErrorResponse('Yorum bulunamadı', 404));
+  }
 
-    // Geçerli ID kontrolü
-    if (!mongoose.Types.ObjectId.isValid(commentId)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Geçersiz yorum ID formatı',
-      });
-    }
+  if (comment.isDeleted) {
+    return next(new ErrorResponse('Silinmiş yorumlar oylanamaz', 400));
+  }
 
-    // Yorumu bul
-    const comment = await Comment.findById(commentId)
-      .populate('author', 'username')
-      .populate({
-        path: 'post',
-        select: 'title subreddit',
-        populate: {
-          path: 'subreddit',
-          select: 'name',
-        },
-      });
+  // Mevcut oyu kontrol et
+  let vote = await Vote.findOne({
+    user: userId,
+    comment: commentId,
+  });
 
-    if (!comment || comment.isDeleted) {
-      return res.status(404).json({
-        success: false,
-        message: 'Yorum bulunamadı',
-      });
-    }
+  let oldValue = 0;
 
-    // Ödül türünü kontrol et
-    const validAwards = [
-      'silver',
-      'gold',
-      'platinum',
-      'helpful',
-      'wholesome',
-      'rocket',
-      'heartwarming',
-    ];
-    if (!validAwards.includes(awardType)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Geçersiz ödül türü',
-      });
-    }
+  if (vote) {
+    // Mevcut oy değerini sakla
+    oldValue = vote.value;
 
-    // Kullanıcının yeterli coin'i var mı kontrol et
-    const user = await User.findById(userId);
-    const awardCosts = {
-      silver: 100,
-      gold: 500,
-      platinum: 1800,
-      helpful: 150,
-      wholesome: 125,
-      rocket: 300,
-      heartwarming: 200,
-    };
-
-    const cost = awardCosts[awardType];
-    if (user.coins < cost) {
-      return res.status(400).json({
-        success: false,
-        message: 'Yetersiz coin bakiyesi',
-        required: cost,
-        available: user.coins,
-      });
-    }
-
-    // Kullanıcının coin'lerini düş
-    user.coins -= cost;
-    user.karma.awarder += Math.floor(cost / 10); // 10 coin = 1 karma
-    await user.save();
-
-    // Ödülü kaydet
-    const newAward = await Award.create({
-      type: awardType,
-      sender: anonymous ? null : userId,
-      receiver: comment.author._id,
-      comment: commentId,
-      message: message || null,
-      anonymous: anonymous,
-    });
-
-    // Yorumun ödül sayısını güncelle
-    comment.awardCount = (comment.awardCount || 0) + 1;
-    await comment.save();
-
-    // Alıcıya ödül karması ve coin ver
-    const awardValues = {
-      silver: { karma: 10, coins: 0 },
-      gold: { karma: 100, coins: 100 },
-      platinum: { karma: 700, coins: 700 },
-      helpful: { karma: 20, coins: 0 },
-      wholesome: { karma: 20, coins: 0 },
-      rocket: { karma: 50, coins: 0 },
-      heartwarming: { karma: 30, coins: 0 },
-    };
-
-    const receiver = await User.findById(comment.author._id);
-    receiver.karma.awardee += awardValues[awardType].karma;
-    receiver.coins += awardValues[awardType].coins;
-    await receiver.save();
-
-    // Bildirim oluştur (anonim değilse)
-    if (!anonymous) {
-      await Notification.create({
-        recipient: comment.author._id,
-        sender: userId,
-        type: 'award',
-        relatedPost: comment.post._id,
-        relatedComment: commentId,
-        message: `Yorumunuz "${comment.content.substring(0, 30)}${comment.content.length > 30 ? '...' : ''}" bir ${awardType} ödülü aldı!`,
-      });
+    if (value === 0) {
+      // Oyu kaldır
+      await Vote.findByIdAndDelete(vote._id);
     } else {
-      await Notification.create({
-        recipient: comment.author._id,
-        type: 'award',
-        relatedPost: comment.post._id,
-        relatedComment: commentId,
-        message: `Yorumunuz "${comment.content.substring(0, 30)}${comment.content.length > 30 ? '...' : ''}" anonim bir kullanıcıdan ${awardType} ödülü aldı!`,
-      });
+      // Oyu güncelle
+      vote.value = value;
+      await vote.save();
     }
-
-    res.status(200).json({
-      success: true,
-      message: 'Ödül başarıyla verildi',
-      data: newAward,
-      userCoins: user.coins,
-    });
-  } catch (error) {
-    console.error('Award comment error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Ödül verilirken bir hata oluştu',
-      error: error.message,
+  } else if (value !== 0) {
+    // Yeni oy oluştur
+    vote = await Vote.create({
+      user: userId,
+      comment: commentId,
+      value,
     });
   }
-};
+
+  // Yorum oy sayılarını güncelle
+  if (oldValue === 1 && value !== 1) {
+    // Olumlu oyu kaldır
+    await Comment.findByIdAndUpdate(commentId, {
+      $inc: { upvotes: -1, voteScore: -1 },
+    });
+  }
+
+  if (oldValue === -1 && value !== -1) {
+    // Olumsuz oyu kaldır
+    await Comment.findByIdAndUpdate(commentId, {
+      $inc: { downvotes: -1, voteScore: 1 },
+    });
+  }
+
+  if (value === 1 && oldValue !== 1) {
+    // Olumlu oy ekle
+    await Comment.findByIdAndUpdate(commentId, {
+      $inc: { upvotes: 1, voteScore: 1 },
+    });
+  }
+
+  if (value === -1 && oldValue !== -1) {
+    // Olumsuz oy ekle
+    await Comment.findByIdAndUpdate(commentId, {
+      $inc: { downvotes: 1, voteScore: -1 },
+    });
+  }
+
+  // Güncellenmiş yorumu getir
+  const updatedComment = await Comment.findById(commentId).select('upvotes downvotes voteScore');
+
+  // Kullanıcının bir başkasının yorumunu ilk kez olumlu oyladıysa bildirim gönder
+  if (value === 1 && oldValue !== 1 && !comment.author.equals(userId)) {
+    await Notification.create({
+      recipient: comment.author,
+      sender: userId,
+      type: 'comment_upvote',
+      comment: commentId,
+      post: comment.post,
+    });
+  }
+
+  res.status(200).json({
+    success: true,
+    data: {
+      userVote: value,
+      ...updatedComment.toJSON(),
+    },
+  });
+});
+
+/**
+ * @desc    Yorumu kaydet
+ * @route   POST /api/comments/:commentId/save
+ * @access  Private
+ */
+const saveComment = asyncHandler(async (req, res, next) => {
+  const { commentId } = req.params;
+  const userId = req.user._id;
+
+  const comment = await Comment.findById(commentId);
+  if (!comment) {
+    return next(new ErrorResponse('Yorum bulunamadı', 404));
+  }
+
+  if (comment.isDeleted) {
+    return next(new ErrorResponse('Silinmiş yorumlar kaydedilemez', 400));
+  }
+
+  // Zaten kaydedilmiş mi kontrol et
+  const existingSave = await SavedItem.findOne({
+    user: userId,
+    comment: commentId,
+  });
+
+  if (existingSave) {
+    return next(new ErrorResponse('Bu yorum zaten kaydedilmiş', 400));
+  }
+
+  // Kaydet
+  await SavedItem.create({
+    user: userId,
+    comment: commentId,
+    savedAt: Date.now(),
+  });
+
+  res.status(200).json({
+    success: true,
+    data: { message: 'Yorum başarıyla kaydedildi' },
+  });
+});
+
+/**
+ * @desc    Yorum kaydını kaldır
+ * @route   DELETE /api/comments/:commentId/save
+ * @access  Private
+ */
+const unsaveComment = asyncHandler(async (req, res, next) => {
+  const { commentId } = req.params;
+  const userId = req.user._id;
+
+  const comment = await Comment.findById(commentId);
+  if (!comment) {
+    return next(new ErrorResponse('Yorum bulunamadı', 404));
+  }
+
+  // Kaydı kontrol et
+  const savedItem = await SavedItem.findOne({
+    user: userId,
+    comment: commentId,
+  });
+
+  if (!savedItem) {
+    return next(new ErrorResponse('Bu yorum kaydedilmemiş', 404));
+  }
+
+  // Kaydı kaldır
+  await SavedItem.findByIdAndDelete(savedItem._id);
+
+  res.status(200).json({
+    success: true,
+    data: { message: 'Yorum kaydı başarıyla kaldırıldı' },
+  });
+});
+
+/**
+ * @desc    Moderatör: Yorumu kaldır
+ * @route   PUT /api/comments/:commentId/remove
+ * @access  Private (Moderatör)
+ */
+const removeComment = asyncHandler(async (req, res, next) => {
+  const { commentId } = req.params;
+  const { reason } = req.body;
+  const userId = req.user._id;
+
+  const comment = await Comment.findById(commentId).populate('post', 'subreddit');
+  if (!comment) {
+    return next(new ErrorResponse('Yorum bulunamadı', 404));
+  }
+
+  if (comment.isDeleted) {
+    return next(new ErrorResponse('Bu yorum zaten silinmiş', 400));
+  }
+
+  // Yorumu kaldır (soft delete)
+  comment.isDeleted = true;
+  comment.deletedAt = Date.now();
+  comment.deletedBy = userId;
+  await comment.save();
+
+  // Moderasyon log kaydı oluştur
+  await ModLog.create({
+    subreddit: comment.post.subreddit,
+    moderator: userId,
+    action: 'remove_comment',
+    targetType: 'comment',
+    targetId: commentId,
+    reason: reason || 'Kuralları ihlal eden içerik',
+  });
+
+  // Kullanıcıya bildirim gönder
+  if (!comment.author.equals(userId)) {
+    await Notification.create({
+      recipient: comment.author,
+      sender: userId,
+      type: 'comment_removed',
+      comment: commentId,
+      post: comment.post._id,
+      message: reason || 'Yorumunuz topluluk kurallarını ihlal ettiği için kaldırıldı.',
+    });
+  }
+
+  res.status(200).json({
+    success: true,
+    data: { message: 'Yorum başarıyla kaldırıldı' },
+  });
+});
+
+/**
+ * @desc    Moderatör: Yorumu onayla
+ * @route   PUT /api/comments/:commentId/approve
+ * @access  Private (Moderatör)
+ */
+const approveComment = asyncHandler(async (req, res, next) => {
+  const { commentId } = req.params;
+  const userId = req.user._id;
+
+  const comment = await Comment.findById(commentId).populate('post', 'subreddit');
+  if (!comment) {
+    return next(new ErrorResponse('Yorum bulunamadı', 404));
+  }
+
+  if (!comment.isDeleted || !comment.deletedBy) {
+    return next(new ErrorResponse('Bu yorum kaldırılmamış, onaylanamaz', 400));
+  }
+
+  // Yorumu onayla (soft delete'i geri al)
+  comment.isDeleted = false;
+  comment.deletedAt = undefined;
+  comment.deletedBy = undefined;
+  await comment.save();
+
+  // Moderasyon log kaydı oluştur
+  await ModLog.create({
+    subreddit: comment.post.subreddit,
+    moderator: userId,
+    action: 'approve_comment',
+    targetType: 'comment',
+    targetId: commentId,
+  });
+
+  // Kullanıcıya bildirim gönder
+  if (!comment.author.equals(userId)) {
+    await Notification.create({
+      recipient: comment.author,
+      sender: userId,
+      type: 'comment_approved',
+      comment: commentId,
+      post: comment.post._id,
+      message: 'Yorumunuz onaylandı ve toplulukta tekrar görünür hale geldi.',
+    });
+  }
+
+  res.status(200).json({
+    success: true,
+    data: { message: 'Yorum başarıyla onaylandı' },
+  });
+});
 
 module.exports = {
+  getCommentById,
   createComment,
   updateComment,
   deleteComment,
+  replyToComment,
   getCommentReplies,
-  reportComment,
-  awardComment,
+  voteComment,
+  saveComment,
+  unsaveComment,
+  removeComment,
+  approveComment,
 };

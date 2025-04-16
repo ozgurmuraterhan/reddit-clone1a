@@ -1,779 +1,774 @@
-const { EditHistory, Post, Comment, Subreddit, SubredditMembership } = require('../models');
 const mongoose = require('mongoose');
+const asyncHandler = require('../middleware/async');
+const ErrorResponse = require('../utils/errorResponse');
+const EditHistory = require('../models/EditHistory');
+const Post = require('../models/Post');
+const Comment = require('../models/Comment');
+const User = require('../models/User');
+const SubredditMembership = require('../models/SubredditMembership');
 
 /**
- * @desc    İçeriğin düzenleme geçmişini getir
- * @route   GET /api/posts/:postId/edit-history
- * @route   GET /api/comments/:commentId/edit-history
+ * @desc    İçerik düzenleme sayısını ve son düzenleme bilgisini getir
+ * @route   GET /api/edit-history/count/:postId
+ * @route   GET /api/edit-history/count/:commentId
  * @access  Public
  */
-const getContentEditHistory = async (req, res) => {
-  try {
-    const { postId, commentId } = req.params;
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 10;
-    const skip = (page - 1) * limit;
+const getContentEditCount = asyncHandler(async (req, res, next) => {
+  const { postId, commentId } = req.params;
 
-    // Hangi içerik türü için geçmiş isteniyor kontrol et
-    if (!postId && !commentId) {
-      return res.status(400).json({
-        success: false,
-        message: 'Post ID veya Comment ID gereklidir',
-      });
+  // Hangi içerik türü için geçmiş isteniyor kontrol et
+  if (!postId && !commentId) {
+    return next(new ErrorResponse('Post ID veya Comment ID gereklidir', 400));
+  }
+
+  let contentType, contentId;
+
+  // Post geçmişi için
+  if (postId) {
+    if (!mongoose.Types.ObjectId.isValid(postId)) {
+      return next(new ErrorResponse('Geçersiz post ID formatı', 400));
     }
 
-    let contentType, contentId, originalContent;
+    contentType = 'post';
+    contentId = postId;
 
-    // Post geçmişi için
-    if (postId) {
-      if (!mongoose.Types.ObjectId.isValid(postId)) {
-        return res.status(400).json({
-          success: false,
-          message: 'Geçersiz post ID formatı',
-        });
-      }
+    // Orijinal postu kontrol et
+    const post = await Post.findById(postId);
+    if (!post) {
+      return next(new ErrorResponse('Post bulunamadı', 404));
+    }
+  }
 
-      contentType = 'post';
-      contentId = postId;
-
-      // Orijinal postu kontrol et
-      const post = await Post.findById(postId);
-      if (!post) {
-        return res.status(404).json({
-          success: false,
-          message: 'Post bulunamadı',
-        });
-      }
-
-      originalContent = post;
+  // Yorum geçmişi için
+  if (commentId) {
+    if (!mongoose.Types.ObjectId.isValid(commentId)) {
+      return next(new ErrorResponse('Geçersiz yorum ID formatı', 400));
     }
 
-    // Yorum geçmişi için
-    if (commentId) {
-      if (!mongoose.Types.ObjectId.isValid(commentId)) {
-        return res.status(400).json({
-          success: false,
-          message: 'Geçersiz yorum ID formatı',
-        });
-      }
+    contentType = 'comment';
+    contentId = commentId;
 
-      contentType = 'comment';
-      contentId = commentId;
+    // Orijinal yorumu kontrol et
+    const comment = await Comment.findById(commentId);
+    if (!comment) {
+      return next(new ErrorResponse('Yorum bulunamadı', 404));
+    }
+  }
 
-      // Orijinal yorumu kontrol et
-      const comment = await Comment.findById(commentId);
-      if (!comment) {
-        return res.status(404).json({
-          success: false,
-          message: 'Yorum bulunamadı',
-        });
-      }
+  // Düzenleme sayısını getir
+  const query = { contentType };
+  contentType === 'post' ? (query.post = contentId) : (query.comment = contentId);
 
-      originalContent = comment;
+  const editCount = await EditHistory.countDocuments(query);
+
+  // Son düzenleme bilgisini getir
+  const lastEdit = await EditHistory.findOne(query)
+    .sort({ createdAt: -1 })
+    .populate('editedBy', 'username avatar');
+
+  res.status(200).json({
+    success: true,
+    data: {
+      editCount,
+      lastEdit: lastEdit
+        ? {
+            editedAt: lastEdit.createdAt,
+            editedBy: lastEdit.editedBy
+              ? {
+                  username: lastEdit.editedBy.username,
+                  avatar: lastEdit.editedBy.avatar,
+                }
+              : null,
+            reason: lastEdit.reason,
+            isModerationEdit: lastEdit.isModerationEdit,
+          }
+        : null,
+    },
+  });
+});
+
+/**
+ * @desc    İçerik düzenleme geçmişini getir
+ * @route   GET /api/edit-history/:postId
+ * @route   GET /api/edit-history/:commentId
+ * @access  Public
+ */
+const getContentEditHistory = asyncHandler(async (req, res, next) => {
+  const { postId, commentId } = req.params;
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 10;
+  const skip = (page - 1) * limit;
+
+  // Hangi içerik türü için geçmiş isteniyor kontrol et
+  if (!postId && !commentId) {
+    return next(new ErrorResponse('Post ID veya Comment ID gereklidir', 400));
+  }
+
+  let contentType, contentId, originalContent;
+
+  // Post geçmişi için
+  if (postId) {
+    if (!mongoose.Types.ObjectId.isValid(postId)) {
+      return next(new ErrorResponse('Geçersiz post ID formatı', 400));
     }
 
-    // Düzenleme geçmişini getir
-    const editHistory = await EditHistory.find({
-      contentType,
-      contentId,
-    })
-      .sort({ editedAt: -1 })
-      .skip(skip)
-      .limit(limit)
-      .populate('editedBy', 'username avatar');
+    contentType = 'post';
+    contentId = postId;
 
-    const totalEdits = await EditHistory.countDocuments({
-      contentType,
-      contentId,
-    });
+    // Orijinal postu kontrol et
+    const post = await Post.findById(postId);
+    if (!post) {
+      return next(new ErrorResponse('Post bulunamadı', 404));
+    }
 
-    res.status(200).json({
-      success: true,
-      currentContent: {
-        content: contentType === 'post' ? originalContent.content : originalContent.text,
-        updatedAt: originalContent.updatedAt,
+    originalContent = post;
+  }
+
+  // Yorum geçmişi için
+  if (commentId) {
+    if (!mongoose.Types.ObjectId.isValid(commentId)) {
+      return next(new ErrorResponse('Geçersiz yorum ID formatı', 400));
+    }
+
+    contentType = 'comment';
+    contentId = commentId;
+
+    // Orijinal yorumu kontrol et
+    const comment = await Comment.findById(commentId);
+    if (!comment) {
+      return next(new ErrorResponse('Yorum bulunamadı', 404));
+    }
+
+    originalContent = comment;
+  }
+
+  // Düzenleme geçmişini getir
+  const query = { contentType };
+  contentType === 'post' ? (query.post = contentId) : (query.comment = contentId);
+
+  const editHistory = await EditHistory.find(query)
+    .sort({ createdAt: -1 })
+    .skip(skip)
+    .limit(limit)
+    .populate('editedBy', 'username avatar');
+
+  const totalEdits = await EditHistory.countDocuments(query);
+
+  res.status(200).json({
+    success: true,
+    data: {
+      originalContent: {
+        id: originalContent._id,
+        content: originalContent.content || originalContent.text || originalContent.body,
+        createdAt: originalContent.createdAt,
+        author: originalContent.author,
       },
-      count: editHistory.length,
-      total: totalEdits,
-      totalPages: Math.ceil(totalEdits / limit),
+      edits: editHistory,
       currentPage: page,
-      data: editHistory,
-    });
-  } catch (error) {
-    console.error('Get content edit history error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Düzenleme geçmişi getirilirken bir hata oluştu',
-      error: error.message,
-    });
-  }
-};
+      totalPages: Math.ceil(totalEdits / limit),
+      totalEdits,
+    },
+  });
+});
 
 /**
- * @desc    Belirli bir düzenlemenin detayını getir
- * @route   GET /api/edit-history/:editId
- * @access  Public
- */
-const getEditById = async (req, res) => {
-  try {
-    const { editId } = req.params;
-
-    if (!mongoose.Types.ObjectId.isValid(editId)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Geçersiz düzenleme ID formatı',
-      });
-    }
-
-    const edit = await EditHistory.findById(editId).populate('editedBy', 'username avatar');
-
-    if (!edit) {
-      return res.status(404).json({
-        success: false,
-        message: 'Düzenleme kaydı bulunamadı',
-      });
-    }
-
-    res.status(200).json({
-      success: true,
-      data: edit,
-    });
-  } catch (error) {
-    console.error('Get edit by id error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Düzenleme detayı getirilirken bir hata oluştu',
-      error: error.message,
-    });
-  }
-};
-
-/**
- * @desc    Yeni bir düzenleme kaydı oluştur
- * @route   POST /api/posts/:postId/edit-history
- * @route   POST /api/comments/:commentId/edit-history
+ * @desc    Yeni düzenleme geçmişi ekle (internal kullanım için)
  * @access  Private
  */
-const createEditHistory = async (req, res) => {
-  try {
-    const { postId, commentId } = req.params;
-    const { previousContent, reason } = req.body;
-    const userId = req.user._id;
-
-    // Hangi içerik türü için geçmiş oluşturuluyor kontrol et
-    if (!postId && !commentId) {
-      return res.status(400).json({
-        success: false,
-        message: 'Post ID veya Comment ID gereklidir',
-      });
+const createEditHistory = asyncHandler(
+  async (
+    contentType,
+    contentId,
+    previousContent,
+    editedBy,
+    reason = null,
+    isModerationEdit = false,
+  ) => {
+    // Girdileri doğrula
+    if (!contentType || !contentId || !previousContent || !editedBy) {
+      throw new Error(
+        'Eksik parametreler: contentType, contentId, previousContent, editedBy gereklidir',
+      );
     }
 
-    if (!previousContent) {
-      return res.status(400).json({
-        success: false,
-        message: 'Önceki içerik gereklidir',
-      });
+    if (contentType !== 'post' && contentType !== 'comment') {
+      throw new Error('Geçersiz içerik türü. "post" veya "comment" olmalıdır');
     }
 
-    let contentType, contentId, originalContent;
-
-    // Post düzenlemesi için
-    if (postId) {
-      if (!mongoose.Types.ObjectId.isValid(postId)) {
-        return res.status(400).json({
-          success: false,
-          message: 'Geçersiz post ID formatı',
-        });
-      }
-
-      contentType = 'post';
-      contentId = postId;
-
-      // Orijinal postu kontrol et
-      const post = await Post.findById(postId);
-      if (!post) {
-        return res.status(404).json({
-          success: false,
-          message: 'Post bulunamadı',
-        });
-      }
-
-      // Yalnızca post sahibi veya moderatör düzenleyebilir
-      if (!post.author.equals(userId) && req.user.role !== 'admin') {
-        // Kullanıcı moderatör mü kontrol et
-        const isModerator = await SubredditMembership.exists({
-          user: userId,
-          subreddit: post.subreddit,
-          isModerator: true,
-        });
-
-        if (!isModerator) {
-          return res.status(403).json({
-            success: false,
-            message: 'Bu işlemi gerçekleştirmek için yetkiniz yok',
-          });
-        }
-      }
-
-      originalContent = post;
+    if (!mongoose.Types.ObjectId.isValid(contentId) || !mongoose.Types.ObjectId.isValid(editedBy)) {
+      throw new Error('Geçersiz ID formatı');
     }
 
-    // Yorum düzenlemesi için
-    if (commentId) {
-      if (!mongoose.Types.ObjectId.isValid(commentId)) {
-        return res.status(400).json({
-          success: false,
-          message: 'Geçersiz yorum ID formatı',
-        });
-      }
-
-      contentType = 'comment';
-      contentId = commentId;
-
-      // Orijinal yorumu kontrol et
-      const comment = await Comment.findById(commentId);
-      if (!comment) {
-        return res.status(404).json({
-          success: false,
-          message: 'Yorum bulunamadı',
-        });
-      }
-
-      // Yalnızca yorum sahibi veya moderatör düzenleyebilir
-      if (!comment.author.equals(userId) && req.user.role !== 'admin') {
-        // Post'u bul ve subreddit'i öğren
-        const post = await Post.findById(comment.post);
-        if (!post) {
-          return res.status(404).json({
-            success: false,
-            message: 'Yoruma ait post bulunamadı',
-          });
-        }
-
-        // Kullanıcı moderatör mü kontrol et
-        const isModerator = await SubredditMembership.exists({
-          user: userId,
-          subreddit: post.subreddit,
-          isModerator: true,
-        });
-
-        if (!isModerator) {
-          return res.status(403).json({
-            success: false,
-            message: 'Bu işlemi gerçekleştirmek için yetkiniz yok',
-          });
-        }
-      }
-
-      originalContent = comment;
-    }
-
-    // Düzenleme kaydı oluştur
-    const newEditHistory = await EditHistory.create({
+    // Düzenleme geçmişi oluştur
+    const editHistory = await EditHistory.create({
       contentType,
-      contentId,
+      [contentType]: contentId, // dynamic field: post or comment
       previousContent,
-      editedBy: userId,
-      reason: reason || 'Düzenleme nedeni belirtilmedi',
-      editedAt: Date.now(),
+      editedBy,
+      reason,
+      isModerationEdit,
     });
 
-    res.status(201).json({
-      success: true,
-      message: 'Düzenleme kaydı başarıyla oluşturuldu',
-      data: newEditHistory,
-    });
-  } catch (error) {
-    console.error('Create edit history error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Düzenleme kaydı oluşturulurken bir hata oluştu',
-      error: error.message,
-    });
-  }
-};
+    return editHistory;
+  },
+);
 
 /**
- * @desc    Belirli bir kullanıcının son düzenlemelerini getir
- * @route   GET /api/users/:userId/edit-history
- * @access  Private
+ * @desc    Moderatör/admin: Düzenleme geçmişi kaydını göster
+ * @route   GET /api/edit-history/record/:id
+ * @access  Private (Moderator or Admin)
  */
-const getUserEditHistory = async (req, res) => {
-  try {
-    const { userId } = req.params;
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 20;
-    const skip = (page - 1) * limit;
+const getEditHistoryRecord = asyncHandler(async (req, res, next) => {
+  const { id } = req.params;
+  const userId = req.user._id;
 
-    if (!mongoose.Types.ObjectId.isValid(userId)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Geçersiz kullanıcı ID formatı',
-      });
-    }
+  if (!mongoose.Types.ObjectId.isValid(id)) {
+    return next(new ErrorResponse('Geçersiz düzenleme kaydı ID formatı', 400));
+  }
 
-    // Sadece kendisi veya admin kullanıcının düzenleme geçmişini görebilir
-    if (!req.user._id.equals(userId) && req.user.role !== 'admin') {
-      return res.status(403).json({
-        success: false,
-        message: 'Bu kullanıcının düzenleme geçmişini görüntülemek için yetkiniz yok',
-      });
-    }
-
-    // Kullanıcının düzenleme geçmişini getir
-    const editHistory = await EditHistory.find({
-      editedBy: userId,
+  const editRecord = await EditHistory.findById(id)
+    .populate('editedBy', 'username avatar')
+    .populate({
+      path: 'post',
+      select: 'title author subreddit',
+      populate: {
+        path: 'subreddit',
+        select: 'name',
+      },
     })
-      .sort({ editedAt: -1 })
-      .skip(skip)
-      .limit(limit)
-      .populate({
-        path: 'contentId',
-        select: contentType === 'post' ? 'title' : 'text',
-        model: contentType === 'post' ? 'Post' : 'Comment',
+    .populate({
+      path: 'comment',
+      select: 'content author post',
+      populate: {
+        path: 'post',
+        select: 'title subreddit',
+      },
+    });
+
+  if (!editRecord) {
+    return next(new ErrorResponse('Düzenleme kaydı bulunamadı', 404));
+  }
+
+  // Yetki kontrolü - admin, içerik sahibi veya moderatör olmalı
+  const isAdmin = req.user.role === 'admin';
+  const isContentAuthor =
+    (editRecord.post && editRecord.post.author.equals(userId)) ||
+    (editRecord.comment && editRecord.comment.author.equals(userId));
+
+  let isModerator = false;
+
+  if (!isAdmin && !isContentAuthor) {
+    // Moderatör kontrolü
+    const subredditId =
+      (editRecord.post && editRecord.post.subreddit) ||
+      (editRecord.comment && editRecord.comment.post && editRecord.comment.post.subreddit);
+
+    if (subredditId) {
+      const membership = await SubredditMembership.findOne({
+        user: userId,
+        subreddit: subredditId,
+        isModerator: true,
       });
 
-    const totalEdits = await EditHistory.countDocuments({
-      editedBy: userId,
-    });
+      isModerator = !!membership;
+    }
 
-    res.status(200).json({
-      success: true,
-      count: editHistory.length,
-      total: totalEdits,
-      totalPages: Math.ceil(totalEdits / limit),
-      currentPage: page,
-      data: editHistory,
-    });
-  } catch (error) {
-    console.error('Get user edit history error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Kullanıcı düzenleme geçmişi getirilirken bir hata oluştu',
-      error: error.message,
-    });
+    if (!isModerator) {
+      return next(new ErrorResponse('Bu düzenleme kaydını görüntüleme yetkiniz yok', 403));
+    }
   }
-};
+
+  res.status(200).json({
+    success: true,
+    data: editRecord,
+  });
+});
 
 /**
- * @desc    Subreddit düzenleme geçmişini getir
- * @route   GET /api/subreddits/:subredditId/edit-history
- * @access  Private/Moderator
+ * @desc    Kullanıcı düzenleme istatistiklerini getir
+ * @route   GET /api/edit-history/stats/user/:userId
+ * @access  Private (Admin or Same User)
  */
-const getSubredditEditHistory = async (req, res) => {
-  try {
-    const { subredditId } = req.params;
-    const userId = req.user._id;
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 20;
-    const skip = (page - 1) * limit;
+const getUserEditStats = asyncHandler(async (req, res, next) => {
+  const { userId } = req.params;
+  const requestingUserId = req.user._id;
 
-    if (!mongoose.Types.ObjectId.isValid(subredditId)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Geçersiz subreddit ID formatı',
-      });
-    }
+  if (!mongoose.Types.ObjectId.isValid(userId)) {
+    return next(new ErrorResponse('Geçersiz kullanıcı ID formatı', 400));
+  }
 
-    // Subreddit'i kontrol et
-    const subreddit = await Subreddit.findById(subredditId);
-    if (!subreddit) {
-      return res.status(404).json({
-        success: false,
-        message: 'Subreddit bulunamadı',
-      });
-    }
+  // Yetki kontrolü
+  if (!requestingUserId.equals(userId) && req.user.role !== 'admin') {
+    return next(
+      new ErrorResponse('Bu kullanıcının düzenleme istatistiklerini görüntüleme yetkiniz yok', 403),
+    );
+  }
 
-    // Kullanıcının moderatör olup olmadığını kontrol et
+  // Kullanıcıyı kontrol et
+  const user = await User.findById(userId);
+  if (!user) {
+    return next(new ErrorResponse('Kullanıcı bulunamadı', 404));
+  }
+
+  // Toplam düzenleme sayısı
+  const totalEdits = await EditHistory.countDocuments({ editedBy: userId });
+
+  // Post düzenlemeleri
+  const postEdits = await EditHistory.countDocuments({
+    editedBy: userId,
+    contentType: 'post',
+  });
+
+  // Yorum düzenlemeleri
+  const commentEdits = await EditHistory.countDocuments({
+    editedBy: userId,
+    contentType: 'comment',
+  });
+
+  // Moderasyon düzenlemeleri
+  const moderationEdits = await EditHistory.countDocuments({
+    editedBy: userId,
+    isModerationEdit: true,
+  });
+
+  // Son 30 gündeki düzenlemeler
+  const thirtyDaysAgo = new Date();
+  thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+
+  const recentEdits = await EditHistory.countDocuments({
+    editedBy: userId,
+    createdAt: { $gte: thirtyDaysAgo },
+  });
+
+  // En çok düzenlenen içerik türü
+  const postEditCount = await EditHistory.countDocuments({
+    editedBy: userId,
+    contentType: 'post',
+  });
+
+  const commentEditCount = await EditHistory.countDocuments({
+    editedBy: userId,
+    contentType: 'comment',
+  });
+
+  const mostEditedContentType = postEditCount > commentEditCount ? 'post' : 'comment';
+
+  res.status(200).json({
+    success: true,
+    data: {
+      totalEdits,
+      postEdits,
+      commentEdits,
+      moderationEdits,
+      recentEdits,
+      mostEditedContentType,
+      editRate: totalEdits > 0 ? (moderationEdits / totalEdits) * 100 : 0,
+    },
+  });
+});
+
+/**
+ * @desc    Subreddit düzenleme istatistiklerini getir
+ * @route   GET /api/edit-history/stats/subreddit/:subredditId
+ * @access  Private (Admin or Moderator)
+ */
+const getSubredditEditStats = asyncHandler(async (req, res, next) => {
+  const { subredditId } = req.params;
+  const userId = req.user._id;
+
+  if (!mongoose.Types.ObjectId.isValid(subredditId)) {
+    return next(new ErrorResponse('Geçersiz subreddit ID formatı', 400));
+  }
+
+  // Subreddit kontrolü
+  const subreddit = await mongoose.model('Subreddit').findById(subredditId);
+  if (!subreddit) {
+    return next(new ErrorResponse('Subreddit bulunamadı', 404));
+  }
+
+  // Yetki kontrolü
+  const isAdmin = req.user.role === 'admin';
+  let isModerator = false;
+
+  if (!isAdmin) {
     const membership = await SubredditMembership.findOne({
       user: userId,
       subreddit: subredditId,
       isModerator: true,
     });
 
-    if (!membership && req.user.role !== 'admin') {
-      return res.status(403).json({
-        success: false,
-        message: 'Bu işlem için moderatör yetkileri gerekiyor',
-      });
+    isModerator = !!membership;
+
+    if (!isModerator) {
+      return next(
+        new ErrorResponse(
+          "Bu subreddit'in düzenleme istatistiklerini görüntüleme yetkiniz yok",
+          403,
+        ),
+      );
+    }
+  }
+
+  // Subreddit'te bulunan postları bul
+  const posts = await Post.find({ subreddit: subredditId }).select('_id');
+  const postIds = posts.map((post) => post._id);
+
+  // Subreddit'te bulunan yorumları bul
+  const comments = await Comment.find({ post: { $in: postIds } }).select('_id');
+  const commentIds = comments.map((comment) => comment._id);
+
+  // Toplam düzenleme sayısı
+  const postEdits = await EditHistory.countDocuments({
+    post: { $in: postIds },
+    contentType: 'post',
+  });
+
+  const commentEdits = await EditHistory.countDocuments({
+    comment: { $in: commentIds },
+    contentType: 'comment',
+  });
+
+  const totalEdits = postEdits + commentEdits;
+
+  // Moderatör düzenlemeleri
+  const moderationEdits = await EditHistory.countDocuments({
+    $or: [
+      { post: { $in: postIds }, contentType: 'post' },
+      { comment: { $in: commentIds }, contentType: 'comment' },
+    ],
+    isModerationEdit: true,
+  });
+
+  // Son 30 gündeki düzenlemeler
+  const thirtyDaysAgo = new Date();
+  thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+
+  const recentEdits = await EditHistory.countDocuments({
+    $or: [
+      { post: { $in: postIds }, contentType: 'post' },
+      { comment: { $in: commentIds }, contentType: 'comment' },
+    ],
+    createdAt: { $gte: thirtyDaysAgo },
+  });
+
+  // En aktif düzenleyiciler
+  const topEditors = await EditHistory.aggregate([
+    {
+      $match: {
+        $or: [
+          { post: { $in: postIds }, contentType: 'post' },
+          { comment: { $in: commentIds }, contentType: 'comment' },
+        ],
+      },
+    },
+    {
+      $group: {
+        _id: '$editedBy',
+        editCount: { $sum: 1 },
+      },
+    },
+    {
+      $sort: { editCount: -1 },
+    },
+    {
+      $limit: 5,
+    },
+    {
+      $lookup: {
+        from: 'users',
+        localField: '_id',
+        foreignField: '_id',
+        as: 'userInfo',
+      },
+    },
+    {
+      $unwind: '$userInfo',
+    },
+    {
+      $project: {
+        _id: 1,
+        username: '$userInfo.username',
+        avatar: '$userInfo.avatar',
+        editCount: 1,
+      },
+    },
+  ]);
+
+  res.status(200).json({
+    success: true,
+    data: {
+      totalEdits,
+      postEdits,
+      commentEdits,
+      moderationEdits,
+      recentEdits,
+      moderationEditRate: totalEdits > 0 ? (moderationEdits / totalEdits) * 100 : 0,
+      topEditors,
+    },
+  });
+});
+
+/**
+ * @desc    Moderatör: İçerik düzenleme geçmişinden bir kaydı sil
+ * @route   DELETE /api/edit-history/:id
+ * @access  Private (Admin only)
+ */
+const deleteEditHistoryRecord = asyncHandler(async (req, res, next) => {
+  const { id } = req.params;
+
+  if (!mongoose.Types.ObjectId.isValid(id)) {
+    return next(new ErrorResponse('Geçersiz düzenleme kaydı ID formatı', 400));
+  }
+
+  // Sadece admin bu işlemi yapabilir
+  if (req.user.role !== 'admin') {
+    return next(
+      new ErrorResponse('Düzenleme geçmişi kayıtlarını silmek için admin yetkileri gerekiyor', 403),
+    );
+  }
+
+  // Kaydı kontrol et
+  const editRecord = await EditHistory.findById(id);
+
+  if (!editRecord) {
+    return next(new ErrorResponse('Düzenleme kaydı bulunamadı', 404));
+  }
+
+  // Kaydı sil
+  await EditHistory.findByIdAndDelete(id);
+
+  res.status(200).json({
+    success: true,
+    data: {},
+    message: 'Düzenleme geçmişi kaydı başarıyla silindi',
+  });
+});
+
+/**
+ * @desc    Düzenleme geçmişi arama
+ * @route   GET /api/edit-history/search
+ * @access  Private (Admin only)
+ */
+const searchEditHistory = asyncHandler(async (req, res, next) => {
+  // Sadece admin bu işlemi yapabilir
+  if (req.user.role !== 'admin') {
+    return next(new ErrorResponse('Düzenleme geçmişi araması için admin yetkileri gerekiyor', 403));
+  }
+
+  const { contentType, userId, subredditId, isModerationEdit, startDate, endDate, searchTerm } =
+    req.query;
+
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 20;
+  const skip = (page - 1) * limit;
+
+  // Arama sorgusu oluştur
+  const query = {};
+
+  if (contentType) {
+    if (contentType !== 'post' && contentType !== 'comment') {
+      return next(new ErrorResponse('Geçersiz içerik türü. "post" veya "comment" olmalıdır', 400));
+    }
+    query.contentType = contentType;
+  }
+
+  if (userId && mongoose.Types.ObjectId.isValid(userId)) {
+    query.editedBy = userId;
+  }
+
+  if (isModerationEdit !== undefined) {
+    query.isModerationEdit = isModerationEdit === 'true';
+  }
+
+  // Tarih aralığı filtreleme
+  if (startDate || endDate) {
+    query.createdAt = {};
+
+    if (startDate) {
+      const startDateTime = new Date(startDate);
+      if (isNaN(startDateTime.getTime())) {
+        return next(new ErrorResponse('Geçersiz başlangıç tarihi formatı', 400));
+      }
+      query.createdAt.$gte = startDateTime;
     }
 
-    // Subreddit'e ait postların ID'lerini al
-    const posts = await Post.find({ subreddit: subredditId }, '_id');
+    if (endDate) {
+      const endDateTime = new Date(endDate);
+      if (isNaN(endDateTime.getTime())) {
+        return next(new ErrorResponse('Geçersiz bitiş tarihi formatı', 400));
+      }
+      // Günün sonuna ayarla
+      endDateTime.setHours(23, 59, 59, 999);
+      query.createdAt.$lte = endDateTime;
+    }
+  }
+
+  // Metin araması
+  if (searchTerm) {
+    query.previousContent = { $regex: searchTerm, $options: 'i' };
+  }
+
+  // Subreddit filtreleme
+  if (subredditId && mongoose.Types.ObjectId.isValid(subredditId)) {
+    // İlişkili postları bul
+    const posts = await Post.find({ subreddit: subredditId }).select('_id');
     const postIds = posts.map((post) => post._id);
 
-    // Yorumları al
-    const comments = await Comment.find({ post: { $in: postIds } }, '_id');
+    // İlişkili yorumları bul
+    const comments = await Comment.find({ post: { $in: postIds } }).select('_id');
     const commentIds = comments.map((comment) => comment._id);
 
-    // Tüm düzenleme geçmişini getir
-    const editHistory = await EditHistory.find({
-      $or: [
-        { contentType: 'post', contentId: { $in: postIds } },
-        { contentType: 'comment', contentId: { $in: commentIds } },
-      ],
-    })
-      .sort({ editedAt: -1 })
-      .skip(skip)
-      .limit(limit)
-      .populate('editedBy', 'username avatar')
-      .populate({
-        path: 'contentId',
-        select: 'title text',
-        refPath: (contentType) => (contentType === 'post' ? 'Post' : 'Comment'),
-      });
-
-    const totalEdits = await EditHistory.countDocuments({
-      $or: [
-        { contentType: 'post', contentId: { $in: postIds } },
-        { contentType: 'comment', contentId: { $in: commentIds } },
-      ],
-    });
-
-    res.status(200).json({
-      success: true,
-      count: editHistory.length,
-      total: totalEdits,
-      totalPages: Math.ceil(totalEdits / limit),
-      currentPage: page,
-      data: editHistory,
-    });
-  } catch (error) {
-    console.error('Get subreddit edit history error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Subreddit düzenleme geçmişi getirilirken bir hata oluştu',
-      error: error.message,
-    });
+    // Post veya comment eşleşmesine göre filtrele
+    query.$or = [{ post: { $in: postIds } }, { comment: { $in: commentIds } }];
   }
-};
+
+  // Sonuçları getir
+  const results = await EditHistory.find(query)
+    .sort({ createdAt: -1 })
+    .skip(skip)
+    .limit(limit)
+    .populate('editedBy', 'username avatar')
+    .populate({
+      path: 'post',
+      select: 'title author subreddit',
+      populate: {
+        path: 'subreddit',
+        select: 'name',
+      },
+    })
+    .populate({
+      path: 'comment',
+      select: 'content author post',
+      populate: {
+        path: 'post',
+        select: 'title subreddit',
+      },
+    });
+
+  // Toplam sonuç sayısı
+  const total = await EditHistory.countDocuments(query);
+
+  res.status(200).json({
+    success: true,
+    data: results,
+    pagination: {
+      page,
+      limit,
+      total,
+      pages: Math.ceil(total / limit),
+    },
+  });
+});
 
 /**
- * @desc    İçeriğin düzenleme sayısını getir
- * @route   GET /api/posts/:postId/edit-count
- * @route   GET /api/comments/:commentId/edit-count
- * @access  Public
+ * @desc    Moderatör: İçerik düzenleme geçmişi özetini getir
+ * @route   GET /api/edit-history/summary/:contentType/:contentId
+ * @access  Private (Admin, Mod, or Content Owner)
  */
-const getContentEditCount = async (req, res) => {
-  try {
-    const { postId, commentId } = req.params;
+const getContentEditSummary = asyncHandler(async (req, res, next) => {
+  const { contentType, contentId } = req.params;
+  const userId = req.user._id;
 
-    // Hangi içerik türü için geçmiş isteniyor kontrol et
-    if (!postId && !commentId) {
-      return res.status(400).json({
-        success: false,
-        message: 'Post ID veya Comment ID gereklidir',
-      });
+  if (!contentType || !contentId) {
+    return next(new ErrorResponse('İçerik türü ve ID gereklidir', 400));
+  }
+
+  if (contentType !== 'post' && contentType !== 'comment') {
+    return next(new ErrorResponse('Geçersiz içerik türü. "post" veya "comment" olmalıdır', 400));
+  }
+
+  if (!mongoose.Types.ObjectId.isValid(contentId)) {
+    return next(new ErrorResponse('Geçersiz içerik ID formatı', 400));
+  }
+
+  // İçeriği kontrol et
+  let content, subredditId;
+
+  if (contentType === 'post') {
+    content = await Post.findById(contentId);
+    if (!content) {
+      return next(new ErrorResponse('Post bulunamadı', 404));
     }
-
-    let contentType, contentId;
-
-    // Post geçmişi için
-    if (postId) {
-      if (!mongoose.Types.ObjectId.isValid(postId)) {
-        return res.status(400).json({
-          success: false,
-          message: 'Geçersiz post ID formatı',
-        });
-      }
-
-      contentType = 'post';
-      contentId = postId;
-
-      // Orijinal postu kontrol et
-      const post = await Post.findById(postId);
-      if (!post) {
-        return res.status(404).json({
-          success: false,
-          message: 'Post bulunamadı',
-        });
-      }
+    subredditId = content.subreddit;
+  } else {
+    content = await Comment.findById(contentId).populate('post', 'subreddit');
+    if (!content) {
+      return next(new ErrorResponse('Yorum bulunamadı', 404));
     }
+    subredditId = content.post.subreddit;
+  }
 
-    // Yorum geçmişi için
-    if (commentId) {
-      if (!mongoose.Types.ObjectId.isValid(commentId)) {
-        return res.status(400).json({
-          success: false,
-          message: 'Geçersiz yorum ID formatı',
-        });
-      }
+  // Yetki kontrolü
+  const isAdmin = req.user.role === 'admin';
+  const isAuthor = content.author.equals(userId);
+  let isModerator = false;
 
-      contentType = 'comment';
-      contentId = commentId;
+  if (!isAdmin && !isAuthor) {
+    // Moderatör kontrolü
+    const membership = await SubredditMembership.findOne({
+      user: userId,
+      subreddit: subredditId,
+      isModerator: true,
+    });
 
-      // Orijinal yorumu kontrol et
-      const comment = await Comment.findById(commentId);
-      if (!comment) {
-        return res.status(404).json({
-          success: false,
-          message: 'Yorum bulunamadı',
-        });
-      }
+    isModerator = !!membership;
+
+    if (!isModerator) {
+      return next(new ErrorResponse('Bu içeriğin düzenleme özetini görüntüleme yetkiniz yok', 403));
     }
+  }
 
-    // Düzenleme sayısını getir
-    const editCount = await EditHistory.countDocuments({
+  // Sorgu oluştur
+  const query = { contentType };
+  query[contentType] = contentId;
+
+  // Düzenleme sayısı
+  const editCount = await EditHistory.countDocuments(query);
+
+  // Son düzenleme
+  const lastEdit = await EditHistory.findOne(query)
+    .sort({ createdAt: -1 })
+    .populate('editedBy', 'username avatar');
+
+  // Moderasyon düzenlemeleri
+  const moderationEdits = await EditHistory.countDocuments({
+    ...query,
+    isModerationEdit: true,
+  });
+
+  // Benzersiz düzenleyiciler
+  const uniqueEditors = await EditHistory.distinct('editedBy', query);
+
+  // Düzenleme sebepleri
+  const reasons = await EditHistory.aggregate([
+    { $match: { ...query, reason: { $ne: null, $ne: '' } } },
+    { $group: { _id: '$reason', count: { $sum: 1 } } },
+    { $sort: { count: -1 } },
+    { $limit: 5 },
+  ]);
+
+  res.status(200).json({
+    success: true,
+    data: {
       contentType,
       contentId,
-    });
-
-    // Son düzenleme bilgisini getir
-    const lastEdit = await EditHistory.findOne({
-      contentType,
-      contentId,
-    })
-      .sort({ editedAt: -1 })
-      .populate('editedBy', 'username');
-
-    res.status(200).json({
-      success: true,
-      data: {
-        editCount,
-        lastEdit: lastEdit
-          ? {
-              editedAt: lastEdit.editedAt,
-              editedBy: lastEdit.editedBy.username,
-            }
-          : null,
-      },
-    });
-  } catch (error) {
-    console.error('Get content edit count error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Düzenleme sayısı getirilirken bir hata oluştu',
-      error: error.message,
-    });
-  }
-};
-
-/**
- * @desc    İki düzenleme arasındaki farkı getir
- * @route   GET /api/edit-history/compare
- * @access  Public
- */
-const compareEdits = async (req, res) => {
-  try {
-    const { editId1, editId2, currentContent } = req.query;
-
-    if (!editId1 || (!editId2 && !currentContent)) {
-      return res.status(400).json({
-        success: false,
-        message:
-          "Karşılaştırma için en az iki içerik gereklidir (iki düzenleme ID'si veya bir düzenleme ID'si ve mevcut içerik)",
-      });
-    }
-
-    // İlk düzenlemeyi getir
-    let edit1;
-    if (editId1 && mongoose.Types.ObjectId.isValid(editId1)) {
-      edit1 = await EditHistory.findById(editId1);
-
-      if (!edit1) {
-        return res.status(404).json({
-          success: false,
-          message: 'Belirtilen düzenleme kaydı bulunamadı',
-        });
-      }
-    } else {
-      return res.status(400).json({
-        success: false,
-        message: 'Geçersiz düzenleme ID formatı',
-      });
-    }
-
-    let content1 = edit1.previousContent;
-    let content2;
-    let timestamp1 = edit1.editedAt;
-    let timestamp2;
-    let editor1 = edit1.editedBy;
-    let editor2;
-
-    // İkinci içeriği belirle
-    if (editId2 && mongoose.Types.ObjectId.isValid(editId2)) {
-      const edit2 = await EditHistory.findById(editId2);
-
-      if (!edit2) {
-        return res.status(404).json({
-          success: false,
-          message: 'Belirtilen düzenleme kaydı bulunamadı',
-        });
-      }
-
-      content2 = edit2.previousContent;
-      timestamp2 = edit2.editedAt;
-      editor2 = edit2.editedBy;
-    } else if (currentContent) {
-      // Mevcut içerikle karşılaştırma
-      content2 = currentContent;
-      timestamp2 = new Date();
-
-      // İçeriğin mevcut sahibini bul
-      if (edit1.contentType === 'post') {
-        const post = await Post.findById(edit1.contentId).populate('author', 'username');
-        if (post) {
-          editor2 = post.author;
-        }
-      } else if (edit1.contentType === 'comment') {
-        const comment = await Comment.findById(edit1.contentId).populate('author', 'username');
-        if (comment) {
-          editor2 = comment.author;
-        }
-      }
-    } else {
-      return res.status(400).json({
-        success: false,
-        message: 'Geçersiz ikinci içerik kaynağı',
-      });
-    }
-
-    // Basit bir karşılaştırma yapılıyor
-    // Gerçek uygulamada diff algoritması kullanılması önerilir
-    const wordCount1 = content1.split(/\s+/).length;
-    const wordCount2 = content2.split(/\s+/).length;
-    const charCount1 = content1.length;
-    const charCount2 = content2.length;
-
-    const wordDiff = wordCount2 - wordCount1;
-    const charDiff = charCount2 - charCount1;
-
-    res.status(200).json({
-      success: true,
-      data: {
-        content1,
-        content2,
-        timestamp1,
-        timestamp2,
-        editor1,
-        editor2,
-        statistics: {
-          wordCount1,
-          wordCount2,
-          wordDiff,
-          charCount1,
-          charCount2,
-          charDiff,
-        },
-      },
-    });
-  } catch (error) {
-    console.error('Compare edits error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Düzenlemeler karşılaştırılırken bir hata oluştu',
-      error: error.message,
-    });
-  }
-};
-
-/**
- * @desc    Düzenleme geçmişi özeti
- * @route   GET /api/edit-history/summary
- * @access  Private/Admin
- */
-const getEditHistorySummary = async (req, res) => {
-  try {
-    // Yetki kontrolü
-    if (req.user.role !== 'admin') {
-      return res.status(403).json({
-        success: false,
-        message: 'Bu bilgilere erişmek için admin yetkileri gerekiyor',
-      });
-    }
-
-    // Toplam düzenleme sayısı
-    const totalEdits = await EditHistory.countDocuments();
-
-    // İçerik türüne göre düzenleme dağılımı
-    const contentTypeStats = await EditHistory.aggregate([
-      { $group: { _id: '$contentType', count: { $sum: 1 } } },
-    ]);
-
-    // Son 7 gündeki düzenleme sayıları
-    const sevenDaysAgo = new Date();
-    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
-
-    const recentEditsCount = await EditHistory.countDocuments({
-      editedAt: { $gte: sevenDaysAgo },
-    });
-
-    // Günlük düzenleme trendi (son 7 gün)
-    const dailyTrend = await EditHistory.aggregate([
-      {
-        $match: {
-          editedAt: { $gte: sevenDaysAgo },
-        },
-      },
-      {
-        $group: {
-          _id: {
-            $dateToString: { format: '%Y-%m-%d', date: '$editedAt' },
-          },
-          count: { $sum: 1 },
-        },
-      },
-      { $sort: { _id: 1 } },
-    ]);
-
-    // En çok düzenleme yapan 5 kullanıcı
-    const topEditors = await EditHistory.aggregate([
-      {
-        $group: {
-          _id: '$editedBy',
-          count: { $sum: 1 },
-        },
-      },
-      { $sort: { count: -1 } },
-      { $limit: 5 },
-    ]);
-
-    // Kullanıcı detaylarını ekle
-    const editorIds = topEditors.map((editor) => editor._id);
-    const editorDetails = await User.find({ _id: { $in: editorIds } }, { username: 1, avatar: 1 });
-
-    const editorsMap = {};
-    editorDetails.forEach((editor) => {
-      editorsMap[editor._id.toString()] = {
-        username: editor.username,
-        avatar: editor.avatar,
-      };
-    });
-
-    const topEditorsWithDetails = topEditors.map((editor) => ({
-      userId: editor._id,
-      editCount: editor.count,
-      username: editorsMap[editor._id.toString()]?.username || 'Silinmiş Kullanıcı',
-      avatar: editorsMap[editor._id.toString()]?.avatar,
-    }));
-
-    res.status(200).json({
-      success: true,
-      data: {
-        totalEdits,
-        recentEditsCount,
-        contentTypeStats,
-        dailyTrend,
-        topEditors: topEditorsWithDetails,
-      },
-    });
-  } catch (error) {
-    console.error('Get edit history summary error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Düzenleme geçmişi özeti getirilirken bir hata oluştu',
-      error: error.message,
-    });
-  }
-};
+      editCount,
+      lastEdit,
+      moderationEdits,
+      uniqueEditorCount: uniqueEditors.length,
+      topReasons: reasons.map((r) => ({ reason: r._id, count: r.count })),
+    },
+  });
+});
 
 module.exports = {
-  getContentEditHistory,
-  getEditById,
-  createEditHistory,
-  getUserEditHistory,
-  getSubredditEditHistory,
   getContentEditCount,
-  compareEdits,
-  getEditHistorySummary,
+  getContentEditHistory,
+  createEditHistory,
+  getEditHistoryRecord,
+  getUserEditStats,
+  getSubredditEditStats,
+  deleteEditHistoryRecord,
+  searchEditHistory,
+  getContentEditSummary,
 };

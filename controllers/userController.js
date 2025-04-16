@@ -1,1175 +1,1044 @@
-const {
-  User,
-  Post,
-  Comment,
-  UserSettings,
-  SubredditMembership,
-  SavedItem,
-  Notification,
-  Flair,
-  ModLog,
-  Vote,
-  Award,
-} = require('../models');
+const User = require('../models/User');
+const Post = require('../models/Post');
+const Comment = require('../models/Comment');
+const SubredditMembership = require('../models/SubredditMembership');
+const asyncHandler = require('../middleware/async');
+const ErrorResponse = require('../utils/errorResponse');
+const crypto = require('crypto');
+const path = require('path');
+const fs = require('fs');
 
 /**
- * Tüm kullanıcıları getir (sadece admin)
- * @route GET /api/users
- * @access Private/Admin
+ * @desc    Tüm kullanıcıları getir
+ * @route   GET /api/users
+ * @access  Private/Admin
  */
-const getUsers = async (req, res) => {
-  try {
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 20;
-    const skip = (page - 1) * limit;
+const getUsers = asyncHandler(async (req, res, next) => {
+  res.status(200).json(res.advancedResults);
+});
 
-    const users = await User.find()
-      .select('-password')
-      .skip(skip)
-      .limit(limit)
-      .sort({ createdAt: -1 });
+/**
+ * @desc    Tek bir kullanıcıyı getir
+ * @route   GET /api/users/:id
+ * @access  Public
+ */
+const getUser = asyncHandler(async (req, res, next) => {
+  const user = await User.findById(req.params.id).select(
+    '-resetPasswordToken -resetPasswordExpire -verificationToken -verificationTokenExpire',
+  );
 
-    const totalUsers = await User.countDocuments();
-
-    res.status(200).json({
-      success: true,
-      count: users.length,
-      total: totalUsers,
-      totalPages: Math.ceil(totalUsers / limit),
-      currentPage: page,
-      data: users,
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Kullanıcılar getirilirken bir hata oluştu',
-      error: error.message,
-    });
+  if (!user) {
+    return next(new ErrorResponse(`${req.params.id} ID'sine sahip kullanıcı bulunamadı`, 404));
   }
-};
+
+  // Bazı bilgiler sadece kullanıcının kendisi veya admin tarafından görülebilir
+  let filteredUser = { ...user.toObject() };
+
+  // Kullanıcı kendisi veya admin değilse email gibi hassas bilgileri çıkar
+  if (req.user && req.user.id !== user._id.toString() && req.user.role !== 'admin') {
+    delete filteredUser.email;
+    delete filteredUser.lastLogin;
+    delete filteredUser.authProvider;
+  }
+
+  res.status(200).json({
+    success: true,
+    data: filteredUser,
+  });
+});
 
 /**
- * Kullanıcı profili getir
- * @route GET /api/users/:username
- * @access Public
+ * @desc    Kullanıcı oluştur (sadece admin için)
+ * @route   POST /api/users
+ * @access  Private/Admin
  */
-const getUserProfile = async (req, res) => {
-  try {
-    const { username } = req.params;
+const createUser = asyncHandler(async (req, res, next) => {
+  const { username, email, password, bio, accountStatus } = req.body;
 
-    const user = await User.findOne({ username }).select(
-      '-password -verificationToken -verificationTokenExpire -resetPasswordToken -resetPasswordExpire',
+  // Kullanıcı oluştur
+  const user = await User.create({
+    username,
+    email,
+    password,
+    bio,
+    accountStatus: accountStatus || 'active',
+    emailVerified: true, // Admin tarafından oluşturulduğu için direkt doğrulanmış kabul et
+  });
+
+  res.status(201).json({
+    success: true,
+    data: user,
+  });
+});
+
+/**
+ * @desc    Kullanıcıyı güncelle (admin için)
+ * @route   PUT /api/users/:id
+ * @access  Private/Admin
+ */
+const updateUser = asyncHandler(async (req, res, next) => {
+  const fieldsToUpdate = {
+    username: req.body.username,
+    email: req.body.email,
+    bio: req.body.bio,
+    accountStatus: req.body.accountStatus,
+  };
+
+  // Boş alanları temizle
+  Object.keys(fieldsToUpdate).forEach((key) => {
+    if (fieldsToUpdate[key] === undefined) {
+      delete fieldsToUpdate[key];
+    }
+  });
+
+  const user = await User.findByIdAndUpdate(req.params.id, fieldsToUpdate, {
+    new: true,
+    runValidators: true,
+  });
+
+  if (!user) {
+    return next(new ErrorResponse(`${req.params.id} ID'sine sahip kullanıcı bulunamadı`, 404));
+  }
+
+  res.status(200).json({
+    success: true,
+    data: user,
+  });
+});
+
+/**
+ * @desc    Kullanıcıyı sil (soft delete)
+ * @route   DELETE /api/users/:id
+ * @access  Private/Admin
+ */
+const deleteUser = asyncHandler(async (req, res, next) => {
+  const user = await User.findById(req.params.id);
+
+  if (!user) {
+    return next(new ErrorResponse(`${req.params.id} ID'sine sahip kullanıcı bulunamadı`, 404));
+  }
+
+  // Soft delete işlemi
+  user.isDeleted = true;
+  user.deletedAt = Date.now();
+  user.accountStatus = 'deleted';
+  await user.save();
+
+  res.status(200).json({
+    success: true,
+    data: {},
+  });
+});
+
+/**
+ * @desc    Profil bilgilerini güncelle (kullanıcının kendisi için)
+ * @route   PUT /api/users/profile
+ * @access  Private
+ */
+const updateProfile = asyncHandler(async (req, res, next) => {
+  const { bio } = req.body;
+
+  // Sadece izin verilen alanları güncelle
+  const fieldsToUpdate = {
+    bio,
+  };
+
+  // Boş alanları temizle
+  Object.keys(fieldsToUpdate).forEach((key) => {
+    if (fieldsToUpdate[key] === undefined) {
+      delete fieldsToUpdate[key];
+    }
+  });
+
+  const user = await User.findByIdAndUpdate(req.user.id, fieldsToUpdate, {
+    new: true,
+    runValidators: true,
+  });
+
+  res.status(200).json({
+    success: true,
+    data: user,
+  });
+});
+
+/**
+ * @desc    Profil fotoğrafını güncelle
+ * @route   PUT /api/users/profile/picture
+ * @access  Private
+ */
+const updateProfilePicture = asyncHandler(async (req, res, next) => {
+  if (!req.files || !req.files.profilePicture) {
+    return next(new ErrorResponse('Lütfen bir dosya yükleyin', 400));
+  }
+
+  const file = req.files.profilePicture;
+
+  // Dosya boyutu kontrolü
+  if (file.size > process.env.MAX_FILE_UPLOAD) {
+    return next(
+      new ErrorResponse(
+        `Lütfen ${process.env.MAX_FILE_UPLOAD / 1000000} MB'dan küçük bir dosya yükleyin`,
+        400,
+      ),
     );
-
-    if (!user) {
-      return res.status(404).json({
-        success: false,
-        message: 'Kullanıcı bulunamadı',
-      });
-    }
-
-    res.status(200).json({
-      success: true,
-      data: user,
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Kullanıcı profili getirilirken bir hata oluştu',
-      error: error.message,
-    });
   }
-};
 
-/**
- * Kullanıcının kendi profilini güncelleme
- * @route PUT /api/users/me
- * @access Private
- */
-const updateProfile = async (req, res) => {
-  try {
-    const userId = req.user._id;
-
-    // Güncellenebilir alanlar
-    const { bio, profilePicture } = req.body;
-
-    // Sadece izin verilen alanları güncelle
-    const updateData = {};
-    if (bio !== undefined) updateData.bio = bio;
-    if (profilePicture !== undefined) updateData.profilePicture = profilePicture;
-
-    const user = await User.findByIdAndUpdate(userId, updateData, {
-      new: true,
-      runValidators: true,
-    }).select('-password');
-
-    if (!user) {
-      return res.status(404).json({
-        success: false,
-        message: 'Kullanıcı bulunamadı',
-      });
-    }
-
-    res.status(200).json({
-      success: true,
-      message: 'Profil başarıyla güncellendi',
-      data: user,
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Profil güncellenirken bir hata oluştu',
-      error: error.message,
-    });
+  // Dosya tipini kontrol et
+  if (!file.mimetype.startsWith('image')) {
+    return next(new ErrorResponse('Lütfen bir resim dosyası yükleyin', 400));
   }
-};
 
-/**
- * Admin: Kullanıcıyı güncelleme
- * @route PUT /api/users/:userId
- * @access Private/Admin
- */
-const updateUser = async (req, res) => {
-  try {
-    const { userId } = req.params;
+  // Özel dosya adı oluştur
+  file.name = `photo_${req.user.id}_${Date.now()}${path.parse(file.name).ext}`;
 
-    // Güncellenebilir alanlar (admin daha fazla alana erişebilir)
-    const { username, email, bio, profilePicture, accountStatus } = req.body;
-
-    // Sadece izin verilen alanları güncelle
-    const updateData = {};
-    if (username !== undefined) updateData.username = username;
-    if (email !== undefined) updateData.email = email;
-    if (bio !== undefined) updateData.bio = bio;
-    if (profilePicture !== undefined) updateData.profilePicture = profilePicture;
-    if (accountStatus !== undefined) updateData.accountStatus = accountStatus;
-
-    const user = await User.findByIdAndUpdate(userId, updateData, {
-      new: true,
-      runValidators: true,
-    }).select('-password');
-
-    if (!user) {
-      return res.status(404).json({
-        success: false,
-        message: 'Kullanıcı bulunamadı',
-      });
+  // Dosyayı kaydet
+  file.mv(`${process.env.FILE_UPLOAD_PATH}/profile/${file.name}`, async (err) => {
+    if (err) {
+      console.error(err);
+      return next(new ErrorResponse('Dosya yükleme hatası', 500));
     }
 
-    res.status(200).json({
-      success: true,
-      message: 'Kullanıcı başarıyla güncellendi',
-      data: user,
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Kullanıcı güncellenirken bir hata oluştu',
-      error: error.message,
-    });
-  }
-};
-
-/**
- * Admin: Kullanıcıyı silme/deaktif etme
- * @route DELETE /api/users/:userId
- * @access Private/Admin
- */
-const deleteUser = async (req, res) => {
-  try {
-    const { userId } = req.params;
-
-    // Soft delete yapalım
-    const user = await User.findByIdAndUpdate(
-      userId,
-      {
-        isDeleted: true,
-        deletedAt: Date.now(),
-        accountStatus: 'deleted',
-      },
-      { new: true },
-    );
-
-    if (!user) {
-      return res.status(404).json({
-        success: false,
-        message: 'Kullanıcı bulunamadı',
-      });
-    }
-
-    res.status(200).json({
-      success: true,
-      message: 'Kullanıcı başarıyla silindi',
-      data: {},
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Kullanıcı silinirken bir hata oluştu',
-      error: error.message,
-    });
-  }
-};
-
-/**
- * Kullanıcı gönderilerini getir
- * @route GET /api/users/:username/posts
- * @access Public
- */
-const getUserPosts = async (req, res) => {
-  try {
-    const { username } = req.params;
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 10;
-    const skip = (page - 1) * limit;
-
-    const user = await User.findOne({ username });
-
-    if (!user) {
-      return res.status(404).json({
-        success: false,
-        message: 'Kullanıcı bulunamadı',
-      });
-    }
-
-    const posts = await Post.find({
-      author: user._id,
-      isDeleted: false,
-    })
-      .skip(skip)
-      .limit(limit)
-      .sort({ createdAt: -1 })
-      .populate('author', 'username profilePicture')
-      .populate('subreddit', 'name');
-
-    const totalPosts = await Post.countDocuments({
-      author: user._id,
-      isDeleted: false,
-    });
-
-    res.status(200).json({
-      success: true,
-      count: posts.length,
-      total: totalPosts,
-      totalPages: Math.ceil(totalPosts / limit),
-      currentPage: page,
-      data: posts,
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Kullanıcı gönderileri getirilirken bir hata oluştu',
-      error: error.message,
-    });
-  }
-};
-
-/**
- * Kullanıcı yorumlarını getir
- * @route GET /api/users/:username/comments
- * @access Public
- */
-const getUserComments = async (req, res) => {
-  try {
-    const { username } = req.params;
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 20;
-    const skip = (page - 1) * limit;
-
-    const user = await User.findOne({ username });
-
-    if (!user) {
-      return res.status(404).json({
-        success: false,
-        message: 'Kullanıcı bulunamadı',
-      });
-    }
-
-    const comments = await Comment.find({
-      author: user._id,
-      isDeleted: false,
-    })
-      .skip(skip)
-      .limit(limit)
-      .sort({ createdAt: -1 })
-      .populate('author', 'username profilePicture')
-      .populate('post', 'title')
-      .populate({
-        path: 'post',
-        populate: {
-          path: 'subreddit',
-          select: 'name',
-        },
-      });
-
-    const totalComments = await Comment.countDocuments({
-      author: user._id,
-      isDeleted: false,
-    });
-
-    res.status(200).json({
-      success: true,
-      count: comments.length,
-      total: totalComments,
-      totalPages: Math.ceil(totalComments / limit),
-      currentPage: page,
-      data: comments,
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Kullanıcı yorumları getirilirken bir hata oluştu',
-      error: error.message,
-    });
-  }
-};
-
-/**
- * Kullanıcının karma bilgilerini getir
- * @route GET /api/users/:username/karma
- * @access Public
- */
-const getUserKarma = async (req, res) => {
-  try {
-    const { username } = req.params;
-
-    const user = await User.findOne({ username });
-
-    if (!user) {
-      return res.status(404).json({
-        success: false,
-        message: 'Kullanıcı bulunamadı',
-      });
-    }
-
-    // Kullanıcının toplam karmasını ve detaylarını döndür
-    res.status(200).json({
-      success: true,
-      data: {
-        totalKarma: user.totalKarma,
-        postKarma: user.karma.post,
-        commentKarma: user.karma.comment,
-        awardeeKarma: user.karma.awardee,
-        awarderKarma: user.karma.awarder,
-      },
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Kullanıcı karma bilgileri getirilirken bir hata oluştu',
-      error: error.message,
-    });
-  }
-};
-
-/**
- * Kullanıcının üye olduğu subredditleri getir
- * @route GET /api/users/:username/subreddits
- * @access Public
- */
-const getUserSubreddits = async (req, res) => {
-  try {
-    const { username } = req.params;
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 20;
-    const skip = (page - 1) * limit;
-
-    const user = await User.findOne({ username });
-
-    if (!user) {
-      return res.status(404).json({
-        success: false,
-        message: 'Kullanıcı bulunamadı',
-      });
-    }
-
-    const memberships = await SubredditMembership.find({
-      user: user._id,
-      status: { $in: ['member', 'moderator', 'admin'] },
-    })
-      .skip(skip)
-      .limit(limit)
-      .sort({ createdAt: -1 })
-      .populate('subreddit', 'name description subscriberCount createdAt');
-
-    const totalMemberships = await SubredditMembership.countDocuments({
-      user: user._id,
-      status: { $in: ['member', 'moderator', 'admin'] },
-    });
-
-    res.status(200).json({
-      success: true,
-      count: memberships.length,
-      total: totalMemberships,
-      totalPages: Math.ceil(totalMemberships / limit),
-      currentPage: page,
-      data: memberships,
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Kullanıcının subreddit üyelikleri getirilirken bir hata oluştu',
-      error: error.message,
-    });
-  }
-};
-
-/**
- * İçeriği kaydet/kaydetmeyi kaldır
- * @route POST /api/users/me/save
- * @access Private
- */
-const toggleSaveItem = async (req, res) => {
-  try {
-    const userId = req.user._id;
-    const { itemId, itemType } = req.body;
-
-    if (!['post', 'comment'].includes(itemType)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Geçersiz öğe türü. "post" veya "comment" olmalıdır.',
-      });
-    }
-
-    // Öğenin var olup olmadığını kontrol et
-    let item;
-    if (itemType === 'post') {
-      item = await Post.findById(itemId);
-    } else {
-      item = await Comment.findById(itemId);
-    }
-
-    if (!item) {
-      return res.status(404).json({
-        success: false,
-        message: 'Kaydedilecek öğe bulunamadı',
-      });
-    }
-
-    // Daha önce kaydedilmiş mi kontrol et
-    const existingSave = await SavedItem.findOne({
-      user: userId,
-      itemId,
-      itemType,
-    });
-
-    if (existingSave) {
-      // Kaydı kaldır
-      await existingSave.remove();
-      return res.status(200).json({
-        success: true,
-        message: 'Öğe başarıyla kaydedilenlerden kaldırıldı',
-        saved: false,
-      });
-    } else {
-      // Yeni kayıt oluştur
-      const newSavedItem = await SavedItem.create({
-        user: userId,
-        itemId,
-        itemType,
-        category: req.body.category || 'uncategorized',
-      });
-
-      return res.status(201).json({
-        success: true,
-        message: 'Öğe başarıyla kaydedildi',
-        data: newSavedItem,
-        saved: true,
-      });
-    }
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Öğe kaydedilirken bir hata oluştu',
-      error: error.message,
-    });
-  }
-};
-
-/**
- * Kullanıcının kaydettiği içerikleri getir
- * @route GET /api/users/me/saved
- * @access Private
- */
-const getSavedItems = async (req, res) => {
-  try {
-    const userId = req.user._id;
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 20;
-    const skip = (page - 1) * limit;
-    const { type } = req.query; // 'post' veya 'comment' olabilir
-
-    // Filtre oluştur
-    const filter = { user: userId };
-    if (type) {
-      filter.itemType = type;
-    }
-
-    const savedItems = await SavedItem.find(filter)
-      .skip(skip)
-      .limit(limit)
-      .sort({ createdAt: -1 })
-      .populate({
-        path: 'itemId',
-        refPath: 'itemType',
-        populate: [
-          { path: 'author', select: 'username profilePicture' },
-          { path: 'subreddit', select: 'name' },
-        ],
-      });
-
-    const totalItems = await SavedItem.countDocuments(filter);
-
-    res.status(200).json({
-      success: true,
-      count: savedItems.length,
-      total: totalItems,
-      totalPages: Math.ceil(totalItems / limit),
-      currentPage: page,
-      data: savedItems,
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Kaydedilen içerikler getirilirken bir hata oluştu',
-      error: error.message,
-    });
-  }
-};
-
-/**
- * Kullanıcının bildirimlerini getir
- * @route GET /api/users/me/notifications
- * @access Private
- */
-const getUserNotifications = async (req, res) => {
-  try {
-    const userId = req.user._id;
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 20;
-    const skip = (page - 1) * limit;
-    const { unreadOnly } = req.query;
-
-    // Filtre oluştur
-    const filter = { recipient: userId };
-    if (unreadOnly === 'true') {
-      filter.read = false;
-    }
-
-    const notifications = await Notification.find(filter)
-      .skip(skip)
-      .limit(limit)
-      .sort({ createdAt: -1 })
-      .populate('sender', 'username profilePicture')
-      .populate('relatedPost', 'title')
-      .populate('relatedComment', 'content');
-
-    const totalNotifications = await Notification.countDocuments(filter);
-    const unreadCount = await Notification.countDocuments({ recipient: userId, read: false });
-
-    res.status(200).json({
-      success: true,
-      count: notifications.length,
-      total: totalNotifications,
-      unreadCount,
-      totalPages: Math.ceil(totalNotifications / limit),
-      currentPage: page,
-      data: notifications,
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Bildirimler getirilirken bir hata oluştu',
-      error: error.message,
-    });
-  }
-};
-
-/**
- * Bildirimi okundu olarak işaretle
- * @route PUT /api/users/me/notifications/:notificationId
- * @access Private
- */
-const markNotificationAsRead = async (req, res) => {
-  try {
-    const { notificationId } = req.params;
-    const userId = req.user._id;
-
-    const notification = await Notification.findOne({
-      _id: notificationId,
-      recipient: userId,
-    });
-
-    if (!notification) {
-      return res.status(404).json({
-        success: false,
-        message: 'Bildirim bulunamadı',
-      });
-    }
-
-    notification.read = true;
-    notification.readAt = Date.now();
-    await notification.save();
-
-    res.status(200).json({
-      success: true,
-      message: 'Bildirim okundu olarak işaretlendi',
-      data: notification,
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Bildirim güncellenirken bir hata oluştu',
-      error: error.message,
-    });
-  }
-};
-
-/**
- * Tüm bildirimleri okundu olarak işaretle
- * @route PUT /api/users/me/notifications/mark-all-read
- * @access Private
- */
-const markAllNotificationsAsRead = async (req, res) => {
-  try {
-    const userId = req.user._id;
-
-    await Notification.updateMany(
-      { recipient: userId, read: false },
-      { read: true, readAt: Date.now() },
-    );
-
-    res.status(200).json({
-      success: true,
-      message: 'Tüm bildirimler okundu olarak işaretlendi',
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Bildirimler güncellenirken bir hata oluştu',
-      error: error.message,
-    });
-  }
-};
-
-/**
- * Kullanıcının oylarını getir
- * @route GET /api/users/me/votes
- * @access Private
- */
-const getUserVotes = async (req, res) => {
-  try {
-    const userId = req.user._id;
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 20;
-    const skip = (page - 1) * limit;
-    const { type, voteType } = req.query;
-
-    // Filtre oluştur
-    const filter = { user: userId };
-    if (type && ['post', 'comment'].includes(type)) {
-      // Belirli bir tür (post/comment) için filtrele
-      if (type === 'post') {
-        filter.post = { $exists: true };
-      } else {
-        filter.comment = { $exists: true };
+    // Kullanıcının eski profil fotoğrafını sil (varsayılan hariç)
+    const user = await User.findById(req.user.id);
+    if (user.profilePicture !== 'default-profile.png') {
+      const oldFilePath = `${process.env.FILE_UPLOAD_PATH}/profile/${user.profilePicture}`;
+      if (fs.existsSync(oldFilePath)) {
+        fs.unlinkSync(oldFilePath);
       }
     }
-    if (voteType && ['upvote', 'downvote'].includes(voteType)) {
-      filter.voteType = voteType;
-    }
 
-    const votes = await Vote.find(filter)
-      .skip(skip)
-      .limit(limit)
-      .sort({ createdAt: -1 })
-      .populate({
-        path: 'post',
-        select: 'title content author subreddit createdAt',
-        populate: [
-          { path: 'author', select: 'username profilePicture' },
-          { path: 'subreddit', select: 'name' },
-        ],
-      })
-      .populate({
-        path: 'comment',
-        select: 'content author post createdAt',
-        populate: [
-          { path: 'author', select: 'username profilePicture' },
-          { path: 'post', select: 'title subreddit' },
-        ],
-      });
-
-    const totalVotes = await Vote.countDocuments(filter);
+    // Veritabanını güncelle
+    await User.findByIdAndUpdate(req.user.id, { profilePicture: file.name });
 
     res.status(200).json({
       success: true,
-      count: votes.length,
-      total: totalVotes,
-      totalPages: Math.ceil(totalVotes / limit),
-      currentPage: page,
-      data: votes,
+      data: file.name,
     });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Kullanıcı oyları getirilirken bir hata oluştu',
-      error: error.message,
-    });
-  }
-};
-/**
- * Kullanıcı ayarlarını getir
- * @route GET /api/users/me/settings
- * @access Private
- */
-const getUserSettings = async (req, res) => {
-  try {
-    const userId = req.user._id;
-
-    const userSettings = await UserSettings.findOne({ user: userId });
-
-    if (!userSettings) {
-      return res.status(404).json({
-        success: false,
-        message: 'Kullanıcı ayarları bulunamadı',
-      });
-    }
-
-    res.status(200).json({
-      success: true,
-      data: userSettings,
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Kullanıcı ayarları getirilirken bir hata oluştu',
-      error: error.message,
-    });
-  }
-};
+  });
+});
 
 /**
- * Kullanıcı ayarlarını güncelle
- * @route PUT /api/users/me/settings
- * @access Private
+ * @desc    Şifreyi güncelle
+ * @route   PUT /api/users/password
+ * @access  Private
  */
-const updateUserSettings = async (req, res) => {
-  try {
-    const userId = req.user._id;
-    const {
-      emailNotifications,
-      contentVisibility,
-      displayName,
-      allowFollowers,
-      theme,
-      language,
-      contentFilters,
-      privacy,
-    } = req.body;
+const updatePassword = asyncHandler(async (req, res, next) => {
+  const { currentPassword, newPassword } = req.body;
 
-    // Güncellenebilir alanlar
-    const updateData = {};
-    if (emailNotifications !== undefined) updateData.emailNotifications = emailNotifications;
-    if (contentVisibility !== undefined) updateData.contentVisibility = contentVisibility;
-    if (displayName !== undefined) updateData.displayName = displayName;
-    if (allowFollowers !== undefined) updateData.allowFollowers = allowFollowers;
-    if (theme !== undefined) updateData.theme = theme;
-    if (language !== undefined) updateData.language = language;
-    if (contentFilters !== undefined) updateData.contentFilters = contentFilters;
-    if (privacy !== undefined) updateData.privacy = privacy;
-
-    // Güncelleme veya oluşturma (upsert)
-    const settings = await UserSettings.findOneAndUpdate({ user: userId }, updateData, {
-      new: true,
-      upsert: true,
-      runValidators: true,
-    });
-
-    res.status(200).json({
-      success: true,
-      message: 'Kullanıcı ayarları başarıyla güncellendi',
-      data: settings,
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Kullanıcı ayarları güncellenirken bir hata oluştu',
-      error: error.message,
-    });
+  if (!currentPassword || !newPassword) {
+    return next(new ErrorResponse('Mevcut şifre ve yeni şifre gereklidir', 400));
   }
-};
+
+  // Şifre ile birlikte kullanıcıyı getir
+  const user = await User.findById(req.user.id).select('+password');
+
+  // Mevcut şifreyi doğrula
+  const isMatch = await user.matchPassword(currentPassword);
+
+  if (!isMatch) {
+    return next(new ErrorResponse('Geçersiz mevcut şifre', 401));
+  }
+
+  // Yeni şifreyi ayarla
+  user.password = newPassword;
+  await user.save();
+
+  res.status(200).json({
+    success: true,
+    message: 'Şifre başarıyla güncellendi',
+  });
+});
 
 /**
- * Kullanıcının moderatör olduğu subredditleri getir
- * @route GET /api/users/me/moderated
- * @access Private
+ * @desc    E-posta doğrulama işlemi
+ * @route   GET /api/users/verify-email/:token
+ * @access  Public
  */
-const getModeratedSubreddits = async (req, res) => {
-  try {
-    const userId = req.user._id;
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 20;
-    const skip = (page - 1) * limit;
+const verifyEmail = asyncHandler(async (req, res, next) => {
+  // Doğrulama token'ını al
+  const { token } = req.params;
 
-    const memberships = await SubredditMembership.find({
-      user: userId,
-      status: { $in: ['moderator', 'admin'] },
-    })
-      .skip(skip)
-      .limit(limit)
-      .sort({ createdAt: -1 })
-      .populate('subreddit', 'name description subscriberCount createdAt bannerImage icon rules');
-
-    const totalMemberships = await SubredditMembership.countDocuments({
-      user: userId,
-      status: { $in: ['moderator', 'admin'] },
-    });
-
-    res.status(200).json({
-      success: true,
-      count: memberships.length,
-      total: totalMemberships,
-      totalPages: Math.ceil(totalMemberships / limit),
-      currentPage: page,
-      data: memberships,
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Moderatör olunan subredditler getirilirken bir hata oluştu',
-      error: error.message,
-    });
+  if (!token) {
+    return next(new ErrorResponse("Doğrulama token'ı geçersiz", 400));
   }
-};
+
+  // Token'a sahip kullanıcıyı bul
+  const user = await User.findOne({
+    verificationToken: token,
+    verificationTokenExpire: { $gt: Date.now() },
+  });
+
+  if (!user) {
+    return next(new ErrorResponse('Geçersiz token veya süresi dolmuş', 400));
+  }
+
+  // Kullanıcı e-postasını doğrulanmış olarak işaretle
+  user.emailVerified = true;
+  user.accountStatus = 'active';
+  user.verificationToken = undefined;
+  user.verificationTokenExpire = undefined;
+  await user.save();
+
+  res.status(200).json({
+    success: true,
+    message: 'E-posta başarıyla doğrulandı, artık giriş yapabilirsiniz',
+  });
+});
 
 /**
- * Kullanıcının moderatör olarak gerçekleştirdiği eylemler
- * @route GET /api/users/me/modactions
- * @access Private
+ * @desc    Kullanıcı adını değiştir
+ * @route   PUT /api/users/username
+ * @access  Private
  */
-const getModActions = async (req, res) => {
-  try {
-    const userId = req.user._id;
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 20;
-    const skip = (page - 1) * limit;
-    const { subredditId } = req.query;
+const updateUsername = asyncHandler(async (req, res, next) => {
+  const { username, password } = req.body;
 
-    // Filtre oluştur
-    const filter = { moderator: userId };
-    if (subredditId) {
-      filter.subreddit = subredditId;
-    }
-
-    const modLogs = await ModLog.find(filter)
-      .skip(skip)
-      .limit(limit)
-      .sort({ createdAt: -1 })
-      .populate('moderator', 'username profilePicture')
-      .populate('subreddit', 'name')
-      .populate('targetUser', 'username')
-      .populate('targetPost', 'title')
-      .populate('targetComment', 'content');
-
-    const totalLogs = await ModLog.countDocuments(filter);
-
-    res.status(200).json({
-      success: true,
-      count: modLogs.length,
-      total: totalLogs,
-      totalPages: Math.ceil(totalLogs / limit),
-      currentPage: page,
-      data: modLogs,
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Moderatör eylemleri getirilirken bir hata oluştu',
-      error: error.message,
-    });
+  if (!username || !password) {
+    return next(new ErrorResponse('Kullanıcı adı ve şifre gereklidir', 400));
   }
-};
+
+  // Şifre ile birlikte kullanıcıyı getir
+  const user = await User.findById(req.user.id).select('+password');
+
+  // Şifreyi doğrula
+  const isMatch = await user.matchPassword(password);
+
+  if (!isMatch) {
+    return next(new ErrorResponse('Geçersiz şifre', 401));
+  }
+
+  // Kullanıcı adının kullanılabilir olduğunu kontrol et
+  const existingUser = await User.findOne({ username });
+  if (existingUser && existingUser._id.toString() !== req.user.id) {
+    return next(new ErrorResponse('Bu kullanıcı adı zaten kullanılıyor', 400));
+  }
+
+  // Kullanıcı adını güncelle
+  user.username = username;
+  await user.save();
+
+  res.status(200).json({
+    success: true,
+    data: {
+      username: user.username,
+    },
+    message: 'Kullanıcı adı başarıyla güncellendi',
+  });
+});
 
 /**
- * Kullanıcının sahip olduğu flairleri getir
- * @route GET /api/users/me/flairs
- * @access Private
+ * @desc    Kullanıcı karma puanlarını getir
+ * @route   GET /api/users/:id/karma
+ * @access  Public
  */
-const getUserFlairs = async (req, res) => {
-  try {
-    const userId = req.user._id;
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 20;
-    const skip = (page - 1) * limit;
-    const { subredditId } = req.query;
+const getUserKarma = asyncHandler(async (req, res, next) => {
+  const user = await User.findById(req.params.id).select('karma');
 
-    // Filtre oluştur
-    const filter = { user: userId, type: 'user' };
-    if (subredditId) {
-      filter.subreddit = subredditId;
-    }
-
-    const flairs = await Flair.find(filter)
-      .skip(skip)
-      .limit(limit)
-      .sort({ createdAt: -1 })
-      .populate('subreddit', 'name');
-
-    const totalFlairs = await Flair.countDocuments(filter);
-
-    res.status(200).json({
-      success: true,
-      count: flairs.length,
-      total: totalFlairs,
-      totalPages: Math.ceil(totalFlairs / limit),
-      currentPage: page,
-      data: flairs,
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Kullanıcı flairleri getirilirken bir hata oluştu',
-      error: error.message,
-    });
+  if (!user) {
+    return next(new ErrorResponse(`${req.params.id} ID'sine sahip kullanıcı bulunamadı`, 404));
   }
-};
+
+  res.status(200).json({
+    success: true,
+    data: {
+      post: user.karma.post,
+      comment: user.karma.comment,
+      awardee: user.karma.awardee,
+      awarder: user.karma.awarder,
+      total: user.karma.post + user.karma.comment + user.karma.awardee + user.karma.awarder,
+    },
+  });
+});
 
 /**
- * Kullanıcıyı engelle/engeli kaldır
- * @route POST /api/users/block
- * @access Private
+ * @desc    Kullanıcının gönderilerini getir
+ * @route   GET /api/users/:id/posts
+ * @access  Public
  */
-const toggleBlockUser = async (req, res) => {
-  try {
-    const userId = req.user._id;
-    const { targetUsername } = req.body;
+const getUserPosts = asyncHandler(async (req, res, next) => {
+  // Pagination
+  const page = parseInt(req.query.page, 10) || 1;
+  const limit = parseInt(req.query.limit, 10) || 25;
+  const startIndex = (page - 1) * limit;
+  const endIndex = page * limit;
 
-    if (!targetUsername) {
-      return res.status(400).json({
-        success: false,
-        message: 'Engellenmek istenen kullanıcının adı gereklidir',
-      });
-    }
+  // Sıralama
+  const sortBy = req.query.sortBy || 'createdAt';
+  const sortOrder = req.query.sortOrder === 'asc' ? 1 : -1;
 
-    // Hedef kullanıcıyı bul
-    const targetUser = await User.findOne({ username: targetUsername });
+  const sortOptions = {};
+  sortOptions[sortBy] = sortOrder;
 
-    if (!targetUser) {
-      return res.status(404).json({
-        success: false,
-        message: 'Kullanıcı bulunamadı',
-      });
-    }
-
-    // Kendini engelleyemezsin
-    if (targetUser._id.toString() === userId.toString()) {
-      return res.status(400).json({
-        success: false,
-        message: 'Kendinizi engelleyemezsiniz',
-      });
-    }
-
-    // Kullanıcıyı bul
-    const user = await User.findById(userId);
-
-    // Kullanıcı zaten engellenmiş mi kontrol et
-    const isBlocked = user.blockedUsers.includes(targetUser._id);
-
-    if (isBlocked) {
-      // Engeli kaldır
-      await User.findByIdAndUpdate(userId, {
-        $pull: { blockedUsers: targetUser._id },
-      });
-
-      return res.status(200).json({
-        success: true,
-        message: 'Kullanıcının engeli kaldırıldı',
-        blocked: false,
-      });
-    } else {
-      // Kullanıcıyı engelle
-      await User.findByIdAndUpdate(userId, {
-        $addToSet: { blockedUsers: targetUser._id },
-      });
-
-      return res.status(200).json({
-        success: true,
-        message: 'Kullanıcı engellendi',
-        blocked: true,
-      });
-    }
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Kullanıcı engellenirken bir hata oluştu',
-      error: error.message,
-    });
+  // Kullanıcıyı kontrol et
+  const user = await User.findById(req.params.id);
+  if (!user) {
+    return next(new ErrorResponse(`${req.params.id} ID'sine sahip kullanıcı bulunamadı`, 404));
   }
-};
 
-/**
- * Engellenen kullanıcıları getir
- * @route GET /api/users/me/blocked
- * @access Private
- */
-const getBlockedUsers = async (req, res) => {
-  try {
-    const userId = req.user._id;
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 20;
-    const skip = (page - 1) * limit;
+  // Kullanıcının gönderilerini getir
+  const totalPosts = await Post.countDocuments({
+    author: req.params.id,
+    isDeleted: false,
+  });
 
-    // Kullanıcıyı tüm blockedUsers ile birlikte getir
-    const user = await User.findById(userId).populate({
-      path: 'blockedUsers',
-      select: 'username profilePicture bio createdAt',
-      options: {
-        skip,
-        limit,
-        sort: { username: 1 },
-      },
-    });
-
-    if (!user) {
-      return res.status(404).json({
-        success: false,
-        message: 'Kullanıcı bulunamadı',
-      });
-    }
-
-    const totalBlocked = user.blockedUsers.length;
-
-    res.status(200).json({
-      success: true,
-      count: user.blockedUsers.length,
-      total: totalBlocked,
-      totalPages: Math.ceil(totalBlocked / limit),
-      currentPage: page,
-      data: user.blockedUsers,
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Engellenen kullanıcılar getirilirken bir hata oluştu',
-      error: error.message,
-    });
-  }
-};
-
-/**
- * Kullanıcı istatistiklerini getir
- * @route GET /api/users/:username/stats
- * @access Public
- */
-const getUserStats = async (req, res) => {
-  try {
-    const { username } = req.params;
-
-    const user = await User.findOne({ username });
-
-    if (!user) {
-      return res.status(404).json({
-        success: false,
-        message: 'Kullanıcı bulunamadı',
-      });
-    }
-
-    // İstatistikleri hesapla
-    const postCount = await Post.countDocuments({ author: user._id, isDeleted: false });
-    const commentCount = await Comment.countDocuments({ author: user._id, isDeleted: false });
-    const subredditCount = await SubredditMembership.countDocuments({
-      user: user._id,
-      status: { $in: ['member', 'moderator', 'admin'] },
-    });
-    const moderatedCount = await SubredditMembership.countDocuments({
-      user: user._id,
-      status: { $in: ['moderator', 'admin'] },
-    });
-    const awardsReceivedCount = await Award.countDocuments({ recipient: user._id });
-    const awardsGivenCount = await Award.countDocuments({ giver: user._id });
-
-    // Upvote ve downvote sayılarını hesapla
-    const upvotesGiven = await Vote.countDocuments({ user: user._id, voteType: 'upvote' });
-    const downvotesGiven = await Vote.countDocuments({ user: user._id, voteType: 'downvote' });
-
-    // En çok aktif olunan subreddit'i bul
-    const popularSubreddits = await Post.aggregate([
-      { $match: { author: user._id, isDeleted: false } },
-      { $group: { _id: '$subreddit', count: { $sum: 1 } } },
-      { $sort: { count: -1 } },
-      { $limit: 1 },
+  const posts = await Post.find({
+    author: req.params.id,
+    isDeleted: false,
+  })
+    .sort(sortOptions)
+    .skip(startIndex)
+    .limit(limit)
+    .populate([
+      { path: 'subreddit', select: 'name title icon' },
+      { path: 'author', select: 'username profilePicture' },
     ]);
 
-    let mostActiveSubreddit = null;
-    if (popularSubreddits.length > 0) {
-      const subredditData = await SubredditMembership.findOne({
-        _id: popularSubreddits[0]._id,
-      }).select('name');
-      if (subredditData) {
-        mostActiveSubreddit = {
-          name: subredditData.name,
-          postCount: popularSubreddits[0].count,
-        };
-      }
+  // Pagination sonuçları
+  const pagination = {};
+
+  if (endIndex < totalPosts) {
+    pagination.next = {
+      page: page + 1,
+      limit,
+    };
+  }
+
+  if (startIndex > 0) {
+    pagination.prev = {
+      page: page - 1,
+      limit,
+    };
+  }
+
+  pagination.totalPages = Math.ceil(totalPosts / limit);
+  pagination.totalCount = totalPosts;
+
+  res.status(200).json({
+    success: true,
+    count: posts.length,
+    pagination,
+    data: posts,
+  });
+});
+
+/**
+ * @desc    Kullanıcının yorumlarını getir
+ * @route   GET /api/users/:id/comments
+ * @access  Public
+ */
+const getUserComments = asyncHandler(async (req, res, next) => {
+  // Pagination
+  const page = parseInt(req.query.page, 10) || 1;
+  const limit = parseInt(req.query.limit, 10) || 25;
+  const startIndex = (page - 1) * limit;
+  const endIndex = page * limit;
+
+  // Sıralama
+  const sortBy = req.query.sortBy || 'createdAt';
+  const sortOrder = req.query.sortOrder === 'asc' ? 1 : -1;
+
+  const sortOptions = {};
+  sortOptions[sortBy] = sortOrder;
+
+  // Kullanıcıyı kontrol et
+  const user = await User.findById(req.params.id);
+  if (!user) {
+    return next(new ErrorResponse(`${req.params.id} ID'sine sahip kullanıcı bulunamadı`, 404));
+  }
+
+  // Kullanıcının yorumlarını getir
+  const totalComments = await Comment.countDocuments({
+    author: req.params.id,
+    isDeleted: false,
+  });
+
+  const comments = await Comment.find({
+    author: req.params.id,
+    isDeleted: false,
+  })
+    .sort(sortOptions)
+    .skip(startIndex)
+    .limit(limit)
+    .populate([
+      { path: 'post', select: 'title slug subreddit' },
+      { path: 'author', select: 'username profilePicture' },
+    ])
+    .populate({
+      path: 'post',
+      populate: {
+        path: 'subreddit',
+        select: 'name title icon',
+      },
+    });
+
+  // Pagination sonuçları
+  const pagination = {};
+
+  if (endIndex < totalComments) {
+    pagination.next = {
+      page: page + 1,
+      limit,
+    };
+  }
+
+  if (startIndex > 0) {
+    pagination.prev = {
+      page: page - 1,
+      limit,
+    };
+  }
+
+  pagination.totalPages = Math.ceil(totalComments / limit);
+  pagination.totalCount = totalComments;
+
+  res.status(200).json({
+    success: true,
+    count: comments.length,
+    pagination,
+    data: comments,
+  });
+});
+
+/**
+ * @desc    Kullanıcının kaydedilmiş gönderilerini getir
+ * @route   GET /api/users/:id/saved
+ * @access  Private
+ */
+const getUserSavedItems = asyncHandler(async (req, res, next) => {
+  // Kullanıcı sadece kendi kaydedilmiş gönderilerini görebilir
+  if (req.user.id !== req.params.id && req.user.role !== 'admin') {
+    return next(new ErrorResponse('Bu işlem için yetkiniz bulunmamaktadır', 403));
+  }
+
+  // Pagination
+  const page = parseInt(req.query.page, 10) || 1;
+  const limit = parseInt(req.query.limit, 10) || 25;
+  const startIndex = (page - 1) * limit;
+  const endIndex = page * limit;
+
+  // Sıralama
+  const sortBy = req.query.sortBy || 'createdAt';
+  const sortOrder = req.query.sortOrder === 'asc' ? 1 : -1;
+  const sortOptions = {};
+  sortOptions[sortBy] = sortOrder;
+
+  // Filtreleme
+  const itemType = req.query.type || 'all'; // 'post', 'comment', 'all'
+
+  // Kullanıcıyı kontrol et
+  const user = await User.findById(req.params.id);
+  if (!user) {
+    return next(new ErrorResponse(`${req.params.id} ID'sine sahip kullanıcı bulunamadı`, 404));
+  }
+
+  // Saved items modeli üzerinden sorgulama
+  let query = { user: req.params.id };
+  if (itemType === 'post') {
+    query.post = { $exists: true };
+  } else if (itemType === 'comment') {
+    query.comment = { $exists: true };
+  }
+
+  const savedItems = await mongoose
+    .model('SavedItem')
+    .find(query)
+    .sort(sortOptions)
+    .skip(startIndex)
+    .limit(limit)
+    .populate([
+      { path: 'post', populate: { path: 'subreddit', select: 'name title icon' } },
+      { path: 'post', populate: { path: 'author', select: 'username profilePicture' } },
+      { path: 'comment', populate: { path: 'post', select: 'title slug subreddit' } },
+      { path: 'comment', populate: { path: 'author', select: 'username profilePicture' } },
+    ]);
+
+  // Toplam öğe sayısını al
+  const total = await mongoose.model('SavedItem').countDocuments(query);
+
+  // Pagination sonuçları
+  const pagination = {};
+
+  if (endIndex < total) {
+    pagination.next = {
+      page: page + 1,
+      limit,
+    };
+  }
+
+  if (startIndex > 0) {
+    pagination.prev = {
+      page: page - 1,
+      limit,
+    };
+  }
+
+  pagination.totalPages = Math.ceil(total / limit);
+  pagination.totalCount = total;
+
+  res.status(200).json({
+    success: true,
+    count: savedItems.length,
+    pagination,
+    data: savedItems,
+  });
+});
+
+/**
+ * @desc    Kullanıcının üye olduğu subreddit'leri getir
+ * @route   GET /api/users/:id/subreddits
+ * @access  Public
+ */
+const getUserSubreddits = asyncHandler(async (req, res, next) => {
+  // Pagination
+  const page = parseInt(req.query.page, 10) || 1;
+  const limit = parseInt(req.query.limit, 10) || 25;
+  const startIndex = (page - 1) * limit;
+  const endIndex = page * limit;
+
+  // Kullanıcıyı kontrol et
+  const user = await User.findById(req.params.id);
+  if (!user) {
+    return next(new ErrorResponse(`${req.params.id} ID'sine sahip kullanıcı bulunamadı`, 404));
+  }
+
+  // Kullanıcının üyeliklerini getir
+  const memberships = await SubredditMembership.find({
+    user: req.params.id,
+    status: 'member',
+  })
+    .sort({ createdAt: -1 })
+    .skip(startIndex)
+    .limit(limit)
+    .populate({
+      path: 'subreddit',
+      select: 'name title description icon memberCount type nsfw createdAt',
+    });
+
+  // Toplam üyelik sayısını al
+  const totalMemberships = await SubredditMembership.countDocuments({
+    user: req.params.id,
+    status: 'member',
+  });
+
+  // Pagination sonuçları
+  const pagination = {};
+
+  if (endIndex < totalMemberships) {
+    pagination.next = {
+      page: page + 1,
+      limit,
+    };
+  }
+
+  if (startIndex > 0) {
+    pagination.prev = {
+      page: page - 1,
+      limit,
+    };
+  }
+
+  pagination.totalPages = Math.ceil(totalMemberships / limit);
+  pagination.totalCount = totalMemberships;
+
+  res.status(200).json({
+    success: true,
+    count: memberships.length,
+    pagination,
+    data: memberships,
+  });
+});
+
+/**
+ * @desc    Kullanıcının moderatörlük yaptığı subreddit'leri getir
+ * @route   GET /api/users/:id/moderating
+ * @access  Public
+ */
+const getUserModeratedSubreddits = asyncHandler(async (req, res, next) => {
+  // Pagination
+  const page = parseInt(req.query.page, 10) || 1;
+  const limit = parseInt(req.query.limit, 10) || 25;
+  const startIndex = (page - 1) * limit;
+  const endIndex = page * limit;
+
+  // Kullanıcıyı kontrol et
+  const user = await User.findById(req.params.id);
+  if (!user) {
+    return next(new ErrorResponse(`${req.params.id} ID'sine sahip kullanıcı bulunamadı`, 404));
+  }
+
+  // Kullanıcının moderatör olduğu subreddit'leri getir
+  const moderatorRoles = await mongoose
+    .model('UserRoleAssignment')
+    .find({
+      user: req.params.id,
+      role: { $in: ['moderator', 'admin'] },
+      entityType: 'subreddit',
+    })
+    .sort({ createdAt: -1 })
+    .skip(startIndex)
+    .limit(limit)
+    .populate({
+      path: 'entity',
+      select: 'name title description icon memberCount type nsfw createdAt',
+    });
+
+  // Toplam moderatörlük sayısını al
+  const totalModeratorRoles = await mongoose.model('UserRoleAssignment').countDocuments({
+    user: req.params.id,
+    role: { $in: ['moderator', 'admin'] },
+    entityType: 'subreddit',
+  });
+
+  // Pagination sonuçları
+  const pagination = {};
+
+  if (endIndex < totalModeratorRoles) {
+    pagination.next = {
+      page: page + 1,
+      limit,
+    };
+  }
+
+  if (startIndex > 0) {
+    pagination.prev = {
+      page: page - 1,
+      limit,
+    };
+  }
+
+  pagination.totalPages = Math.ceil(totalModeratorRoles / limit);
+  pagination.totalCount = totalModeratorRoles;
+
+  res.status(200).json({
+    success: true,
+    count: moderatorRoles.length,
+    pagination,
+    data: moderatorRoles,
+  });
+});
+
+/**
+ * @desc    Kullanıcı istatistiklerini getir
+ * @route   GET /api/users/:id/statistics
+ * @access  Public
+ */
+const getUserStatistics = asyncHandler(async (req, res, next) => {
+  const userId = req.params.id;
+
+  // Kullanıcı kontrolü
+  const user = await User.findById(userId);
+  if (!user) {
+    return next(new ErrorResponse(`${userId} ID'sine sahip kullanıcı bulunamadı`, 404));
+  }
+
+  // Post istatistikleri
+  const postCount = await Post.countDocuments({ author: userId, isDeleted: false });
+  const postUpvotes = await Post.aggregate([
+    { $match: { author: mongoose.Types.ObjectId(userId), isDeleted: false } },
+    { $group: { _id: null, total: { $sum: '$voteScore' } } },
+  ]);
+
+  // Yorum istatistikleri
+  const commentCount = await Comment.countDocuments({ author: userId, isDeleted: false });
+  const commentUpvotes = await Comment.aggregate([
+    { $match: { author: mongoose.Types.ObjectId(userId), isDeleted: false } },
+    { $group: { _id: null, total: { $sum: '$voteScore' } } },
+  ]);
+
+  // Üye olunan subreddit sayısı
+  const membershipCount = await SubredditMembership.countDocuments({
+    user: userId,
+    status: 'member',
+  });
+
+  // Moderatörlük yapılan subreddit sayısı
+  const moderatorCount = await mongoose.model('UserRoleAssignment').countDocuments({
+    user: userId,
+    role: { $in: ['moderator', 'admin'] },
+    entityType: 'subreddit',
+  });
+
+  // En aktif olduğu subredditler
+  const topSubreddits = await Post.aggregate([
+    { $match: { author: mongoose.Types.ObjectId(userId), isDeleted: false } },
+    { $group: { _id: '$subreddit', count: { $sum: 1 } } },
+    { $sort: { count: -1 } },
+    { $limit: 5 },
+    {
+      $lookup: {
+        from: 'subreddits',
+        localField: '_id',
+        foreignField: '_id',
+        as: 'subredditInfo',
+      },
+    },
+    { $unwind: '$subredditInfo' },
+    {
+      $project: {
+        _id: 1,
+        count: 1,
+        name: '$subredditInfo.name',
+        title: '$subredditInfo.title',
+        icon: '$subredditInfo.icon',
+      },
+    },
+  ]);
+
+  // Hesap yaşı
+  const accountAge = Math.floor((Date.now() - user.createdAt) / (1000 * 60 * 60 * 24));
+
+  res.status(200).json({
+    success: true,
+    data: {
+      username: user.username,
+      profilePicture: user.profilePicture,
+      karma: {
+        post: user.karma.post,
+        comment: user.karma.comment,
+        awardee: user.karma.awardee,
+        awarder: user.karma.awarder,
+        total: user.karma.post + user.karma.comment + user.karma.awardee + user.karma.awarder,
+      },
+      activity: {
+        postCount,
+        postUpvotes: postUpvotes.length > 0 ? postUpvotes[0].total : 0,
+        commentCount,
+        commentUpvotes: commentUpvotes.length > 0 ? commentUpvotes[0].total : 0,
+        membershipCount,
+        moderatorCount,
+      },
+      topSubreddits,
+      accountAge,
+      createdAt: user.createdAt,
+    },
+  });
+});
+
+/**
+ * @desc    Kullanıcının aldığı ödülleri getir
+ * @route   GET /api/users/:id/awards
+ * @access  Public
+ */
+const getUserAwards = asyncHandler(async (req, res, next) => {
+  const userId = req.params.id;
+
+  // Pagination
+  const page = parseInt(req.query.page, 10) || 1;
+  const limit = parseInt(req.query.limit, 10) || 25;
+  const startIndex = (page - 1) * limit;
+  const endIndex = page * limit;
+
+  // Kullanıcı kontrolü
+  const user = await User.findById(userId);
+  if (!user) {
+    return next(new ErrorResponse(`${userId} ID'sine sahip kullanıcı bulunamadı`, 404));
+  }
+
+  // Kullanıcının aldığı ödülleri getir
+  const awards = await mongoose
+    .model('Award')
+    .find({
+      recipient: userId,
+      entityType: { $in: ['post', 'comment'] },
+    })
+    .sort({ createdAt: -1 })
+    .skip(startIndex)
+    .limit(limit)
+    .populate([
+      { path: 'awardType', select: 'name icon description value' },
+      { path: 'giver', select: 'username profilePicture' },
+      { path: 'post', select: 'title slug subreddit' },
+      { path: 'comment', select: 'content post' },
+    ]);
+
+  // Toplam ödül sayısını al
+  const totalAwards = await mongoose.model('Award').countDocuments({
+    recipient: userId,
+    entityType: { $in: ['post', 'comment'] },
+  });
+
+  // Pagination sonuçları
+  const pagination = {};
+
+  if (endIndex < totalAwards) {
+    pagination.next = {
+      page: page + 1,
+      limit,
+    };
+  }
+
+  if (startIndex > 0) {
+    pagination.prev = {
+      page: page - 1,
+      limit,
+    };
+  }
+
+  pagination.totalPages = Math.ceil(totalAwards / limit);
+  pagination.totalCount = totalAwards;
+
+  res.status(200).json({
+    success: true,
+    count: awards.length,
+    pagination,
+    data: awards,
+  });
+});
+
+/**
+ * @desc    Kullanıcının dosya kullanım istatistiklerini getir
+ * @route   GET /api/users/:id/storage
+ * @access  Private (Kullanıcının kendisi ve admin)
+ */
+const getUserStorageStats = asyncHandler(async (req, res, next) => {
+  const userId = req.params.id;
+
+  // Yetki kontrolü
+  if (req.user.id !== userId && req.user.role !== 'admin') {
+    return next(new ErrorResponse('Bu işlem için yetkiniz bulunmamaktadır', 403));
+  }
+
+  // Kullanıcı kontrolü
+  const user = await User.findById(userId);
+  if (!user) {
+    return next(new ErrorResponse(`${userId} ID'sine sahip kullanıcı bulunamadı`, 404));
+  }
+
+  // Kullanıcının yüklediği dosyaları getir
+  const uploadedFiles = await mongoose.model('Upload').find({
+    uploader: userId,
+  });
+
+  // Toplam kullanılan alanı hesapla
+  let totalSize = 0;
+  let fileTypeStats = {};
+
+  uploadedFiles.forEach((file) => {
+    totalSize += file.size;
+
+    // Dosya tipi istatistikleri
+    const fileType = file.fileType || 'other';
+    if (!fileTypeStats[fileType]) {
+      fileTypeStats[fileType] = {
+        count: 0,
+        size: 0,
+      };
     }
+
+    fileTypeStats[fileType].count += 1;
+    fileTypeStats[fileType].size += file.size;
+  });
+
+  res.status(200).json({
+    success: true,
+    data: {
+      totalFiles: uploadedFiles.length,
+      totalSize,
+      usedStoragePercentage: (totalSize / process.env.MAX_USER_STORAGE) * 100,
+      maxStorage: process.env.MAX_USER_STORAGE,
+      fileTypes: fileTypeStats,
+    },
+  });
+});
+
+/**
+ * @desc    Hesabı kalıcı olarak sil
+ * @route   DELETE /api/users/account
+ * @access  Private
+ */
+const permanentlyDeleteAccount = asyncHandler(async (req, res, next) => {
+  const { password, confirmation } = req.body;
+
+  if (!password) {
+    return next(new ErrorResponse('Hesabınızı silmek için şifrenizi girmelisiniz', 400));
+  }
+
+  if (confirmation !== 'DELETE_MY_ACCOUNT') {
+    return next(new ErrorResponse('Hesap silme işlemini onaylamanız gerekiyor', 400));
+  }
+
+  // Şifre ile birlikte kullanıcıyı getir
+  const user = await User.findById(req.user.id).select('+password');
+
+  // Şifreyi doğrula
+  const isMatch = await user.matchPassword(password);
+  if (!isMatch) {
+    return next(new ErrorResponse('Geçersiz şifre', 401));
+  }
+
+  // Transaction başlat
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
+  try {
+    // Kullanıcının içeriklerini anonim yap
+    await Post.updateMany(
+      { author: req.user.id },
+      {
+        author: null,
+        authorUsername: '[deleted]',
+        isAnonymized: true,
+      },
+      { session },
+    );
+
+    await Comment.updateMany(
+      { author: req.user.id },
+      {
+        author: null,
+        authorUsername: '[deleted]',
+        isAnonymized: true,
+      },
+      { session },
+    );
+
+    // Kullanıcının üyeliklerini sil
+    await SubredditMembership.deleteMany({ user: req.user.id }, { session });
+
+    // Kullanıcının rol atamalarını sil
+    await mongoose.model('UserRoleAssignment').deleteMany({ user: req.user.id }, { session });
+
+    // Kullanıcının oylama geçmişini sil
+    await mongoose.model('Vote').deleteMany({ user: req.user.id }, { session });
+
+    // Kullanıcıyı sil (hard delete)
+    await User.findByIdAndDelete(req.user.id, { session });
+
+    // İşlemi tamamla
+    await session.commitTransaction();
 
     res.status(200).json({
       success: true,
-      data: {
-        accountAge: user.createdAt,
-        karma: {
-          total: user.totalKarma,
-          post: user.karma.post,
-          comment: user.karma.comment,
-          awardee: user.karma.awardee,
-          awarder: user.karma.awarder,
-        },
-        activity: {
-          postCount,
-          commentCount,
-          subredditCount,
-          moderatedCount,
-          awardsReceived: awardsReceivedCount,
-          awardsGiven: awardsGivenCount,
-          upvotesGiven,
-          downvotesGiven,
-          mostActiveSubreddit,
-        },
-      },
+      data: {},
+      message: 'Hesabınız başarıyla kalıcı olarak silindi',
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Kullanıcı istatistikleri getirilirken bir hata oluştu',
-      error: error.message,
-    });
+    await session.abortTransaction();
+    return next(new ErrorResponse('Hesap silme işlemi sırasında bir hata oluştu', 500));
+  } finally {
+    session.endSession();
   }
-};
+});
 
-// Fonksiyonları dışa aktar
 module.exports = {
   getUsers,
-  getUserProfile,
-  updateProfile,
+  getUser,
+  createUser,
   updateUser,
   deleteUser,
+  updateProfile,
+  updateProfilePicture,
+  updatePassword,
+  verifyEmail,
+  updateUsername,
+  getUserKarma,
   getUserPosts,
   getUserComments,
-  getUserKarma,
+  getUserSavedItems,
   getUserSubreddits,
-  getSavedItems,
-  toggleSaveItem,
-  getUserNotifications,
-  markNotificationAsRead,
-  markAllNotificationsAsRead,
-  getUserVotes,
-  getUserSettings,
-  updateUserSettings,
-  getModeratedSubreddits,
-  getModActions,
-  getUserFlairs,
-  toggleBlockUser,
-  getBlockedUsers,
-  getUserStats,
+  getUserModeratedSubreddits,
+  getUserStatistics,
+  getUserAwards,
+  getUserStorageStats,
+  permanentlyDeleteAccount,
 };

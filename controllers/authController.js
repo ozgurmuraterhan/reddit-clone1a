@@ -1,180 +1,579 @@
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
+const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
 const User = require('../models/User');
 const Role = require('../models/Role');
 const UserRoleAssignment = require('../models/UserRoleAssignment');
 const Permission = require('../models/Permission');
-const Post = require('../models/Post');
-const Comment = require('../models/Comment');
-const asyncHandler = require('../middleware/async');
 const ErrorResponse = require('../utils/errorResponse');
+const asyncHandler = require('../middleware/async');
 const sendEmail = require('../utils/sendEmail');
 
-// JWT token oluşturma yardımcısı
-const generateToken = (id) => {
-  return jwt.sign({ id }, process.env.JWT_SECRET, {
-    expiresIn: process.env.JWT_EXPIRE,
-  });
-};
+/**
+ * @desc    Kullanıcı kaydı oluştur
+ * @route   POST /api/auth/register
+ * @access  Public
+ */
+const register = asyncHandler(async (req, res, next) => {
+  const { username, email, password, confirmPassword } = req.body;
 
-// Token yanıtı gönderme yardımcısı
-const sendTokenResponse = (user, statusCode, res) => {
-  const token = generateToken(user._id);
-
-  const options = {
-    expires: new Date(Date.now() + process.env.JWT_COOKIE_EXPIRE * 24 * 60 * 60 * 1000),
-    httpOnly: true,
-  };
-
-  if (process.env.NODE_ENV === 'production') {
-    options.secure = true;
+  // Şifre doğrulama kontrolü
+  if (password !== confirmPassword) {
+    return next(new ErrorResponse('Şifreler eşleşmiyor', 400));
   }
 
-  res.status(statusCode).cookie('token', token, options).json({
-    success: true,
-    token,
-  });
-};
-
-// İzin kontrolü yardımcısı
-const checkPermission = async (userId, permissionName, subredditId = null) => {
-  const query = {
-    user: userId,
-  };
-
-  if (subredditId) {
-    query.$or = [{ subreddit: subredditId }, { scope: 'site' }];
-  } else {
-    query.scope = 'site';
+  // Kullanıcı adı ve email kontrolü
+  const usernameExists = await User.findOne({ username });
+  if (usernameExists) {
+    return next(new ErrorResponse('Bu kullanıcı adı zaten kullanılıyor', 400));
   }
 
-  const userRoles = await UserRoleAssignment.find(query).populate({
-    path: 'role',
-    populate: {
-      path: 'permissions',
-      match: { name: permissionName },
-    },
-  });
+  const emailExists = await User.findOne({ email });
+  if (emailExists) {
+    return next(new ErrorResponse('Bu email adresi zaten kullanılıyor', 400));
+  }
 
-  return userRoles.some(
-    (assignment) => assignment.role.permissions && assignment.role.permissions.length > 0,
-  );
-};
-// @desc    Register user
-// @route   POST /api/v1/auth/register
-// @access  Public
-exports.register = asyncHandler(async (req, res, next) => {
-  const { username, email, password } = req.body;
-
-  // Hash password
-  const salt = await bcrypt.genSalt(10);
+  // Şifre hashleme
+  const salt = await bcrypt.genSalt(12);
   const hashedPassword = await bcrypt.hash(password, salt);
 
-  // Create user
+  // Doğrulama token'ı oluştur
+  const verificationToken = crypto.randomBytes(20).toString('hex');
+  const verificationTokenExpire = Date.now() + 24 * 60 * 60 * 1000; // 24 saat
+
+  // Kullanıcı oluştur
   const user = await User.create({
     username,
     email,
     password: hashedPassword,
+    verificationToken,
+    verificationTokenExpire,
+    accountStatus: 'pending_verification',
   });
 
-  // Assign default user role
-  const defaultRole = await Role.findOne({
-    scope: 'site',
-    isDefault: true,
-  });
-
+  // Default kullanıcı rolünü bul ve ata
+  const defaultRole = await Role.findOne({ isDefault: true, scope: 'site' });
   if (defaultRole) {
     await UserRoleAssignment.create({
       user: user._id,
       role: defaultRole._id,
-      scope: 'site',
     });
   }
 
-  // Create verification token
-  const verificationToken = crypto.randomBytes(20).toString('hex');
-
-  // Hash token and set to verificationToken field
-  const hashedToken = crypto.createHash('sha256').update(verificationToken).digest('hex');
-
-  // Set verification token fields
-  user.verificationToken = hashedToken;
-  user.verificationTokenExpire = Date.now() + 24 * 60 * 60 * 1000; // 24 hours
-
-  await user.save();
-
-  // Create verification URL
-  const verificationUrl = `${req.protocol}://${req.get(
-    'host',
-  )}/api/v1/auth/verify-email/${verificationToken}`;
-
-  const message = `You are receiving this email because you need to confirm your email address. Please visit: \n\n ${verificationUrl}`;
-
+  // Doğrulama e-postası gönder
   try {
+    const verificationUrl = `${req.protocol}://${req.get('host')}/api/auth/verify-email/${verificationToken}`;
+
+    const message = `
+      <h1>Email Adresinizi Doğrulayın</h1>
+      <p>Reddit klonumuza hoş geldiniz! Hesabınızı aktifleştirmek için lütfen aşağıdaki bağlantıya tıklayın:</p>
+      <a href="${verificationUrl}" target="_blank">Hesabımı Doğrula</a>
+      <p>Bu e-posta sizin tarafınızdan talep edilmediyse, lütfen dikkate almayın.</p>
+    `;
+
     await sendEmail({
       email: user.email,
-      subject: 'Email verification',
-      message,
+      subject: 'Email Doğrulama',
+      html: message,
     });
 
-    sendTokenResponse(user, 200, res);
-  } catch (err) {
-    user.verificationToken = undefined;
-    user.verificationTokenExpire = undefined;
-    await user.save({ validateBeforeSave: false });
+    res.status(201).json({
+      success: true,
+      message:
+        'Kullanıcı kaydı başarılı. Email adresinize gönderilen link ile hesabınızı doğrulayın.',
+    });
+  } catch (error) {
+    // Email gönderilemediğinde kullanıcıyı bilgilendir ama işlemi iptal etme
+    console.error('Email gönderme hatası:', error);
 
-    return next(new ErrorResponse('Email could not be sent', 500));
+    res.status(201).json({
+      success: true,
+      message:
+        'Kullanıcı kaydı başarılı fakat doğrulama e-postası gönderilemedi. Lütfen yöneticiyle iletişime geçin.',
+      error: 'Email gönderme hatası',
+    });
   }
 });
 
-// @desc    Login user
-// @route   POST /api/v1/auth/login
-// @access  Public
-exports.login = asyncHandler(async (req, res, next) => {
-  const { email, password } = req.body;
+/**
+ * @desc    Email doğrulama
+ * @route   GET /api/auth/verify-email/:token
+ * @access  Public
+ */
+const verifyEmail = asyncHandler(async (req, res, next) => {
+  const { token } = req.params;
 
-  // Validate email & password
-  if (!email || !password) {
-    return next(new ErrorResponse('Please provide an email and password', 400));
-  }
-
-  // Check for user
-  const user = await User.findOne({ email, isDeleted: false }).select('+password');
+  // Token ile kullanıcıyı bul
+  const user = await User.findOne({
+    verificationToken: token,
+    verificationTokenExpire: { $gt: Date.now() },
+  });
 
   if (!user) {
-    return next(new ErrorResponse('Invalid credentials', 401));
+    return next(new ErrorResponse("Geçersiz veya süresi dolmuş doğrulama token'ı", 400));
   }
 
-  // Check if password matches
+  // Kullanıcı hesabını aktifleştir
+  user.emailVerified = true;
+  user.accountStatus = 'active';
+  user.verificationToken = undefined;
+  user.verificationTokenExpire = undefined;
+  await user.save();
+
+  res.status(200).json({
+    success: true,
+    message: 'Email doğrulama başarılı. Hesabınız aktifleştirildi.',
+  });
+});
+
+/**
+ * @desc    Kullanıcı girişi
+ * @route   POST /api/auth/login
+ * @access  Public
+ */
+const login = asyncHandler(async (req, res, next) => {
+  const { username, email, password } = req.body;
+
+  // Kullanıcı adı veya email kontrolü
+  if (!username && !email) {
+    return next(new ErrorResponse('Lütfen kullanıcı adı veya email girin', 400));
+  }
+
+  // Şifre kontrolü
+  if (!password) {
+    return next(new ErrorResponse('Lütfen şifre girin', 400));
+  }
+
+  // Kullanıcıyı bul
+  const query = {};
+  if (username) query.username = username;
+  if (email) query.email = email;
+
+  const user = await User.findOne(query).select('+password');
+
+  if (!user) {
+    return next(new ErrorResponse('Hatalı kullanıcı bilgileri', 401));
+  }
+
+  // Hesap durumu kontrolü
+  if (user.accountStatus === 'suspended') {
+    return next(
+      new ErrorResponse(
+        'Hesabınız askıya alınmıştır. Daha fazla bilgi için yöneticiyle iletişime geçin.',
+        403,
+      ),
+    );
+  }
+
+  if (user.accountStatus === 'pending_verification') {
+    return next(
+      new ErrorResponse('Lütfen hesabınızı email adresinize gönderilen link ile doğrulayın.', 401),
+    );
+  }
+
+  if (user.accountStatus === 'deleted') {
+    return next(new ErrorResponse('Bu hesap silindi', 401));
+  }
+
+  // Şifre kontrolü
   const isMatch = await bcrypt.compare(password, user.password);
 
   if (!isMatch) {
-    return next(new ErrorResponse('Invalid credentials', 401));
+    return next(new ErrorResponse('Hatalı kullanıcı bilgileri', 401));
   }
 
-  // Check if email is verified
-  if (!user.emailVerified && process.env.REQUIRE_EMAIL_VERIFICATION === 'true') {
-    return next(new ErrorResponse('Please verify your email address', 401));
-  }
-
-  // Check if account is suspended
-  if (user.accountStatus === 'suspended') {
-    return next(new ErrorResponse(`This account has been suspended.`, 403));
-  }
-
-  // Update last login time
+  // Son giriş tarihini güncelle
   user.lastLogin = Date.now();
   user.lastActive = Date.now();
+  await user.save();
+
+  // JWT token oluştur
+  sendTokenResponse(user, 200, res);
+});
+
+/**
+ * @desc    Sosyal medya hesabı ile giriş/kayıt
+ * @route   POST /api/auth/social/:provider
+ * @access  Public
+ */
+const socialAuth = asyncHandler(async (req, res, next) => {
+  const { provider } = req.params;
+  const { id, email, name, picture } = req.body;
+
+  if (!['google', 'facebook', 'twitter', 'github'].includes(provider)) {
+    return next(new ErrorResponse('Desteklenmeyen kimlik doğrulama sağlayıcısı', 400));
+  }
+
+  if (!id || !email) {
+    return next(new ErrorResponse('ID ve email bilgileri gereklidir', 400));
+  }
+
+  // Email doğrulaması yapılmış sosyal giriş kabul edilir
+  let user = await User.findOne({ email });
+
+  if (user) {
+    // Eğer kullanıcı varsa auth provider bilgisini güncelle/ekle
+    if (user.authProvider !== provider || user.authProviderId !== id) {
+      user.authProvider = provider;
+      user.authProviderId = id;
+      await user.save();
+    }
+  } else {
+    // Kullanıcı yoksa oluştur
+    const username = await generateUniqueUsername(name || email.split('@')[0]);
+
+    user = await User.create({
+      username,
+      email,
+      password: crypto.randomBytes(16).toString('hex'), // Rastgele şifre (direkt giriş yapılamaz)
+      profilePicture: picture || `default-profile.png`,
+      authProvider: provider,
+      authProviderId: id,
+      emailVerified: true, // Sosyal giriş kullanıcıları email doğrulaması atlar
+      accountStatus: 'active',
+    });
+
+    // Default kullanıcı rolünü ata
+    const defaultRole = await Role.findOne({ isDefault: true, scope: 'site' });
+    if (defaultRole) {
+      await UserRoleAssignment.create({
+        user: user._id,
+        role: defaultRole._id,
+      });
+    }
+  }
+
+  // Son giriş tarihini güncelle
+  user.lastLogin = Date.now();
+  user.lastActive = Date.now();
+  await user.save();
+
+  // JWT token oluştur
+  sendTokenResponse(user, 200, res);
+});
+
+/**
+ * @desc    Mevcut giriş yapmış kullanıcı bilgilerini getir
+ * @route   GET /api/auth/me
+ * @access  Private
+ */
+const getMe = asyncHandler(async (req, res, next) => {
+  const user = await User.findById(req.user._id).select('-password');
+
+  // Kullanıcının rollerini getir
+  const roleAssignments = await UserRoleAssignment.find({ user: user._id }).populate({
+    path: 'role',
+    select: 'name permissions scope',
+    populate: {
+      path: 'permissions',
+      select: 'name category scope',
+    },
+  });
+
+  // Basitleştirilmiş rol ve izin listesi oluştur
+  const roles = roleAssignments.map((assignment) => ({
+    id: assignment.role._id,
+    name: assignment.role.name,
+    scope: assignment.role.scope,
+    subreddit: assignment.subreddit || null,
+    permissions: assignment.role.permissions.map((p) => p.name),
+  }));
+
+  // Son aktiflik tarihini güncelle
+  user.lastActive = Date.now();
   await user.save({ validateBeforeSave: false });
+
+  res.status(200).json({
+    success: true,
+    data: {
+      user,
+      roles,
+    },
+  });
+});
+
+/**
+ * @desc    Kullanıcı çıkışı
+ * @route   GET /api/auth/logout
+ * @access  Private
+ */
+const logout = asyncHandler(async (req, res, next) => {
+  res.cookie('token', 'none', {
+    expires: new Date(Date.now() + 10 * 1000), // 10 saniye sonra expire
+    httpOnly: true,
+  });
+
+  res.status(200).json({
+    success: true,
+    data: {},
+  });
+});
+
+/**
+ * @desc    Şifre güncelleme
+ * @route   PUT /api/auth/update-password
+ * @access  Private
+ */
+const updatePassword = asyncHandler(async (req, res, next) => {
+  const { currentPassword, newPassword, confirmPassword } = req.body;
+
+  // Şifre doğrulama kontrolü
+  if (newPassword !== confirmPassword) {
+    return next(new ErrorResponse('Yeni şifreler eşleşmiyor', 400));
+  }
+
+  // Kullanıcıyı şifresiyle getir
+  const user = await User.findById(req.user._id).select('+password');
+
+  // Sosyal medya hesabıyla giriş yapan kullanıcılar için kontrol
+  if (user.authProvider !== 'local') {
+    return next(
+      new ErrorResponse(
+        `${user.authProvider} hesabı ile giriş yaptığınız için şifre değiştiremezsiniz`,
+        400,
+      ),
+    );
+  }
+
+  // Mevcut şifre kontrolü
+  const isMatch = await bcrypt.compare(currentPassword, user.password);
+
+  if (!isMatch) {
+    return next(new ErrorResponse('Mevcut şifre hatalı', 401));
+  }
+
+  // Şifre hashleme
+  const salt = await bcrypt.genSalt(12);
+  const hashedPassword = await bcrypt.hash(newPassword, salt);
+
+  // Şifreyi güncelle
+  user.password = hashedPassword;
+  await user.save();
 
   sendTokenResponse(user, 200, res);
 });
 
-// @desc    Log user out / clear cookie
-// @route   GET /api/v1/auth/logout
-// @access  Private
-exports.logout = asyncHandler(async (req, res, next) => {
+/**
+ * @desc    Şifremi unuttum
+ * @route   POST /api/auth/forgot-password
+ * @access  Public
+ */
+const forgotPassword = asyncHandler(async (req, res, next) => {
+  const { email } = req.body;
+
+  if (!email) {
+    return next(new ErrorResponse('Lütfen email adresinizi girin', 400));
+  }
+
+  const user = await User.findOne({ email });
+
+  if (!user) {
+    return next(new ErrorResponse('Bu email adresiyle kayıtlı kullanıcı bulunamadı', 404));
+  }
+
+  // Sosyal medya hesabıyla giriş yapan kullanıcılar için kontrol
+  if (user.authProvider !== 'local') {
+    return next(new ErrorResponse(`Lütfen ${user.authProvider} hesabınızla giriş yapın`, 400));
+  }
+
+  // Şifre sıfırlama token'ı oluştur
+  const resetToken = crypto.randomBytes(20).toString('hex');
+
+  // Token'ı hash'le ve DB'ye kaydet
+  user.resetPasswordToken = crypto.createHash('sha256').update(resetToken).digest('hex');
+
+  // Token süresi: 10 dakika
+  user.resetPasswordExpire = Date.now() + 10 * 60 * 1000;
+
+  await user.save({ validateBeforeSave: false });
+
+  // Şifre sıfırlama e-postası gönder
+  try {
+    const resetUrl = `${req.protocol}://${req.get('host')}/api/auth/reset-password/${resetToken}`;
+
+    const message = `
+      <h1>Şifre Sıfırlama İsteği</h1>
+      <p>Şifrenizi sıfırlamak için aşağıdaki bağlantıya tıklayın:</p>
+      <a href="${resetUrl}" target="_blank">Şifremi Sıfırla</a>
+      <p>Bu link 10 dakika sonra geçerliliğini yitirecektir.</p>
+      <p>Eğer bu isteği siz yapmadıysanız, bu e-postayı dikkate almayın.</p>
+    `;
+
+    await sendEmail({
+      email: user.email,
+      subject: 'Şifre Sıfırlama',
+      html: message,
+    });
+
+    res.status(200).json({
+      success: true,
+      message: 'Şifre sıfırlama linki e-posta adresinize gönderildi',
+    });
+  } catch (error) {
+    console.error('Email gönderme hatası:', error);
+
+    // Token'ları sıfırla
+    user.resetPasswordToken = undefined;
+    user.resetPasswordExpire = undefined;
+    await user.save({ validateBeforeSave: false });
+
+    return next(new ErrorResponse('Email gönderilemedi. Lütfen daha sonra tekrar deneyin.', 500));
+  }
+});
+
+/**
+ * @desc    Şifre sıfırlama
+ * @route   PUT /api/auth/reset-password/:token
+ * @access  Public
+ */
+const resetPassword = asyncHandler(async (req, res, next) => {
+  const { token } = req.params;
+  const { password, confirmPassword } = req.body;
+
+  // Şifre doğrulama kontrolü
+  if (!password || !confirmPassword) {
+    return next(new ErrorResponse('Lütfen şifre ve şifre doğrulama alanlarını doldurun', 400));
+  }
+
+  if (password !== confirmPassword) {
+    return next(new ErrorResponse('Şifreler eşleşmiyor', 400));
+  }
+
+  // Token'ı hash'le
+  const resetPasswordToken = crypto.createHash('sha256').update(token).digest('hex');
+
+  // Token'a sahip ve süresi dolmamış kullanıcıyı bul
+  const user = await User.findOne({
+    resetPasswordToken,
+    resetPasswordExpire: { $gt: Date.now() },
+  });
+
+  if (!user) {
+    return next(new ErrorResponse('Geçersiz veya süresi dolmuş token', 400));
+  }
+
+  // Şifre hashleme
+  const salt = await bcrypt.genSalt(12);
+  const hashedPassword = await bcrypt.hash(password, salt);
+
+  // Şifreyi güncelle ve token'ları sıfırla
+  user.password = hashedPassword;
+  user.resetPasswordToken = undefined;
+  user.resetPasswordExpire = undefined;
+  await user.save();
+
+  // E-posta bildirimi gönder
+  try {
+    const message = `
+      <h1>Şifreniz Başarıyla Değiştirildi</h1>
+      <p>Reddit klonumuzda şifreniz başarıyla değiştirildi.</p>
+      <p>Eğer bu değişikliği siz yapmadıysanız, lütfen hemen bizimle iletişime geçin.</p>
+    `;
+
+    await sendEmail({
+      email: user.email,
+      subject: 'Şifre Değişikliği Bildirimi',
+      html: message,
+    });
+  } catch (error) {
+    console.error('Email gönderme hatası:', error);
+    // Şifre değişikliği tamamlandı, email gönderim hatası işlemi engellemez
+  }
+
+  sendTokenResponse(user, 200, res);
+});
+
+/**
+ * @desc    Profil güncelleme
+ * @route   PUT /api/auth/update-profile
+ * @access  Private
+ */
+const updateProfile = asyncHandler(async (req, res, next) => {
+  const allowedFields = ['bio'];
+  const updateData = {};
+
+  // İzin verilen alanları güncelleme objesine ekle
+  Object.keys(req.body).forEach((key) => {
+    if (allowedFields.includes(key)) {
+      updateData[key] = req.body[key];
+    }
+  });
+
+  // Güncelleme yapılacak alan yok ise
+  if (Object.keys(updateData).length === 0) {
+    return next(new ErrorResponse('Güncellenecek alan bulunamadı', 400));
+  }
+
+  // Kullanıcıyı güncelle
+  const user = await User.findByIdAndUpdate(req.user._id, updateData, {
+    new: true,
+    runValidators: true,
+  }).select('-password');
+
+  res.status(200).json({
+    success: true,
+    data: user,
+  });
+});
+
+/**
+ * @desc    Hesabı silme (soft delete)
+ * @route   DELETE /api/auth/delete-account
+ * @access  Private
+ */
+const deleteAccount = asyncHandler(async (req, res, next) => {
+  const { password, confirmDelete } = req.body;
+
+  // Silme onayı
+  if (!confirmDelete || confirmDelete !== 'DELETE') {
+    return next(
+      new ErrorResponse('Hesap silme işlemi için "DELETE" yazarak onay vermeniz gerekiyor', 400),
+    );
+  }
+
+  // Kullanıcıyı şifresiyle getir
+  const user = await User.findById(req.user._id).select('+password');
+
+  // Sosyal giriş kontrolü
+  if (user.authProvider !== 'local') {
+    // Sosyal giriş için şifre doğrulaması gerekmez
+  } else {
+    // Şifre kontrolü
+    if (!password) {
+      return next(new ErrorResponse('Lütfen şifrenizi girin', 400));
+    }
+
+    const isMatch = await bcrypt.compare(password, user.password);
+
+    if (!isMatch) {
+      return next(new ErrorResponse('Şifre hatalı', 401));
+    }
+  }
+
+  // Kullanıcı hesabını soft delete
+  user.isDeleted = true;
+  user.deletedAt = Date.now();
+  user.accountStatus = 'deleted';
+  user.username = `deleted_${user.username}_${Date.now()}`;
+  user.email = `deleted_${user.email}_${Date.now()}`;
+  await user.save({ validateBeforeSave: false });
+
+  // İlişkili içerikleri işaretleme (posts ve comments)
+  // Bu işlem arka planda görev olarak çalıştırılabilir
+
+  // Gönderi ve yorumları işaretleme
+  await Post.updateMany(
+    { author: user._id },
+    { isDeleted: true, deletedAt: Date.now(), deletedBy: user._id },
+  );
+
+  await Comment.updateMany(
+    { author: user._id },
+    { isDeleted: true, deletedAt: Date.now(), deletedBy: user._id },
+  );
+
+  // Oturumu sonlandır
   res.cookie('token', 'none', {
     expires: new Date(Date.now() + 10 * 1000),
     httpOnly: true,
@@ -182,675 +581,92 @@ exports.logout = asyncHandler(async (req, res, next) => {
 
   res.status(200).json({
     success: true,
-    data: {},
+    message: 'Hesabınız başarıyla silindi.',
   });
 });
 
-// @desc    Get current logged in user
-// @route   GET /api/v1/auth/me
-// @access  Private
-exports.getMe = asyncHandler(async (req, res, next) => {
-  const user = await User.findById(req.user.id);
-
-  // Update last active time
-  user.lastActive = Date.now();
-  await user.save({ validateBeforeSave: false });
-
-  // Get user's roles and permissions
-  const userRoleAssignments = await UserRoleAssignment.find({
-    user: user._id,
-  }).populate({
-    path: 'role',
-    populate: {
-      path: 'permissions',
-    },
+/**
+ * @desc    Token oluşturma ve yanıt gönderme yardımcı fonksiyonu
+ * @private
+ */
+const sendTokenResponse = (user, statusCode, res) => {
+  // JWT token oluştur
+  const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, {
+    expiresIn: process.env.JWT_EXPIRE,
   });
 
-  // Extract permissions from roles
-  const permissions = new Set();
-  const roles = {};
-
-  userRoleAssignments.forEach((assignment) => {
-    // Group roles by scope
-    const scope = assignment.scope;
-    const subreddit = assignment.subreddit ? assignment.subreddit.toString() : null;
-    const scopeKey = subreddit ? `subreddit:${subreddit}` : 'site';
-
-    if (!roles[scopeKey]) {
-      roles[scopeKey] = [];
-    }
-
-    roles[scopeKey].push({
-      id: assignment.role._id,
-      name: assignment.role.name,
-      description: assignment.role.description,
-    });
-
-    // Add permissions
-    if (assignment.role.permissions) {
-      assignment.role.permissions.forEach((permission) => {
-        permissions.add(permission.name);
-      });
-    }
-  });
-
-  res.status(200).json({
-    success: true,
-    data: {
-      user,
-      roles,
-      permissions: Array.from(permissions),
-    },
-  });
-});
-
-// @desc    Update user details
-// @route   PUT /api/v1/auth/updatedetails
-// @access  Private
-exports.updateDetails = asyncHandler(async (req, res, next) => {
-  const fieldsToUpdate = {
-    username: req.body.username,
-    email: req.body.email,
-    bio: req.body.bio,
-    profilePicture: req.body.profilePicture,
+  const options = {
+    expires: new Date(Date.now() + process.env.JWT_COOKIE_EXPIRE * 24 * 60 * 60 * 1000),
+    httpOnly: true,
   };
 
-  // Remove undefined fields
-  Object.keys(fieldsToUpdate).forEach(
-    (key) => fieldsToUpdate[key] === undefined && delete fieldsToUpdate[key],
-  );
+  // HTTPS modunda güvenli cookie
+  if (process.env.NODE_ENV === 'production') {
+    options.secure = true;
+  }
 
-  // Handle email changes separately
-  if (fieldsToUpdate.email && fieldsToUpdate.email !== req.user.email) {
-    // Create verification token for the new email
-    const verificationToken = crypto.randomBytes(20).toString('hex');
-    const hashedToken = crypto.createHash('sha256').update(verificationToken).digest('hex');
+  // Bazı hassas verileri çıkar
+  user.password = undefined;
 
-    // Find the user and update
-    const user = await User.findById(req.user.id);
-    user.pendingEmail = fieldsToUpdate.email;
-    user.verificationToken = hashedToken;
-    user.verificationTokenExpire = Date.now() + 24 * 60 * 60 * 1000; // 24 hours
+  res.status(statusCode).cookie('token', token, options).json({
+    success: true,
+    token,
+    user,
+  });
+};
 
-    delete fieldsToUpdate.email; // Don't update email directly
+/**
+ * @desc    Benzersiz kullanıcı adı oluşturma (Sosyal giriş için)
+ * @private
+ */
+const generateUniqueUsername = async (baseUsername) => {
+  // Kullanıcı adını oluştur (özel karakterleri kaldır)
+  let username = baseUsername
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]/g, '')
+    .substring(0, 15); // Max 15 karakter
 
-    await user.save();
+  // Kullanıcı adı boşsa default değer ata
+  if (!username) {
+    username = 'user';
+  }
 
-    // Send verification email
-    const verificationUrl = `${req.protocol}://${req.get(
-      'host',
-    )}/api/v1/auth/verify-email-change/${verificationToken}`;
+  // Benzersiz kullanıcı adı oluştur
+  let isUnique = false;
+  let counter = 0;
+  let finalUsername = username;
 
-    const message = `You are receiving this email because you requested an email change. Please visit: \n\n ${verificationUrl}`;
+  while (!isUnique) {
+    // Aynı kullanıcı adı var mı kontrol et
+    const existing = await User.findOne({ username: finalUsername });
 
-    try {
-      await sendEmail({
-        email: user.pendingEmail,
-        subject: 'Email change verification',
-        message,
-      });
-    } catch (err) {
-      user.verificationToken = undefined;
-      user.pendingEmail = undefined;
-      user.verificationTokenExpire = undefined;
-      await user.save({ validateBeforeSave: false });
+    if (!existing) {
+      isUnique = true;
+    } else {
+      counter++;
+      finalUsername = `${username}${counter}`;
+    }
 
-      return next(new ErrorResponse('Email could not be sent', 500));
+    // Sonsuz döngü önlemi
+    if (counter > 1000) {
+      finalUsername = `user_${crypto.randomBytes(4).toString('hex')}`;
+      isUnique = true;
     }
   }
 
-  // Update user with any remaining fields
-  const user = await User.findByIdAndUpdate(req.user.id, fieldsToUpdate, {
-    new: true,
-    runValidators: true,
-  });
-
-  res.status(200).json({
-    success: true,
-    data: user,
-  });
-});
-
-// @desc    Update password
-// @route   PUT /api/v1/auth/updatepassword
-// @access  Private
-exports.updatePassword = asyncHandler(async (req, res, next) => {
-  const user = await User.findById(req.user.id).select('+password');
-
-  // Check current password
-  const isMatch = await bcrypt.compare(req.body.currentPassword, user.password);
-  if (!isMatch) {
-    return next(new ErrorResponse('Password is incorrect', 401));
-  }
-
-  // Hash new password
-  const salt = await bcrypt.genSalt(10);
-  user.password = await bcrypt.hash(req.body.newPassword, salt);
-
-  await user.save();
-
-  sendTokenResponse(user, 200, res);
-});
-
-// @desc    Forgot password
-// @route   POST /api/v1/auth/forgotpassword
-// @access  Public
-exports.forgotPassword = asyncHandler(async (req, res, next) => {
-  const user = await User.findOne({ email: req.body.email });
-
-  if (!user) {
-    return next(new ErrorResponse('There is no user with that email', 404));
-  }
-
-  // Generate reset token
-  const resetToken = crypto.randomBytes(20).toString('hex');
-
-  // Hash token and set to resetPasswordToken field
-  user.resetPasswordToken = crypto.createHash('sha256').update(resetToken).digest('hex');
-
-  // Set expiration
-  user.resetPasswordExpire = Date.now() + 60 * 60 * 1000; // 1 hour
-
-  await user.save({ validateBeforeSave: false });
-
-  // Create reset url
-  const resetUrl = `${req.protocol}://${req.get('host')}/api/v1/auth/resetpassword/${resetToken}`;
-
-  const message = `You are receiving this email because you requested the reset of a password. Please visit: \n\n ${resetUrl}`;
-
-  try {
-    await sendEmail({
-      email: user.email,
-      subject: 'Password reset token',
-      message,
-    });
-
-    res.status(200).json({ success: true, data: 'Email sent' });
-  } catch (err) {
-    user.resetPasswordToken = undefined;
-    user.resetPasswordExpire = undefined;
-
-    await user.save({ validateBeforeSave: false });
-
-    return next(new ErrorResponse('Email could not be sent', 500));
-  }
-});
-
-// @desc    Reset password
-// @route   PUT /api/v1/auth/resetpassword/:resettoken
-// @access  Public
-exports.resetPassword = asyncHandler(async (req, res, next) => {
-  // Get hashed token
-  const resetPasswordToken = crypto
-    .createHash('sha256')
-    .update(req.params.resettoken)
-    .digest('hex');
-
-  const user = await User.findOne({
-    resetPasswordToken,
-    resetPasswordExpire: { $gt: Date.now() },
-  });
-
-  if (!user) {
-    return next(new ErrorResponse('Invalid token', 400));
-  }
-
-  // Hash new password
-  const salt = await bcrypt.genSalt(10);
-  user.password = await bcrypt.hash(req.body.password, salt);
-
-  user.resetPasswordToken = undefined;
-  user.resetPasswordExpire = undefined;
-  await user.save();
-
-  sendTokenResponse(user, 200, res);
-});
-
-// @desc    Verify email
-// @route   GET /api/v1/auth/verify-email/:verificationtoken
-// @access  Public
-exports.verifyEmail = asyncHandler(async (req, res, next) => {
-  // Get hashed token
-  const verificationToken = crypto
-    .createHash('sha256')
-    .update(req.params.verificationtoken)
-    .digest('hex');
-
-  const user = await User.findOne({
-    verificationToken,
-    verificationTokenExpire: { $gt: Date.now() },
-  });
-
-  if (!user) {
-    return next(new ErrorResponse('Invalid token', 400));
-  }
-
-  // Set email as verified
-  user.emailVerified = true;
-  user.accountStatus = 'active';
-  user.verificationToken = undefined;
-  user.verificationTokenExpire = undefined;
-  await user.save();
-
-  sendTokenResponse(user, 200, res);
-});
-
-// @desc    Verify email change
-// @route   GET /api/v1/auth/verify-email-change/:verificationtoken
-// @access  Public
-exports.verifyEmailChange = asyncHandler(async (req, res, next) => {
-  // Get hashed token
-  const verificationToken = crypto
-    .createHash('sha256')
-    .update(req.params.verificationtoken)
-    .digest('hex');
-
-  const user = await User.findOne({
-    verificationToken,
-    verificationTokenExpire: { $gt: Date.now() },
-  });
-
-  if (!user) {
-    return next(new ErrorResponse('Invalid token', 400));
-  }
-
-  // Update email
-  user.email = user.pendingEmail;
-  user.emailVerified = true;
-  user.pendingEmail = undefined;
-  user.verificationToken = undefined;
-  user.verificationTokenExpire = undefined;
-  await user.save();
-
-  sendTokenResponse(user, 200, res);
-});
-
-// @desc    Get all users (admin only)
-// @route   GET /api/v1/auth/users
-// @access  Private (Admin)
-exports.getUsers = asyncHandler(async (req, res, next) => {
-  // Check for admin permission
-  const hasPermission = await checkPermission(req.user.id, 'view_all_users');
-  if (!hasPermission) {
-    return next(new ErrorResponse('Not authorized to access this resource', 403));
-  }
-
-  res.status(200).json(res.advancedResults);
-});
-
-// @desc    Get single user (admin only)
-// @route   GET /api/v1/auth/users/:id
-// @access  Private (Admin)
-exports.getUser = asyncHandler(async (req, res, next) => {
-  // Check for admin permission
-  const hasPermission = await checkPermission(req.user.id, 'view_all_users');
-  if (!hasPermission) {
-    return next(new ErrorResponse('Not authorized to access this resource', 403));
-  }
-
-  const user = await User.findById(req.params.id);
-
-  if (!user) {
-    return next(new ErrorResponse(`User not found with id of ${req.params.id}`, 404));
-  }
-
-  res.status(200).json({
-    success: true,
-    data: user,
-  });
-});
-
-// @desc    Create new user (admin only)
-// @route   POST /api/v1/auth/users
-// @access  Private (Admin)
-exports.createUser = asyncHandler(async (req, res, next) => {
-  // Check for admin permission
-  const hasPermission = await checkPermission(req.user.id, 'create_users');
-  if (!hasPermission) {
-    return next(new ErrorResponse('Not authorized to access this resource', 403));
-  }
-
-  // Hash password if provided
-  if (req.body.password) {
-    const salt = await bcrypt.genSalt(10);
-    req.body.password = await bcrypt.hash(req.body.password, salt);
-  }
-
-  const user = await User.create(req.body);
-
-  res.status(201).json({
-    success: true,
-    data: user,
-  });
-});
-
-// @desc    Update user (admin only)
-// @route   PUT /api/v1/auth/users/:id
-// @access  Private (Admin)
-exports.updateUser = asyncHandler(async (req, res, next) => {
-  // Check for admin permission
-  const hasPermission = await checkPermission(req.user.id, 'update_users');
-  if (!hasPermission) {
-    return next(new ErrorResponse('Not authorized to access this resource', 403));
-  }
-
-  // Don't allow password updates through this route
-  if (req.body.password) {
-    delete req.body.password;
-  }
-
-  const user = await User.findByIdAndUpdate(req.params.id, req.body, {
-    new: true,
-    runValidators: true,
-  });
-
-  if (!user) {
-    return next(new ErrorResponse(`User not found with id of ${req.params.id}`, 404));
-  }
-
-  res.status(200).json({
-    success: true,
-    data: user,
-  });
-});
-
-// @desc    Delete user (admin only)
-// @route   DELETE /api/v1/auth/users/:id
-// @access  Private (Admin)
-exports.deleteUser = asyncHandler(async (req, res, next) => {
-  // Check for admin permission
-  const hasPermission = await checkPermission(req.user.id, 'delete_users');
-  if (!hasPermission) {
-    return next(new ErrorResponse('Not authorized to access this resource', 403));
-  }
-
-  const user = await User.findById(req.params.id);
-
-  if (!user) {
-    return next(new ErrorResponse(`User not found with id of ${req.params.id}`, 404));
-  }
-
-  // Perform a soft delete
-  user.isDeleted = true;
-  user.deletedAt = Date.now();
-  user.accountStatus = 'deleted';
-  await user.save();
-
-  res.status(200).json({
-    success: true,
-    data: {},
-  });
-});
-
-// @desc    Assign role to user
-// @route   POST /api/v1/auth/users/:userId/roles
-// @access  Private (Admin only)
-exports.assignRole = asyncHandler(async (req, res, next) => {
-  const { roleId, subredditId } = req.body;
-
-  // Verify the user exists
-  const user = await User.findById(req.params.userId);
-  if (!user) {
-    return next(new ErrorResponse(`User not found with id of ${req.params.userId}`, 404));
-  }
-
-  // Verify the role exists
-  const role = await Role.findById(roleId);
-  if (!role) {
-    return next(new ErrorResponse(`Role not found with id of ${roleId}`, 404));
-  }
-
-  // Check if user has permission to assign roles
-  const hasPermission = await checkPermission(req.user.id, 'assign_roles', subredditId);
-  if (!hasPermission) {
-    return next(new ErrorResponse('Not authorized to assign roles', 403));
-  }
-
-  // Check for existing assignment to avoid duplicates
-  const existingAssignment = await UserRoleAssignment.findOne({
-    user: req.params.userId,
-    role: roleId,
-    subreddit: subredditId || undefined,
-  });
-
-  if (existingAssignment) {
-    return next(new ErrorResponse('User already has this role assignment', 400));
-  }
-
-  // Create new role assignment
-  const assignment = await UserRoleAssignment.create({
-    user: req.params.userId,
-    role: roleId,
-    scope: role.scope,
-    subreddit: subredditId || undefined,
-  });
-
-  res.status(201).json({
-    success: true,
-    data: assignment,
-  });
-});
-
-// @desc    Remove role from user
-// @route   DELETE /api/v1/auth/users/:userId/roles/:assignmentId
-// @access  Private (Admin only)
-exports.removeRole = asyncHandler(async (req, res, next) => {
-  const assignment = await UserRoleAssignment.findById(req.params.assignmentId).populate('role');
-
-  if (!assignment) {
-    return next(new ErrorResponse(`Role assignment not found`, 404));
-  }
-
-  // Check if assignment belongs to the user
-  if (assignment.user.toString() !== req.params.userId) {
-    return next(new ErrorResponse(`Role assignment does not belong to this user`, 400));
-  }
-
-  // Check if user has permission to remove roles
-  const hasPermission = await checkPermission(
-    req.user.id,
-    'assign_roles',
-    assignment.subreddit ? assignment.subreddit.toString() : null,
-  );
-
-  if (!hasPermission) {
-    return next(new ErrorResponse('Not authorized to remove roles', 403));
-  }
-
-  // Prevent removal of system roles if they're marked as required
-  if (assignment.role.isSystem && assignment.role.isDefault) {
-    return next(new ErrorResponse('Cannot remove required system role', 400));
-  }
-
-  await assignment.remove();
-
-  res.status(200).json({
-    success: true,
-    data: {},
-  });
-});
-
-// @desc    Suspend user
-// @route   PUT /api/v1/auth/users/:id/suspend
-// @access  Private (Admin or Moderator)
-exports.suspendUser = asyncHandler(async (req, res, next) => {
-  const { reason } = req.body;
-
-  // Check for suspend permission
-  const hasPermission = await checkPermission(req.user.id, 'suspend_users');
-  if (!hasPermission) {
-    return next(new ErrorResponse('Not authorized to suspend users', 403));
-  }
-
-  const user = await User.findById(req.params.id);
-
-  if (!user) {
-    return next(new ErrorResponse(`User not found with id of ${req.params.id}`, 404));
-  }
-
-  // Update user status
-  user.accountStatus = 'suspended';
-  user.suspensionReason = reason || 'Violated terms of service';
-  await user.save();
-
-  res.status(200).json({
-    success: true,
-    data: user,
-  });
-});
-
-// @desc    Unsuspend user
-// @route   PUT /api/v1/auth/users/:id/unsuspend
-// @access  Private (Admin or Moderator)
-exports.unsuspendUser = asyncHandler(async (req, res, next) => {
-  // Check for suspend permission
-  const hasPermission = await checkPermission(req.user.id, 'suspend_users');
-  if (!hasPermission) {
-    return next(new ErrorResponse('Not authorized to manage user suspensions', 403));
-  }
-
-  const user = await User.findById(req.params.id);
-
-  if (!user) {
-    return next(new ErrorResponse(`User not found with id of ${req.params.id}`, 404));
-  }
-
-  // Only update if user is suspended
-  if (user.accountStatus !== 'suspended') {
-    return next(new ErrorResponse(`User is not suspended`, 400));
-  }
-
-  // Update user status
-  user.accountStatus = 'active';
-  user.suspensionReason = undefined;
-  await user.save();
-
-  res.status(200).json({
-    success: true,
-    data: user,
-  });
-});
-
-// @desc    Get user activity (posts and comments)
-// @route   GET /api/v1/auth/users/:id/activity
-// @access  Public
-exports.getUserActivity = asyncHandler(async (req, res, next) => {
-  const user = await User.findById(req.params.id);
-
-  if (!user) {
-    return next(new ErrorResponse(`User not found with id of ${req.params.id}`, 404));
-  }
-
-  // Get user's posts
-  const posts = await Post.find({
-    author: user._id,
-    isDeleted: { $ne: true },
-  })
-    .sort('-createdAt')
-    .limit(10)
-    .populate('subreddit', 'name');
-
-  // Get user's comments
-  const comments = await Comment.find({
-    author: user._id,
-    isDeleted: { $ne: true },
-  })
-    .sort('-createdAt')
-    .limit(10)
-    .populate({
-      path: 'post',
-      select: 'title subreddit',
-      populate: {
-        path: 'subreddit',
-        select: 'name',
-      },
-    });
-
-  res.status(200).json({
-    success: true,
-    data: {
-      posts,
-      comments,
-    },
-  });
-});
-
-// @desc    Get user's karma breakdown
-// @route   GET /api/v1/auth/users/:id/karma
-// @access  Public
-exports.getUserKarma = asyncHandler(async (req, res, next) => {
-  const user = await User.findById(req.params.id);
-
-  if (!user) {
-    return next(new ErrorResponse(`User not found with id of ${req.params.id}`, 404));
-  }
-
-  res.status(200).json({
-    success: true,
-    data: {
-      totalKarma: user.totalKarma,
-      breakdown: user.karma,
-    },
-  });
-});
-
-// @desc    Get user's role assignments
-// @route   GET /api/v1/auth/users/:id/roles
-// @access  Private (Admin or Self)
-exports.getUserRoles = asyncHandler(async (req, res, next) => {
-  // Check if user is requesting their own roles or has permission
-  if (req.params.id !== req.user.id) {
-    const hasPermission = await checkPermission(req.user.id, 'view_all_users');
-    if (!hasPermission) {
-      return next(new ErrorResponse("Not authorized to view other users' roles", 403));
-    }
-  }
-
-  const assignments = await UserRoleAssignment.find({ user: req.params.id })
-    .populate('role')
-    .populate('subreddit', 'name');
-
-  res.status(200).json({
-    success: true,
-    count: assignments.length,
-    data: assignments,
-  });
-});
-
-// @desc    Get all available permissions
-// @route   GET /api/v1/auth/permissions
-// @access  Private (Admin)
-exports.getPermissions = asyncHandler(async (req, res, next) => {
-  // Check for admin permission
-  const hasPermission = await checkPermission(req.user.id, 'manage_roles');
-  if (!hasPermission) {
-    return next(new ErrorResponse('Not authorized to view permissions', 403));
-  }
-
-  const permissions = await Permission.find();
-
-  res.status(200).json({
-    success: true,
-    count: permissions.length,
-    data: permissions,
-  });
-});
-
-// @desc    Check if user has specific permission
-// @route   GET /api/v1/auth/check-permission/:permissionName
-// @access  Private
-exports.checkUserPermission = asyncHandler(async (req, res, next) => {
-  const { permissionName } = req.params;
-  const { subredditId } = req.query;
-
-  const hasPermission = await checkPermission(req.user.id, permissionName, subredditId);
-
-  res.status(200).json({
-    success: true,
-    data: {
-      hasPermission,
-    },
-  });
-});
-
-module.exports = exports;
+  return finalUsername;
+};
+
+module.exports = {
+  register,
+  verifyEmail,
+  login,
+  socialAuth,
+  getMe,
+  logout,
+  updatePassword,
+  forgotPassword,
+  resetPassword,
+  updateProfile,
+  deleteAccount,
+};

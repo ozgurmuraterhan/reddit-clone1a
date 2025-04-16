@@ -1,51 +1,129 @@
-const mongoose = require('mongoose');
-const asyncHandler = require('../middleware/async');
-const ErrorResponse = require('../utils/errorResponse');
 const SubredditMembership = require('../models/SubredditMembership');
 const Subreddit = require('../models/Subreddit');
 const User = require('../models/User');
-const Notification = require('../models/Notification');
-const AdminLog = require('../models/AdminLog');
 const ModLog = require('../models/ModLog');
+const AdminLog = require('../models/AdminLog');
+const mongoose = require('mongoose');
+const asyncHandler = require('../middleware/async');
+const ErrorResponse = require('../utils/errorResponse');
 
 /**
- * @desc    Subreddit'e üye ol
- * @route   POST /api/subreddits/:subredditId/memberships
- * @access  Üye (private subreddit) / Public
+ * @desc    Kullanıcının topluluk üyeliklerini getir
+ * @route   GET /api/memberships
+ * @access  Private
+ */
+const getUserMemberships = asyncHandler(async (req, res, next) => {
+  const userId = req.user._id;
+  const { type, status, favorite } = req.query;
+
+  // Filtreleme sorgusu oluştur
+  let query = { user: userId };
+
+  // Üyelik tipi filtresi
+  if (type && ['member', 'moderator', 'banned'].includes(type)) {
+    query.type = type;
+  }
+
+  // Üyelik durumu filtresi
+  if (status && ['active', 'pending', 'banned'].includes(status)) {
+    query.status = status;
+  }
+
+  // Favori filtresi
+  if (favorite !== undefined) {
+    query.isFavorite = favorite === 'true';
+  }
+
+  // Üyelikleri getir
+  const memberships = await SubredditMembership.find(query)
+    .populate({
+      path: 'subreddit',
+      select: 'name title icon banner memberCount type nsfw',
+    })
+    .sort({ isFavorite: -1, joinedAt: -1 });
+
+  // Üyelikleri kategorize et
+  const moderating = [];
+  const joined = [];
+  const pending = [];
+  const banned = [];
+
+  memberships.forEach((membership) => {
+    if (!membership.subreddit) return; // Silinmiş subredditler için kontrol
+
+    const membershipData = {
+      _id: membership._id,
+      subreddit: {
+        _id: membership.subreddit._id,
+        name: membership.subreddit.name,
+        title: membership.subreddit.title,
+        icon: membership.subreddit.icon,
+        banner: membership.subreddit.banner,
+        memberCount: membership.subreddit.memberCount,
+        type: membership.subreddit.type,
+        nsfw: membership.subreddit.nsfw,
+      },
+      type: membership.type,
+      status: membership.status,
+      joinedAt: membership.joinedAt,
+      isFavorite: membership.isFavorite,
+    };
+
+    if (membership.status === 'banned') {
+      membershipData.bannedAt = membership.bannedAt;
+      membershipData.banReason = membership.banReason;
+      membershipData.banExpiration = membership.banExpiration;
+      banned.push(membershipData);
+    } else if (membership.status === 'pending') {
+      pending.push(membershipData);
+    } else if (membership.type === 'moderator' || membership.type === 'admin') {
+      moderating.push(membershipData);
+    } else {
+      joined.push(membershipData);
+    }
+  });
+
+  res.status(200).json({
+    success: true,
+    count: memberships.length,
+    data: {
+      moderating,
+      joined,
+      pending,
+      banned,
+    },
+  });
+});
+
+/**
+ * @desc    Bir topluluğa katıl
+ * @route   POST /api/subreddits/:subredditId/join
+ * @access  Private
  */
 const joinSubreddit = asyncHandler(async (req, res, next) => {
-  const { subredditId } = req.params;
+  const subredditId = req.params.subredditId;
   const userId = req.user._id;
-
-  // Geçerli bir ObjectId mi kontrol et
-  if (!mongoose.Types.ObjectId.isValid(subredditId)) {
-    return next(new ErrorResponse('Geçersiz Subreddit ID formatı', 400));
-  }
 
   // Subreddit'in varlığını kontrol et
   const subreddit = await Subreddit.findById(subredditId);
   if (!subreddit) {
-    return next(new ErrorResponse('Subreddit bulunamadı', 404));
+    return next(new ErrorResponse('Topluluk bulunamadı', 404));
   }
 
-  // Kullanıcının zaten üye olup olmadığını kontrol et
+  // Zaten üye mi kontrol et
   const existingMembership = await SubredditMembership.findOne({
     user: userId,
     subreddit: subredditId,
   });
 
   if (existingMembership) {
-    // Daha önce banlanmış bir üye mi kontrol et
+    // Banlanmış kullanıcı kontrolü
     if (existingMembership.status === 'banned') {
       return next(new ErrorResponse('Bu topluluğa katılmanız engellendi', 403));
     }
 
     // Zaten üye ise hata döndür
-    if (
-      existingMembership.status === 'member' ||
-      existingMembership.status === 'moderator' ||
-      existingMembership.status === 'admin'
-    ) {
+    if (existingMembership.status === 'active') {
       return next(new ErrorResponse('Bu topluluğa zaten üyesiniz', 400));
     }
 
@@ -55,229 +133,129 @@ const joinSubreddit = asyncHandler(async (req, res, next) => {
     }
 
     // Diğer durumlarda üyeliği güncelle
-    existingMembership.status = subreddit.type === 'private' ? 'pending' : 'member';
+    existingMembership.status = subreddit.type === 'private' ? 'pending' : 'active';
     existingMembership.joinedAt = Date.now();
     await existingMembership.save();
-
-    // Özel subreddit ise moderatörlere bildirim gönder
-    if (subreddit.type === 'private') {
-      // Moderatörleri bul
-      const moderators = await SubredditMembership.find({
-        subreddit: subredditId,
-        type: { $in: ['moderator', 'admin'] },
-        status: 'active',
-      }).select('user');
-
-      // Her moderatöre bildirim gönder
-      if (moderators.length > 0) {
-        const notifications = moderators.map((mod) => ({
-          recipient: mod.user,
-          type: 'subreddit_join_request',
-          message: `${req.user.username} kullanıcısı r/${subreddit.name} topluluğuna katılmak istiyor`,
-          reference: {
-            type: 'Subreddit',
-            id: subredditId,
-          },
-          data: {
-            subredditName: subreddit.name,
-            requestingUser: userId,
-          },
-          isRead: false,
-        }));
-
-        await Notification.insertMany(notifications);
-      }
-
-      return res.status(200).json({
-        success: true,
-        message: 'Üyelik isteğiniz moderatörlere iletildi',
-        data: {
-          status: 'pending',
-          subreddit: {
-            id: subreddit._id,
-            name: subreddit.name,
-            type: subreddit.type,
-          },
-        },
-      });
-    }
-
-    return res.status(200).json({
-      success: true,
-      message: `r/${subreddit.name} topluluğuna başarıyla katıldınız`,
-      data: {
-        status: 'member',
-        subreddit: {
-          id: subreddit._id,
-          name: subreddit.name,
-          type: subreddit.type,
-        },
-      },
+  } else {
+    // Yeni üyelik oluştur
+    await SubredditMembership.create({
+      user: userId,
+      subreddit: subredditId,
+      type: 'member',
+      status: subreddit.type === 'private' ? 'pending' : 'active',
+      joinedAt: Date.now(),
     });
   }
 
-  // Yeni üyelik oluştur
-  const membershipStatus = subreddit.type === 'private' ? 'pending' : 'member';
+  // Üye sayısını güncelle (private için onay bekliyorsa güncelleme)
+  if (subreddit.type !== 'private' || existingMembership?.status === 'active') {
+    subreddit.memberCount += 1;
+    await subreddit.save();
+  }
 
-  const membership = await SubredditMembership.create({
+  res.status(200).json({
+    success: true,
+    message:
+      subreddit.type === 'private'
+        ? 'Üyelik isteğiniz gönderildi, onay bekleniyor'
+        : 'Topluluğa başarıyla katıldınız',
+    data: {
+      subreddit: {
+        _id: subreddit._id,
+        name: subreddit.name,
+        memberCount: subreddit.memberCount,
+      },
+      status: subreddit.type === 'private' ? 'pending' : 'active',
+    },
+  });
+});
+
+/**
+ * @desc    Bir topluluktan ayrıl
+ * @route   DELETE /api/subreddits/:subredditId/leave
+ * @access  Private
+ */
+const leaveSubreddit = asyncHandler(async (req, res, next) => {
+  const subredditId = req.params.subredditId;
+  const userId = req.user._id;
+
+  // Subreddit'in varlığını kontrol et
+  const subreddit = await Subreddit.findById(subredditId);
+  if (!subreddit) {
+    return next(new ErrorResponse('Topluluk bulunamadı', 404));
+  }
+
+  // Üyelik durumunu kontrol et
+  const membership = await SubredditMembership.findOne({
     user: userId,
     subreddit: subredditId,
-    type: 'regular',
-    status: membershipStatus,
-    joinedAt: Date.now(),
   });
 
+  if (!membership || membership.status !== 'active') {
+    return next(new ErrorResponse('Bu topluluğa üye değilsiniz', 400));
+  }
+
+  // Kurucu kontrolü - kurucu ayrılamaz
+  if (subreddit.creator.toString() === userId.toString()) {
+    return next(new ErrorResponse('Topluluk kurucusu topluluğu terk edemez', 400));
+  }
+
+  // Üyeliği kaldır
+  await SubredditMembership.findByIdAndDelete(membership._id);
+
   // Üye sayısını güncelle
-  if (membershipStatus === 'member') {
-    await Subreddit.findByIdAndUpdate(subredditId, { $inc: { memberCount: 1 } });
-  }
+  subreddit.memberCount = Math.max(0, subreddit.memberCount - 1);
+  await subreddit.save();
 
-  // Özel subreddit ise moderatörlere bildirim gönder
-  if (subreddit.type === 'private') {
-    // Moderatörleri bul
-    const moderators = await SubredditMembership.find({
-      subreddit: subredditId,
-      type: { $in: ['moderator', 'admin'] },
-      status: 'active',
-    }).select('user');
-
-    // Her moderatöre bildirim gönder
-    if (moderators.length > 0) {
-      const notifications = moderators.map((mod) => ({
-        recipient: mod.user,
-        type: 'subreddit_join_request',
-        message: `${req.user.username} kullanıcısı r/${subreddit.name} topluluğuna katılmak istiyor`,
-        reference: {
-          type: 'Subreddit',
-          id: subredditId,
-        },
-        data: {
-          subredditName: subreddit.name,
-          requestingUser: userId,
-        },
-        isRead: false,
-      }));
-
-      await Notification.insertMany(notifications);
-    }
-
-    return res.status(200).json({
-      success: true,
-      message: 'Üyelik isteğiniz moderatörlere iletildi',
-      data: {
-        status: 'pending',
-        subreddit: {
-          id: subreddit._id,
-          name: subreddit.name,
-          type: subreddit.type,
-        },
-      },
-    });
-  }
-
-  res.status(201).json({
+  res.status(200).json({
     success: true,
-    message: `r/${subreddit.name} topluluğuna başarıyla katıldınız`,
+    message: 'Topluluktan başarıyla ayrıldınız',
+    data: {},
+  });
+});
+
+/**
+ * @desc    Bir topluluğu favorilere ekle/çıkar
+ * @route   PUT /api/memberships/:membershipId/favorite
+ * @access  Private
+ */
+const toggleFavorite = asyncHandler(async (req, res, next) => {
+  const membershipId = req.params.membershipId;
+  const { isFavorite } = req.body;
+
+  // Üyeliğin varlığını ve kullanıcıya ait olduğunu kontrol et
+  const membership = await SubredditMembership.findOne({
+    _id: membershipId,
+    user: req.user._id,
+  });
+
+  if (!membership) {
+    return next(new ErrorResponse('Üyelik bulunamadı', 404));
+  }
+
+  // Favori durumunu güncelle
+  membership.isFavorite = isFavorite === undefined ? !membership.isFavorite : isFavorite;
+  await membership.save();
+
+  res.status(200).json({
+    success: true,
+    message: membership.isFavorite
+      ? 'Topluluk favorilere eklendi'
+      : 'Topluluk favorilerden çıkarıldı',
     data: membership,
   });
 });
 
 /**
- * @desc    Subreddit'ten ayrıl
- * @route   DELETE /api/subreddits/:subredditId/memberships
- * @access  Üye
+ * @desc    Kullanıcının bir toplulukta üyelik durumunu kontrol et
+ * @route   GET /api/subreddits/:subredditId/membership-status
+ * @access  Private
  */
-const leaveSubreddit = asyncHandler(async (req, res, next) => {
-  const { subredditId } = req.params;
+const checkMembershipStatus = asyncHandler(async (req, res, next) => {
+  const subredditId = req.params.subredditId;
   const userId = req.user._id;
 
-  // Geçerli bir ObjectId mi kontrol et
-  if (!mongoose.Types.ObjectId.isValid(subredditId)) {
-    return next(new ErrorResponse('Geçersiz Subreddit ID formatı', 400));
-  }
-
-  // Subreddit'in varlığını kontrol et
-  const subreddit = await Subreddit.findById(subredditId);
-  if (!subreddit) {
-    return next(new ErrorResponse('Subreddit bulunamadı', 404));
-  }
-
-  // Kullanıcının üyeliğini kontrol et
-  const membership = await SubredditMembership.findOne({
-    user: userId,
-    subreddit: subredditId,
-  });
-
-  if (!membership) {
-    return next(new ErrorResponse('Bu topluluğa üye değilsiniz', 400));
-  }
-
-  // Topluluk sahibi (admin) topluluktan ayrılamaz
-  if (membership.type === 'admin') {
-    return next(
-      new ErrorResponse(
-        'Topluluk sahibi olarak topluluktan ayrılamazsınız. Önce başka bir kullanıcıyı topluluk sahibi olarak atamalısınız.',
-        400,
-      ),
-    );
-  }
-
-  // Üye durumunu güncelle
-  await SubredditMembership.findByIdAndUpdate(membership._id, {
-    status: 'left',
-    leftAt: Date.now(),
-  });
-
-  // Üye sayısını güncelle (sadece aktif üyelikler için)
-  if (membership.status === 'member' || membership.status === 'moderator') {
-    await Subreddit.findByIdAndUpdate(subredditId, { $inc: { memberCount: -1 } });
-  }
-
-  // Moderatör ise moderatör logunu kaydet
-  if (membership.type === 'moderator') {
-    await ModLog.create({
-      subreddit: subredditId,
-      action: 'moderator_left',
-      moderator: userId,
-      target: userId,
-      details: `${req.user.username} moderatör olarak topluluktan ayrıldı`,
-      timestamp: Date.now(),
-    });
-  }
-
-  res.status(200).json({
-    success: true,
-    message: `r/${subreddit.name} topluluğundan başarıyla ayrıldınız`,
-    data: {
-      subreddit: {
-        id: subreddit._id,
-        name: subreddit.name,
-      },
-    },
-  });
-});
-
-/**
- * @desc    Kullanıcının topluluk üyeliğini kontrol et
- * @route   GET /api/subreddits/:subredditId/membership/check
- * @access  Üye
- */
-const checkMembership = asyncHandler(async (req, res, next) => {
-  const { subredditId } = req.params;
-  const userId = req.user._id;
-
-  // Geçerli bir ObjectId mi kontrol et
-  if (!mongoose.Types.ObjectId.isValid(subredditId)) {
-    return next(new ErrorResponse('Geçersiz Subreddit ID formatı', 400));
-  }
-
-  // Subreddit'in varlığını kontrol et
-  const subreddit = await Subreddit.findById(subredditId);
-  if (!subreddit) {
-    return next(new ErrorResponse('Subreddit bulunamadı', 404));
-  }
-
-  // Kullanıcının üyeliğini kontrol et
+  // Üyelik bilgisini sorgula
   const membership = await SubredditMembership.findOne({
     user: userId,
     subreddit: subredditId,
@@ -286,54 +264,60 @@ const checkMembership = asyncHandler(async (req, res, next) => {
   if (!membership) {
     return res.status(200).json({
       success: true,
-      isMember: false,
       data: {
-        subreddit: {
-          id: subreddit._id,
-          name: subreddit.name,
-          type: subreddit.type,
-        },
+        isMember: false,
+        status: null,
+        type: null,
       },
     });
   }
 
   res.status(200).json({
     success: true,
-    isMember:
-      membership.status === 'member' ||
-      membership.status === 'moderator' ||
-      membership.status === 'admin',
-    isPending: membership.status === 'pending',
-    isBanned: membership.status === 'banned',
-    isModerator: membership.type === 'moderator' || membership.type === 'admin',
-    isAdmin: membership.type === 'admin',
     data: {
-      membership: {
-        id: membership._id,
-        type: membership.type,
-        status: membership.status,
-        joinedAt: membership.joinedAt,
-      },
-      subreddit: {
-        id: subreddit._id,
-        name: subreddit.name,
-        type: subreddit.type,
-      },
+      isMember: membership.status === 'active',
+      status: membership.status,
+      type: membership.type,
+      joinedAt: membership.joinedAt,
+      isFavorite: membership.isFavorite,
+      isBanned: membership.status === 'banned',
+      banInfo:
+        membership.status === 'banned'
+          ? {
+              reason: membership.banReason,
+              expiresAt: membership.banExpiration,
+              bannedAt: membership.bannedAt,
+            }
+          : null,
     },
   });
 });
 
 /**
- * @desc    Kullanıcının üye olduğu toplulukları getir
- * @route   GET /api/users/:userId/memberships
- * @access  Üye (kendi profili) / Admin (tüm profiller)
+ * @desc    Bir kullanıcıyı topluluktan yasakla
+ * @route   POST /api/subreddits/:subredditId/ban/:userId
+ * @access  Private (Moderatör/Admin)
  */
-const getUserMemberships = asyncHandler(async (req, res, next) => {
-  const { userId } = req.params;
+const banUser = asyncHandler(async (req, res, next) => {
+  const { subredditId, userId } = req.params;
+  const { reason, duration } = req.body;
 
-  // Geçerli bir ObjectId mi kontrol et
-  if (!mongoose.Types.ObjectId.isValid(userId)) {
-    return next(new ErrorResponse('Geçersiz Kullanıcı ID formatı', 400));
+  // Subreddit'in varlığını kontrol et
+  const subreddit = await Subreddit.findById(subredditId);
+  if (!subreddit) {
+    return next(new ErrorResponse('Topluluk bulunamadı', 404));
+  }
+
+  // Yetki kontrolü
+  const modStatus = await SubredditMembership.findOne({
+    user: req.user._id,
+    subreddit: subredditId,
+    type: { $in: ['moderator', 'admin'] },
+    status: 'active',
+  });
+
+  if (!modStatus && req.user.role !== 'admin') {
+    return next(new ErrorResponse('Bu işlem için moderatör yetkiniz yok', 403));
   }
 
   // Kullanıcının varlığını kontrol et
@@ -342,507 +326,115 @@ const getUserMemberships = asyncHandler(async (req, res, next) => {
     return next(new ErrorResponse('Kullanıcı bulunamadı', 404));
   }
 
-  // Yetki kontrolü (sadece kendi profilini veya admin görüntüleyebilir)
-  if (userId !== req.user._id.toString() && req.user.role !== 'admin') {
-    return next(new ErrorResponse('Bu işlem için yetkiniz yok', 403));
+  // Topluluk kurucusunu banlama kontrolü
+  if (subreddit.creator.toString() === userId) {
+    return next(new ErrorResponse('Topluluk kurucusu banlanamaz', 400));
   }
 
-  // Sayfalama için parametreleri al
-  const page = parseInt(req.query.page, 10) || 1;
-  const limit = parseInt(req.query.limit, 10) || 20;
-  const startIndex = (page - 1) * limit;
-  const endIndex = page * limit;
-
-  // Filtreleme parametrelerini al
-  const { status, type } = req.query;
-
-  // Sorgu parametrelerini oluştur
-  const query = { user: userId };
-
-  if (status) {
-    query.status = status;
-  } else {
-    // Varsayılan olarak sadece aktif üyelikleri getir
-    query.status = { $in: ['member', 'moderator', 'admin'] };
-  }
-
-  if (type) {
-    query.type = type;
-  }
-
-  // Toplam üyelik sayısını al
-  const total = await SubredditMembership.countDocuments(query);
-
-  // Üyelikleri getir ve subreddit bilgilerini popüle et
-  const memberships = await SubredditMembership.find(query)
-    .sort({ joinedAt: -1 })
-    .skip(startIndex)
-    .limit(limit)
-    .populate('subreddit', 'name title description type memberCount createdAt icon banner');
-
-  // Sayfalama bilgisi
-  const pagination = {};
-
-  if (endIndex < total) {
-    pagination.next = {
-      page: page + 1,
-      limit,
-    };
-  }
-
-  if (startIndex > 0) {
-    pagination.prev = {
-      page: page - 1,
-      limit,
-    };
-  }
-
-  res.status(200).json({
-    success: true,
-    count: memberships.length,
-    total,
-    pagination,
-    data: memberships,
-  });
-});
-
-/**
- * @desc    Topluluk üyelerini getir
- * @route   GET /api/subreddits/:subredditId/memberships
- * @access  Herkese Açık (basic) / Moderatör (detaylı)
- */
-const getSubredditMembers = asyncHandler(async (req, res, next) => {
-  const { subredditId } = req.params;
-
-  // Geçerli bir ObjectId mi kontrol et
-  if (!mongoose.Types.ObjectId.isValid(subredditId)) {
-    return next(new ErrorResponse('Geçersiz Subreddit ID formatı', 400));
-  }
-
-  // Subreddit'in varlığını kontrol et
-  const subreddit = await Subreddit.findById(subredditId);
-  if (!subreddit) {
-    return next(new ErrorResponse('Subreddit bulunamadı', 404));
-  }
-
-  // Kullanıcının moderatör olup olmadığını kontrol et
-  let isModerator = false;
-  if (req.user) {
-    const modMembership = await SubredditMembership.findOne({
-      user: req.user._id,
+  // Moderatör banlama yetkisi kontrolü
+  if (modStatus?.type !== 'admin') {
+    const targetModStatus = await SubredditMembership.findOne({
+      user: userId,
       subreddit: subredditId,
       type: { $in: ['moderator', 'admin'] },
       status: 'active',
     });
 
-    if (modMembership) {
-      isModerator = true;
+    if (targetModStatus) {
+      return next(new ErrorResponse('Moderatörleri sadece topluluk admini banlayabilir', 403));
     }
   }
 
-  // Sayfalama için parametreleri al
-  const page = parseInt(req.query.page, 10) || 1;
-  const limit = parseInt(req.query.limit, 10) || 50;
-  const startIndex = (page - 1) * limit;
-  const endIndex = page * limit;
-
-  // Filtreleme ve sıralama parametrelerini al
-  const { search, type, status, sortBy, order } = req.query;
-
-  // Sorgu parametrelerini oluştur
-  const query = { subreddit: subredditId };
-
-  // Moderatör değilse, sadece aktif üyeleri görebilir
-  if (!isModerator) {
-    query.status = 'active';
-    query.type = { $in: ['regular', 'moderator', 'admin'] };
-  } else {
-    // Moderatör ise filtreleme yapabilir
-    if (status) {
-      query.status = status;
-    }
-
-    if (type) {
-      query.type = type;
-    }
-  }
-
-  // Arama sorgusu
-  if (search && isModerator) {
-    const users = await User.find({
-      $or: [
-        { username: { $regex: search, $options: 'i' } },
-        { displayName: { $regex: search, $options: 'i' } },
-      ],
-    }).select('_id');
-
-    query.user = { $in: users.map((u) => u._id) };
-  }
-
-  // Sıralama seçenekleri
-  const sortOptions = {};
-
-  if (sortBy && ['joinedAt', 'lastActiveAt', 'type'].includes(sortBy)) {
-    sortOptions[sortBy] = order === 'asc' ? 1 : -1;
-  } else {
-    // Varsayılan sıralama
-    sortOptions.joinedAt = -1;
-  }
-
-  // Toplam üye sayısını al
-  const total = await SubredditMembership.countDocuments(query);
-
-  // Üyeleri getir ve kullanıcı bilgilerini popüle et
-  const memberships = await SubredditMembership.find(query)
-    .sort(sortOptions)
-    .skip(startIndex)
-    .limit(limit)
-    .populate('user', 'username displayName avatar createdAt lastActive');
-
-  // Sayfalama bilgisi
-  const pagination = {};
-
-  if (endIndex < total) {
-    pagination.next = {
-      page: page + 1,
-      limit,
-    };
-  }
-
-  if (startIndex > 0) {
-    pagination.prev = {
-      page: page - 1,
-      limit,
-    };
-  }
-
-  res.status(200).json({
-    success: true,
-    count: memberships.length,
-    total,
-    pagination,
-    data: {
-      subreddit: {
-        id: subreddit._id,
-        name: subreddit.name,
-        memberCount: subreddit.memberCount,
-      },
-      members: memberships,
-    },
-  });
-});
-
-/**
- * @desc    Üyelik isteğini onayla/reddet
- * @route   PUT /api/subreddits/:subredditId/memberships/:membershipId
- * @access  Moderatör
- */
-const updateMembershipRequest = asyncHandler(async (req, res, next) => {
-  const { subredditId, membershipId } = req.params;
-  const { action } = req.body;
-
-  // Parametreleri doğrula
-  if (!action || !['approve', 'reject'].includes(action)) {
-    return next(new ErrorResponse('Geçersiz işlem. "approve" veya "reject" olmalıdır', 400));
-  }
-
-  // Geçerli ObjectId'ler mi kontrol et
-  if (
-    !mongoose.Types.ObjectId.isValid(subredditId) ||
-    !mongoose.Types.ObjectId.isValid(membershipId)
-  ) {
-    return next(new ErrorResponse('Geçersiz ID formatı', 400));
-  }
-
-  // Subreddit'in varlığını kontrol et
-  const subreddit = await Subreddit.findById(subredditId);
-  if (!subreddit) {
-    return next(new ErrorResponse('Subreddit bulunamadı', 404));
-  }
-
-  // Kullanıcının moderatör olup olmadığını kontrol et
-  const modMembership = await SubredditMembership.findOne({
-    user: req.user._id,
-    subreddit: subredditId,
-    type: { $in: ['moderator', 'admin'] },
-    status: 'active',
-  });
-
-  if (!modMembership) {
-    return next(new ErrorResponse('Bu işlem için yetkiniz yok', 403));
-  }
-
-  // Üyelik isteğini bul
-  const membership = await SubredditMembership.findOne({
-    _id: membershipId,
-    subreddit: subredditId,
-    status: 'pending',
-  }).populate('user', 'username displayName');
-
-  if (!membership) {
-    return next(new ErrorResponse('Geçerli bir üyelik isteği bulunamadı', 404));
-  }
-
-  // İşleme göre üyeliği güncelle
-  if (action === 'approve') {
-    membership.status = 'active';
-    membership.approvedBy = req.user._id;
-    membership.approvedAt = Date.now();
-    await membership.save();
-
-    // Üye sayısını güncelle
-    await Subreddit.findByIdAndUpdate(subredditId, { $inc: { memberCount: 1 } });
-
-    // Moderatör logunu kaydet
-    await ModLog.create({
-      subreddit: subredditId,
-      action: 'membership_approved',
-      moderator: req.user._id,
-      target: membership.user._id,
-      details: `${membership.user.username} kullanıcısının üyelik isteği onaylandı`,
-      timestamp: Date.now(),
-    });
-
-    // Kullanıcıya bildirim gönder
-    await Notification.create({
-      recipient: membership.user._id,
-      type: 'membership_approved',
-      message: `r/${subreddit.name} topluluğuna üyelik isteğiniz onaylandı`,
-      reference: {
-        type: 'Subreddit',
-        id: subredditId,
-      },
-      isRead: false,
-    });
-
-    res.status(200).json({
-      success: true,
-      message: 'Üyelik isteği onaylandı',
-      data: membership,
-    });
-  } else {
-    // İsteği reddet
-    membership.status = 'rejected';
-    membership.rejectedBy = req.user._id;
-    membership.rejectedAt = Date.now();
-    await membership.save();
-
-    // Moderatör logunu kaydet
-    await ModLog.create({
-      subreddit: subredditId,
-      action: 'membership_rejected',
-      moderator: req.user._id,
-      target: membership.user._id,
-      details: `${membership.user.username} kullanıcısının üyelik isteği reddedildi`,
-      timestamp: Date.now(),
-    });
-
-    // Kullanıcıya bildirim gönder
-    await Notification.create({
-      recipient: membership.user._id,
-      type: 'membership_rejected',
-      message: `r/${subreddit.name} topluluğuna üyelik isteğiniz reddedildi`,
-      reference: {
-        type: 'Subreddit',
-        id: subredditId,
-      },
-      isRead: false,
-    });
-
-    res.status(200).json({
-      success: true,
-      message: 'Üyelik isteği reddedildi',
-      data: membership,
-    });
-  }
-});
-
-/**
- * @desc    Kullanıcıyı topluluktan yasakla
- * @route   POST /api/subreddits/:subredditId/bans
- * @access  Moderatör
- */
-const banUser = asyncHandler(async (req, res, next) => {
-  const { subredditId } = req.params;
-  const { userId, reason, duration, modNote, sendMessage } = req.body;
-
-  // Parametreleri doğrula
-  if (!userId) {
-    return next(new ErrorResponse("Kullanıcı ID'si zorunludur", 400));
-  }
-
-  // Geçerli ObjectId'ler mi kontrol et
-  if (!mongoose.Types.ObjectId.isValid(subredditId) || !mongoose.Types.ObjectId.isValid(userId)) {
-    return next(new ErrorResponse('Geçersiz ID formatı', 400));
-  }
-
-  // Subreddit'in varlığını kontrol et
-  const subreddit = await Subreddit.findById(subredditId);
-  if (!subreddit) {
-    return next(new ErrorResponse('Subreddit bulunamadı', 404));
-  }
-
-  // Kullanıcının varlığını kontrol et
-  const user = await User.findById(userId);
-  if (!user) {
-    return next(new ErrorResponse('Kullanıcı bulunamadı', 404));
-  }
-
-  // Kullanıcının moderatör olup olmadığını kontrol et
-  const modMembership = await SubredditMembership.findOne({
-    user: req.user._id,
-    subreddit: subredditId,
-    type: { $in: ['moderator', 'admin'] },
-    status: 'active',
-  });
-
-  if (!modMembership) {
-    return next(new ErrorResponse('Bu işlem için yetkiniz yok', 403));
-  }
-
-  // Hedef kullanıcının topluluk sahibi (admin) olup olmadığını kontrol et
-  const targetMembership = await SubredditMembership.findOne({
+  // Kullanıcının üyelik durumunu bul veya oluştur
+  let membership = await SubredditMembership.findOne({
     user: userId,
     subreddit: subredditId,
   });
 
-  if (targetMembership && targetMembership.type === 'admin') {
-    return next(new ErrorResponse('Topluluk sahibini yasaklayamazsınız', 403));
-  }
+  // Ban süresi hesapla
+  const banExpiration = duration
+    ? new Date(Date.now() + parseInt(duration) * 24 * 60 * 60 * 1000)
+    : null;
 
-  // Daha üst yetkili bir moderatörü yasaklamaya çalışıyor mu kontrol et
-  if (targetMembership && targetMembership.type === 'moderator' && modMembership.type !== 'admin') {
-    return next(
-      new ErrorResponse('Diğer moderatörleri sadece topluluk sahibi yasaklayabilir', 403),
-    );
-  }
-
-  // Ban süresi hesapla (varsa)
-  let banExpiresAt = null;
-  if (duration) {
-    const durationDays = parseInt(duration, 10);
-    if (isNaN(durationDays) || durationDays < 1) {
-      return next(new ErrorResponse('Ban süresi geçerli bir sayı olmalıdır', 400));
+  if (membership) {
+    // Aktif bir üye ise sayıyı azalt
+    if (membership.status === 'active') {
+      subreddit.memberCount = Math.max(0, subreddit.memberCount - 1);
+      await subreddit.save();
     }
 
-    banExpiresAt = new Date();
-    banExpiresAt.setDate(banExpiresAt.getDate() + durationDays);
-  }
+    // Üyeliği güncelle
+    membership.type = 'banned';
+    membership.status = 'banned';
+    membership.banReason = reason || 'Moderatör kararıyla';
+    membership.banExpiration = banExpiration;
+    membership.bannedBy = req.user._id;
+    membership.bannedAt = Date.now();
 
-  // Kullanıcının üyeliğini güncelle veya yeni üyelik oluştur
-  if (targetMembership) {
-    targetMembership.status = 'banned';
-    targetMembership.bannedBy = req.user._id;
-    targetMembership.bannedAt = Date.now();
-    targetMembership.banReason = reason || 'Topluluk kurallarını ihlal';
-    targetMembership.banExpiresAt = banExpiresAt;
-    targetMembership.modNote = modNote;
-
-    await targetMembership.save();
+    await membership.save();
   } else {
-    // Kullanıcının üyeliği yoksa, banned durumunda yeni üyelik oluştur
-    await SubredditMembership.create({
+    // Yeni üyelik kaydı oluştur
+    membership = await SubredditMembership.create({
       user: userId,
       subreddit: subredditId,
-      type: 'regular',
+      type: 'banned',
       status: 'banned',
+      banReason: reason || 'Moderatör kararıyla',
+      banExpiration: banExpiration,
       bannedBy: req.user._id,
       bannedAt: Date.now(),
-      banReason: reason || 'Topluluk kurallarını ihlal',
-      banExpiresAt: banExpiresAt,
-      modNote: modNote,
     });
   }
 
-  // Üye sayısını güncelle (eğer aktif bir üye yasaklandıysa)
-  if (
-    targetMembership &&
-    (targetMembership.status === 'active' || targetMembership.status === 'moderator')
-  ) {
-    await Subreddit.findByIdAndUpdate(subredditId, { $inc: { memberCount: -1 } });
-  }
-
-  // Moderatör logunu kaydet
+  // Moderasyon logu oluştur
   await ModLog.create({
+    user: req.user._id,
     subreddit: subredditId,
-    action: 'user_banned',
-    moderator: req.user._id,
-    target: userId,
-    details: reason || 'Topluluk kurallarını ihlal',
-    data: {
-      banExpiresAt,
-      modNote,
-    },
-    timestamp: Date.now(),
+    action: 'ban_user',
+    targetType: 'user',
+    targetId: userId,
+    details: `Kullanıcı yasaklandı: ${user.username}, Sebep: ${reason || 'Belirtilmedi'}, Süre: ${duration ? `${duration} gün` : 'Süresiz'}`,
   });
-
-  // Kullanıcıya bildirim gönder
-  await Notification.create({
-    recipient: userId,
-    type: 'subreddit_ban',
-    message: `r/${subreddit.name} topluluğundan yasaklandınız${banExpiresAt ? ` (${duration} gün)` : ''}`,
-    reference: {
-      type: 'Subreddit',
-      id: subredditId,
-    },
-    data: {
-      reason: reason || 'Topluluk kurallarını ihlal',
-      banExpiresAt,
-      permanent: !banExpiresAt,
-    },
-    isRead: false,
-  });
-
-  // Kullanıcıya mesaj gönder (eğer istenirse)
-  if (sendMessage && sendMessage.trim() !== '') {
-    // Sistemden gelen mesaj olarak işaretle
-    await Message.create({
-      sender: req.user._id,
-      recipient: userId,
-      subject: `r/${subreddit.name} topluluğundan yasaklandınız`,
-      body: sendMessage,
-      isSystemMessage: true,
-      metadata: {
-        type: 'ban_notification',
-        subreddit: subredditId,
-      },
-    });
-  }
 
   res.status(200).json({
     success: true,
-    message: `${user.username} kullanıcısı başarıyla topluluktan yasaklandı`,
+    message: `${user.username} kullanıcısı başarıyla yasaklandı`,
     data: {
-      userId,
-      subreddit: {
-        id: subreddit._id,
-        name: subreddit.name,
+      user: {
+        _id: user._id,
+        username: user.username,
       },
-      reason,
-      banExpiresAt,
-      permanent: !banExpiresAt,
+      banReason: membership.banReason,
+      banExpiration: membership.banExpiration,
+      bannedAt: membership.bannedAt,
     },
   });
 });
 
 /**
- * @desc    Kullanıcının topluluk yasağını kaldır
- * @route   DELETE /api/subreddits/:subredditId/bans/:userId
- * @access  Moderatör
+ * @desc    Bir kullanıcının yasağını kaldır
+ * @route   DELETE /api/subreddits/:subredditId/ban/:userId
+ * @access  Private (Moderatör/Admin)
  */
 const unbanUser = asyncHandler(async (req, res, next) => {
   const { subredditId, userId } = req.params;
-  const { sendMessage } = req.body;
-
-  // Geçerli ObjectId'ler mi kontrol et
-  if (!mongoose.Types.ObjectId.isValid(subredditId) || !mongoose.Types.ObjectId.isValid(userId)) {
-    return next(new ErrorResponse('Geçersiz ID formatı', 400));
-  }
 
   // Subreddit'in varlığını kontrol et
   const subreddit = await Subreddit.findById(subredditId);
   if (!subreddit) {
-    return next(new ErrorResponse('Subreddit bulunamadı', 404));
+    return next(new ErrorResponse('Topluluk bulunamadı', 404));
+  }
+
+  // Yetki kontrolü
+  const modStatus = await SubredditMembership.findOne({
+    user: req.user._id,
+    subreddit: subredditId,
+    type: { $in: ['moderator', 'admin'] },
+    status: 'active',
+  });
+
+  if (!modStatus && req.user.role !== 'admin') {
+    return next(new ErrorResponse('Bu işlem için moderatör yetkiniz yok', 403));
   }
 
   // Kullanıcının varlığını kontrol et
@@ -851,19 +443,7 @@ const unbanUser = asyncHandler(async (req, res, next) => {
     return next(new ErrorResponse('Kullanıcı bulunamadı', 404));
   }
 
-  // Kullanıcının moderatör olup olmadığını kontrol et
-  const modMembership = await SubredditMembership.findOne({
-    user: req.user._id,
-    subreddit: subredditId,
-    type: { $in: ['moderator', 'admin'] },
-    status: 'active',
-  });
-
-  if (!modMembership) {
-    return next(new ErrorResponse('Bu işlem için yetkiniz yok', 403));
-  }
-
-  // Kullanıcının yasaklı olup olmadığını kontrol et
+  // Kullanıcının banlanmış olup olmadığını kontrol et
   const membership = await SubredditMembership.findOne({
     user: userId,
     subreddit: subredditId,
@@ -871,88 +451,289 @@ const unbanUser = asyncHandler(async (req, res, next) => {
   });
 
   if (!membership) {
-    return next(new ErrorResponse('Bu kullanıcı topluluktan yasaklı değil', 404));
+    return next(new ErrorResponse('Bu kullanıcı zaten yasaklanmamış', 400));
   }
 
-  // Üyeliği güncelle
-  membership.status = 'left'; // Önceki durumuna değil, left durumuna geçir (yeniden katılması gerekecek)
-  membership.unbannedBy = req.user._id;
-  membership.unbannedAt = Date.now();
+  // Ban kaldır
+  membership.type = 'member';
+  membership.status = 'active';
+  membership.banReason = null;
+  membership.banExpiration = null;
+  membership.bannedBy = null;
+  membership.bannedAt = null;
+
   await membership.save();
 
-  // Moderatör logunu kaydet
+  // Üye sayısını güncelle
+  subreddit.memberCount += 1;
+  await subreddit.save();
+
+  // Moderasyon logu oluştur
   await ModLog.create({
+    user: req.user._id,
     subreddit: subredditId,
-    action: 'user_unbanned',
-    moderator: req.user._id,
-    target: userId,
-    details: 'Kullanıcının topluluk yasağı kaldırıldı',
-    timestamp: Date.now(),
+    action: 'unban_user',
+    targetType: 'user',
+    targetId: userId,
+    details: `Kullanıcının yasağı kaldırıldı: ${user.username}`,
   });
-
-  // Kullanıcıya bildirim gönder
-  await Notification.create({
-    recipient: userId,
-    type: 'subreddit_unban',
-    message: `r/${subreddit.name} topluluğundan yasağınız kaldırıldı`,
-    reference: {
-      type: 'Subreddit',
-      id: subredditId,
-    },
-    isRead: false,
-  });
-
-  // Kullanıcıya mesaj gönder (eğer istenirse)
-  if (sendMessage && sendMessage.trim() !== '') {
-    await Message.create({
-      sender: req.user._id,
-      recipient: userId,
-      subject: `r/${subreddit.name} topluluğundan yasağınız kaldırıldı`,
-      body: sendMessage,
-      isSystemMessage: true,
-      metadata: {
-        type: 'unban_notification',
-        subreddit: subredditId,
-      },
-    });
-  }
 
   res.status(200).json({
     success: true,
-    message: `${user.username} kullanıcısının topluluk yasağı başarıyla kaldırıldı`,
+    message: `${user.username} kullanıcısının yasağı başarıyla kaldırıldı`,
     data: {
-      userId,
-      subreddit: {
-        id: subreddit._id,
-        name: subreddit.name,
+      user: {
+        _id: user._id,
+        username: user.username,
       },
     },
   });
 });
 
 /**
- * @desc    Kullanıcıyı moderatör olarak ata
+ * @desc    Bir topluluğun yasaklanmış kullanıcılarını listele
+ * @route   GET /api/subreddits/:subredditId/banned-users
+ * @access  Private (Moderatör/Admin)
+ */
+const getBannedUsers = asyncHandler(async (req, res, next) => {
+  const { subredditId } = req.params;
+
+  // Sayfalama için
+  const page = parseInt(req.query.page, 10) || 1;
+  const limit = parseInt(req.query.limit, 10) || 20;
+  const startIndex = (page - 1) * limit;
+
+  // Subreddit'in varlığını kontrol et
+  const subreddit = await Subreddit.findById(subredditId);
+  if (!subreddit) {
+    return next(new ErrorResponse('Topluluk bulunamadı', 404));
+  }
+
+  // Yetki kontrolü
+  const modStatus = await SubredditMembership.findOne({
+    user: req.user._id,
+    subreddit: subredditId,
+    type: { $in: ['moderator', 'admin'] },
+    status: 'active',
+  });
+
+  if (!modStatus && req.user.role !== 'admin') {
+    return next(new ErrorResponse('Bu işlem için moderatör yetkiniz yok', 403));
+  }
+
+  // Yasaklanmış kullanıcıları say
+  const total = await SubredditMembership.countDocuments({
+    subreddit: subredditId,
+    status: 'banned',
+  });
+
+  // Yasaklanmış kullanıcıları getir
+  const bannedUsers = await SubredditMembership.find({
+    subreddit: subredditId,
+    status: 'banned',
+  })
+    .populate('user', 'username profilePicture')
+    .populate('bannedBy', 'username')
+    .sort({ bannedAt: -1 })
+    .skip(startIndex)
+    .limit(limit);
+
+  // Sayfalama bilgisi
+  const pagination = {
+    page,
+    limit,
+    totalPages: Math.ceil(total / limit),
+    totalDocs: total,
+  };
+
+  res.status(200).json({
+    success: true,
+    count: bannedUsers.length,
+    pagination,
+    data: bannedUsers,
+  });
+});
+
+/**
+ * @desc    Bekleyen üyelik isteklerini listele
+ * @route   GET /api/subreddits/:subredditId/pending
+ * @access  Private (Moderatör/Admin)
+ */
+const getPendingRequests = asyncHandler(async (req, res, next) => {
+  const { subredditId } = req.params;
+
+  // Sayfalama için
+  const page = parseInt(req.query.page, 10) || 1;
+  const limit = parseInt(req.query.limit, 10) || 20;
+  const startIndex = (page - 1) * limit;
+
+  // Subreddit'in varlığını kontrol et
+  const subreddit = await Subreddit.findById(subredditId);
+  if (!subreddit) {
+    return next(new ErrorResponse('Topluluk bulunamadı', 404));
+  }
+
+  // Yetki kontrolü
+  const modStatus = await SubredditMembership.findOne({
+    user: req.user._id,
+    subreddit: subredditId,
+    type: { $in: ['moderator', 'admin'] },
+    status: 'active',
+  });
+
+  if (!modStatus && req.user.role !== 'admin') {
+    return next(new ErrorResponse('Bu işlem için moderatör yetkiniz yok', 403));
+  }
+
+  // Bekleyen istekleri say
+  const total = await SubredditMembership.countDocuments({
+    subreddit: subredditId,
+    status: 'pending',
+  });
+
+  // Bekleyen istekleri getir
+  const pendingRequests = await SubredditMembership.find({
+    subreddit: subredditId,
+    status: 'pending',
+  })
+    .populate('user', 'username profilePicture karma')
+    .sort({ joinedAt: 1 })
+    .skip(startIndex)
+    .limit(limit);
+
+  // Sayfalama bilgisi
+  const pagination = {
+    page,
+    limit,
+    totalPages: Math.ceil(total / limit),
+    totalDocs: total,
+  };
+
+  res.status(200).json({
+    success: true,
+    count: pendingRequests.length,
+    pagination,
+    data: pendingRequests,
+  });
+});
+
+/**
+ * @desc    Bekleyen üyelik isteğini kabul et veya reddet
+ * @route   PUT /api/memberships/:membershipId/respond
+ * @access  Private (Moderatör/Admin)
+ */
+const respondToPendingRequest = asyncHandler(async (req, res, next) => {
+  const { membershipId } = req.params;
+  const { action } = req.body;
+
+  if (!['approve', 'reject'].includes(action)) {
+    return next(new ErrorResponse('Geçersiz işlem, approve veya reject olmalı', 400));
+  }
+
+  // Bekleyen üyelik isteğini kontrol et
+  const membership = await SubredditMembership.findById(membershipId);
+
+  if (!membership) {
+    return next(new ErrorResponse('Üyelik isteği bulunamadı', 404));
+  }
+
+  if (membership.status !== 'pending') {
+    return next(new ErrorResponse('Bu üyelik isteği zaten işlenmiş', 400));
+  }
+
+  // Yetki kontrolü
+  const modStatus = await SubredditMembership.findOne({
+    user: req.user._id,
+    subreddit: membership.subreddit,
+    type: { $in: ['moderator', 'admin'] },
+    status: 'active',
+  });
+
+  if (!modStatus && req.user.role !== 'admin') {
+    return next(new ErrorResponse('Bu işlem için moderatör yetkiniz yok', 403));
+  }
+
+  // Subreddit'i bul
+  const subreddit = await Subreddit.findById(membership.subreddit);
+  if (!subreddit) {
+    return next(new ErrorResponse('Topluluk bulunamadı', 404));
+  }
+
+  if (action === 'approve') {
+    // İsteği onayla
+    membership.status = 'active';
+    await membership.save();
+
+    // Üye sayısını güncelle
+    subreddit.memberCount += 1;
+    await subreddit.save();
+
+    // Moderasyon logu oluştur
+    await ModLog.create({
+      user: req.user._id,
+      subreddit: membership.subreddit,
+      action: 'approve_membership',
+      targetType: 'user',
+      targetId: membership.user,
+      details: `Üyelik isteği onaylandı`,
+    });
+
+    res.status(200).json({
+      success: true,
+      message: 'Üyelik isteği başarıyla onaylandı',
+      data: membership,
+    });
+  } else {
+    // İsteği reddet
+    await SubredditMembership.findByIdAndDelete(membershipId);
+
+    // Moderasyon logu oluştur
+    await ModLog.create({
+      user: req.user._id,
+      subreddit: membership.subreddit,
+      action: 'reject_membership',
+      targetType: 'user',
+      targetId: membership.user,
+      details: `Üyelik isteği reddedildi`,
+    });
+
+    res.status(200).json({
+      success: true,
+      message: 'Üyelik isteği başarıyla reddedildi',
+      data: {},
+    });
+  }
+});
+
+/**
+ * @desc    Moderatör ekle
  * @route   POST /api/subreddits/:subredditId/moderators
- * @access  Admin
+ * @access  Private (Admin)
  */
 const addModerator = asyncHandler(async (req, res, next) => {
   const { subredditId } = req.params;
   const { userId, permissions } = req.body;
 
-  // Parametreleri doğrula
   if (!userId) {
-    return next(new ErrorResponse("Kullanıcı ID'si zorunludur", 400));
-  }
-
-  // Geçerli ObjectId'ler mi kontrol et
-  if (!mongoose.Types.ObjectId.isValid(subredditId) || !mongoose.Types.ObjectId.isValid(userId)) {
-    return next(new ErrorResponse('Geçersiz ID formatı', 400));
+    return next(new ErrorResponse('Kullanıcı ID gereklidir', 400));
   }
 
   // Subreddit'in varlığını kontrol et
   const subreddit = await Subreddit.findById(subredditId);
   if (!subreddit) {
-    return next(new ErrorResponse('Subreddit bulunamadı', 404));
+    return next(new ErrorResponse('Topluluk bulunamadı', 404));
+  }
+
+  // Yetki kontrolü - sadece topluluk admini veya site admini
+  const isSubredditAdmin = await SubredditMembership.findOne({
+    user: req.user._id,
+    subreddit: subredditId,
+    type: 'admin',
+    status: 'active',
+  });
+
+  if (!isSubredditAdmin && req.user.role !== 'admin') {
+    return next(new ErrorResponse('Bu işlem için admin yetkiniz yok', 403));
   }
 
   // Kullanıcının varlığını kontrol et
@@ -961,131 +742,90 @@ const addModerator = asyncHandler(async (req, res, next) => {
     return next(new ErrorResponse('Kullanıcı bulunamadı', 404));
   }
 
-  // Kullanıcının admin olup olmadığını kontrol et
-  const requesterMembership = await SubredditMembership.findOne({
-    user: req.user._id,
-    subreddit: subredditId,
-    type: 'admin',
-    status: 'active',
-  });
-
-  if (!requesterMembership) {
-    return next(new ErrorResponse('Bu işlem için topluluk sahibi olmalısınız', 403));
-  }
-
-  // Kullanıcının mevcut üyeliğini kontrol et
+  // Kullanıcının üyelik durumunu kontrol et
   let membership = await SubredditMembership.findOne({
     user: userId,
     subreddit: subredditId,
   });
 
-  // Yasaklı kullanıcı kontrolü
-  if (membership && membership.status === 'banned') {
-    return next(new ErrorResponse('Yasaklı bir kullanıcıyı moderatör olarak atamazsınız', 400));
-  }
-
-  // Zaten moderatör mü kontrolü
-  if (membership && (membership.type === 'moderator' || membership.type === 'admin')) {
-    return next(new ErrorResponse('Bu kullanıcı zaten moderatör veya topluluk sahibi', 400));
-  }
-
-  // Moderatör izinlerini kontrol et
-  const validPermissions = [
-    'all',
-    'manage_settings',
-    'manage_flair',
-    'manage_posts',
-    'manage_comments',
-    'manage_users',
-    'manage_automod',
-    'view_traffic',
-    'mail',
-    'access',
-    'wiki',
-  ];
-
-  const modPermissions =
-    permissions && Array.isArray(permissions)
-      ? permissions.filter((p) => validPermissions.includes(p))
-      : ['access', 'posts', 'mail']; // Varsayılan izinler
-
   if (membership) {
-    // Mevcut üyeliği güncelle
+    // Zaten moderatör mü kontrol et
+    if (membership.type === 'moderator' || membership.type === 'admin') {
+      return next(new ErrorResponse('Bu kullanıcı zaten moderatör', 400));
+    }
+
+    // Banlanmış kullanıcı kontrolü
+    if (membership.status === 'banned') {
+      return next(new ErrorResponse('Banlanmış kullanıcı moderatör yapılamaz', 400));
+    }
+
+    // Normal üyeyi moderatör yap
     membership.type = 'moderator';
-    membership.status = 'active';
-    membership.permissions = modPermissions;
-    membership.updatedAt = Date.now();
+    membership.permissions = permissions || ['manage_posts', 'manage_comments', 'manage_users'];
     await membership.save();
   } else {
-    // Yeni moderatör üyeliği oluştur
+    // Yeni moderatör ekle
     membership = await SubredditMembership.create({
       user: userId,
       subreddit: subredditId,
       type: 'moderator',
       status: 'active',
-      permissions: modPermissions,
       joinedAt: Date.now(),
+      permissions: permissions || ['manage_posts', 'manage_comments', 'manage_users'],
     });
 
     // Üye sayısını güncelle
-    await Subreddit.findByIdAndUpdate(subredditId, { $inc: { memberCount: 1 } });
+    subreddit.memberCount += 1;
+    await subreddit.save();
   }
 
-  // Moderatör logunu kaydet
+  // Moderasyon logu oluştur
   await ModLog.create({
+    user: req.user._id,
     subreddit: subredditId,
-    action: 'moderator_added',
-    moderator: req.user._id,
-    target: userId,
-    details: `${user.username} kullanıcısı moderatör olarak atandı`,
-    data: {
-      permissions: modPermissions,
-    },
-    timestamp: Date.now(),
+    action: 'add_moderator',
+    targetType: 'user',
+    targetId: userId,
+    details: `Moderatör eklendi: ${user.username}`,
   });
 
-  // Kullanıcıya bildirim gönder
-  await Notification.create({
-    recipient: userId,
-    type: 'moderator_added',
-    message: `r/${subreddit.name} topluluğuna moderatör olarak atandınız`,
-    reference: {
-      type: 'Subreddit',
-      id: subredditId,
-    },
-    isRead: false,
-  });
+  // Moderatör bilgisini user detayları ile getir
+  const populatedMembership = await SubredditMembership.findById(membership._id).populate(
+    'user',
+    'username profilePicture',
+  );
 
   res.status(200).json({
     success: true,
-    message: `${user.username} kullanıcısı başarıyla moderatör olarak atandı`,
-    data: {
-      membership,
-      subreddit: {
-        id: subreddit._id,
-        name: subreddit.name,
-      },
-    },
+    message: `${user.username} moderatör olarak eklendi`,
+    data: populatedMembership,
   });
 });
 
 /**
- * @desc    Moderatör olarak kullanıcıyı kaldır
+ * @desc    Moderatörü kaldır
  * @route   DELETE /api/subreddits/:subredditId/moderators/:userId
- * @access  Admin
+ * @access  Private (Admin)
  */
 const removeModerator = asyncHandler(async (req, res, next) => {
   const { subredditId, userId } = req.params;
 
-  // Geçerli ObjectId'ler mi kontrol et
-  if (!mongoose.Types.ObjectId.isValid(subredditId) || !mongoose.Types.ObjectId.isValid(userId)) {
-    return next(new ErrorResponse('Geçersiz ID formatı', 400));
-  }
-
   // Subreddit'in varlığını kontrol et
   const subreddit = await Subreddit.findById(subredditId);
   if (!subreddit) {
-    return next(new ErrorResponse('Subreddit bulunamadı', 404));
+    return next(new ErrorResponse('Topluluk bulunamadı', 404));
+  }
+
+  // Yetki kontrolü - sadece topluluk admini veya site admini
+  const isSubredditAdmin = await SubredditMembership.findOne({
+    user: req.user._id,
+    subreddit: subredditId,
+    type: 'admin',
+    status: 'active',
+  });
+
+  if (!isSubredditAdmin && req.user.role !== 'admin') {
+    return next(new ErrorResponse('Bu işlem için admin yetkiniz yok', 403));
   }
 
   // Kullanıcının varlığını kontrol et
@@ -1094,71 +834,39 @@ const removeModerator = asyncHandler(async (req, res, next) => {
     return next(new ErrorResponse('Kullanıcı bulunamadı', 404));
   }
 
-  // Kullanıcının admin olup olmadığını kontrol et
-  const requesterMembership = await SubredditMembership.findOne({
-    user: req.user._id,
-    subreddit: subredditId,
-    type: 'admin',
-    status: 'active',
-  });
-
-  if (!requesterMembership) {
-    return next(new ErrorResponse('Bu işlem için topluluk sahibi olmalısınız', 403));
-  }
-
-  // Hedef kullanıcının moderatör olup olmadığını kontrol et
+  // Kullanıcının moderatör olup olmadığını kontrol et
   const membership = await SubredditMembership.findOne({
     user: userId,
     subreddit: subredditId,
     type: 'moderator',
-    status: 'active',
   });
 
   if (!membership) {
-    return next(new ErrorResponse('Bu kullanıcı topluluğun moderatörü değil', 404));
+    return next(new ErrorResponse('Bu kullanıcı zaten moderatör değil', 400));
   }
 
-  // Topluluk sahibini (admin) kaldırmaya çalışıyor mu kontrol et
-  if (membership.type === 'admin') {
-    return next(new ErrorResponse('Topluluk sahibi moderatörlükten çıkarılamaz', 403));
-  }
-
-  // Moderatörlüğü kaldır, normal üye yap
-  membership.type = 'regular';
+  // Moderatör yetkisini normal üyeliğe düşür
+  membership.type = 'member';
   membership.permissions = [];
-  membership.updatedAt = Date.now();
   await membership.save();
 
-  // Moderatör logunu kaydet
+  // Moderasyon logu oluştur
   await ModLog.create({
+    user: req.user._id,
     subreddit: subredditId,
-    action: 'moderator_removed',
-    moderator: req.user._id,
-    target: userId,
-    details: `${user.username} kullanıcısının moderatörlüğü kaldırıldı`,
-    timestamp: Date.now(),
-  });
-
-  // Kullanıcıya bildirim gönder
-  await Notification.create({
-    recipient: userId,
-    type: 'moderator_removed',
-    message: `r/${subreddit.name} topluluğundaki moderatörlüğünüz kaldırıldı`,
-    reference: {
-      type: 'Subreddit',
-      id: subredditId,
-    },
-    isRead: false,
+    action: 'remove_moderator',
+    targetType: 'user',
+    targetId: userId,
+    details: `Moderatör çıkarıldı: ${user.username}`,
   });
 
   res.status(200).json({
     success: true,
-    message: `${user.username} kullanıcısının moderatörlüğü başarıyla kaldırıldı`,
+    message: `${user.username} moderatörlükten çıkarıldı`,
     data: {
-      userId,
-      subreddit: {
-        id: subreddit._id,
-        name: subreddit.name,
+      user: {
+        _id: user._id,
+        username: user.username,
       },
     },
   });
@@ -1167,351 +875,206 @@ const removeModerator = asyncHandler(async (req, res, next) => {
 /**
  * @desc    Moderatör izinlerini güncelle
  * @route   PUT /api/subreddits/:subredditId/moderators/:userId
- * @access  Admin
+ * @access  Private (Admin)
  */
 const updateModeratorPermissions = asyncHandler(async (req, res, next) => {
   const { subredditId, userId } = req.params;
   const { permissions } = req.body;
 
-  // Parametreleri doğrula
   if (!permissions || !Array.isArray(permissions)) {
-    return next(new ErrorResponse('İzinler bir dizi olarak belirtilmelidir', 400));
+    return next(new ErrorResponse('Geçerli izinler dizisi gereklidir', 400));
   }
 
-  // Geçerli ObjectId'ler mi kontrol et
-  if (!mongoose.Types.ObjectId.isValid(subredditId) || !mongoose.Types.ObjectId.isValid(userId)) {
-    return next(new ErrorResponse('Geçersiz ID formatı', 400));
+  // İzinlerin geçerliliğini kontrol et
+  const validPermissions = [
+    'manage_posts',
+    'manage_comments',
+    'manage_users',
+    'manage_settings',
+    'manage_flair',
+    'manage_rules',
+  ];
+  const isValidPermissions = permissions.every((perm) => validPermissions.includes(perm));
+
+  if (!isValidPermissions) {
+    return next(new ErrorResponse('Geçersiz izinler bulunmaktadır', 400));
   }
 
   // Subreddit'in varlığını kontrol et
   const subreddit = await Subreddit.findById(subredditId);
   if (!subreddit) {
-    return next(new ErrorResponse('Subreddit bulunamadı', 404));
+    return next(new ErrorResponse('Topluluk bulunamadı', 404));
   }
 
-  // Kullanıcının varlığını kontrol et
-  const user = await User.findById(userId);
-  if (!user) {
-    return next(new ErrorResponse('Kullanıcı bulunamadı', 404));
-  }
-
-  // Kullanıcının admin olup olmadığını kontrol et
-  const requesterMembership = await SubredditMembership.findOne({
+  // Yetki kontrolü - sadece topluluk admini veya site admini
+  const isSubredditAdmin = await SubredditMembership.findOne({
     user: req.user._id,
     subreddit: subredditId,
     type: 'admin',
     status: 'active',
   });
 
-  if (!requesterMembership) {
-    return next(new ErrorResponse('Bu işlem için topluluk sahibi olmalısınız', 403));
+  if (!isSubredditAdmin && req.user.role !== 'admin') {
+    return next(new ErrorResponse('Bu işlem için admin yetkiniz yok', 403));
   }
 
-  // Hedef kullanıcının moderatör olup olmadığını kontrol et
+  // Kullanıcının moderatör olup olmadığını kontrol et
   const membership = await SubredditMembership.findOne({
     user: userId,
     subreddit: subredditId,
     type: 'moderator',
-    status: 'active',
   });
 
   if (!membership) {
-    return next(new ErrorResponse('Bu kullanıcı topluluğun moderatörü değil', 404));
+    return next(new ErrorResponse('Bu kullanıcı moderatör değil', 400));
   }
-
-  // Moderatör izinlerini kontrol et ve geçerli olanları filtrele
-  const validPermissions = [
-    'all',
-    'manage_settings',
-    'manage_flair',
-    'manage_posts',
-    'manage_comments',
-    'manage_users',
-    'manage_automod',
-    'view_traffic',
-    'mail',
-    'access',
-    'wiki',
-  ];
-
-  const modPermissions = permissions.filter((p) => validPermissions.includes(p));
 
   // İzinleri güncelle
-  membership.permissions = modPermissions;
-  membership.updatedAt = Date.now();
+  membership.permissions = permissions;
   await membership.save();
 
-  // Moderatör logunu kaydet
+  // Moderasyon logu oluştur
   await ModLog.create({
+    user: req.user._id,
     subreddit: subredditId,
-    action: 'moderator_permissions_updated',
-    moderator: req.user._id,
-    target: userId,
-    details: `${user.username} kullanıcısının moderatör izinleri güncellendi`,
-    data: {
-      permissions: modPermissions,
-    },
-    timestamp: Date.now(),
+    action: 'update_moderator_permissions',
+    targetType: 'user',
+    targetId: userId,
+    details: `Moderatör izinleri güncellendi: ${permissions.join(', ')}`,
   });
+
+  // Kullanıcı bilgisi ile getir
+  const user = await User.findById(userId).select('username profilePicture');
 
   res.status(200).json({
     success: true,
-    message: `${user.username} kullanıcısının moderatör izinleri başarıyla güncellendi`,
+    message: 'Moderatör izinleri başarıyla güncellendi',
     data: {
-      membership,
-      subreddit: {
-        id: subreddit._id,
-        name: subreddit.name,
+      _id: membership._id,
+      user: {
+        _id: user._id,
+        username: user.username,
+        profilePicture: user.profilePicture,
       },
+      permissions: membership.permissions,
+      type: membership.type,
+      status: membership.status,
+      joinedAt: membership.joinedAt,
     },
   });
 });
 
 /**
- * @desc    Topluluk sahibini değiştir
- * @route   PUT /api/subreddits/:subredditId/transfer-ownership
- * @access  Admin
+ * @desc    Bir topluluğun moderatörlerini listele
+ * @route   GET /api/subreddits/:subredditId/moderators
+ * @access  Public
  */
-const transferOwnership = asyncHandler(async (req, res, next) => {
+const getModerators = asyncHandler(async (req, res, next) => {
   const { subredditId } = req.params;
-  const { userId, confirmationCode } = req.body;
-
-  // Parametreleri doğrula
-  if (!userId) {
-    return next(new ErrorResponse("Kullanıcı ID'si zorunludur", 400));
-  }
-
-  // Onay kodu kontrolü
-  if (!confirmationCode || confirmationCode !== 'TRANSFER_CONFIRM') {
-    return next(
-      new ErrorResponse(
-        'Sahiplik transferini onaylamak için "TRANSFER_CONFIRM" kodunu göndermelisiniz',
-        400,
-      ),
-    );
-  }
-
-  // Geçerli ObjectId'ler mi kontrol et
-  if (!mongoose.Types.ObjectId.isValid(subredditId) || !mongoose.Types.ObjectId.isValid(userId)) {
-    return next(new ErrorResponse('Geçersiz ID formatı', 400));
-  }
 
   // Subreddit'in varlığını kontrol et
   const subreddit = await Subreddit.findById(subredditId);
   if (!subreddit) {
-    return next(new ErrorResponse('Subreddit bulunamadı', 404));
+    return next(new ErrorResponse('Topluluk bulunamadı', 404));
   }
 
-  // Kullanıcının varlığını kontrol et
-  const newOwner = await User.findById(userId);
-  if (!newOwner) {
-    return next(new ErrorResponse('Kullanıcı bulunamadı', 404));
-  }
-
-  // Kullanıcının admin olup olmadığını kontrol et
-  const requesterMembership = await SubredditMembership.findOne({
-    user: req.user._id,
-    subreddit: subredditId,
-    type: 'admin',
-    status: 'active',
-  });
-
-  if (!requesterMembership) {
-    return next(new ErrorResponse('Bu işlem için topluluk sahibi olmalısınız', 403));
-  }
-
-  // Kendisine transfer etmeye çalışıyor mu kontrol et
-  if (userId === req.user._id.toString()) {
-    return next(new ErrorResponse('Topluluk sahipliğini kendinize transfer edemezsiniz', 400));
-  }
-
-  // Yeni sahibin üyeliğini kontrol et
-  let newOwnerMembership = await SubredditMembership.findOne({
-    user: userId,
-    subreddit: subredditId,
-  });
-
-  // Yasaklı kullanıcı kontrolü
-  if (newOwnerMembership && newOwnerMembership.status === 'banned') {
-    return next(
-      new ErrorResponse('Yasaklı bir kullanıcıya topluluk sahipliği transfer edemezsiniz', 400),
-    );
-  }
-
-  // Yeni sahibin üyeliği yoksa oluştur
-  if (!newOwnerMembership) {
-    newOwnerMembership = await SubredditMembership.create({
-      user: userId,
-      subreddit: subredditId,
-      type: 'regular',
-      status: 'active',
-      joinedAt: Date.now(),
-    });
-
-    // Üye sayısını güncelle
-    await Subreddit.findByIdAndUpdate(subredditId, { $inc: { memberCount: 1 } });
-  }
-
-  // Eski sahibin üyeliğini moderatöre düşür
-  requesterMembership.type = 'moderator';
-  requesterMembership.updatedAt = Date.now();
-  requesterMembership.permissions = ['all']; // Tüm izinleri ver
-  await requesterMembership.save();
-
-  // Yeni sahibin üyeliğini admin yap
-  newOwnerMembership.type = 'admin';
-  newOwnerMembership.status = 'active';
-  newOwnerMembership.updatedAt = Date.now();
-  await newOwnerMembership.save();
-
-  // Subreddit'i güncelle
-  subreddit.owner = userId;
-  subreddit.updatedAt = Date.now();
-  await subreddit.save();
-
-  // Moderatör logunu kaydet
-  await ModLog.create({
-    subreddit: subredditId,
-    action: 'ownership_transferred',
-    moderator: req.user._id,
-    target: userId,
-    details: `Topluluk sahipliği ${req.user.username} kullanıcısından ${newOwner.username} kullanıcısına transfer edildi`,
-    timestamp: Date.now(),
-  });
-
-  // Admin logunu kaydet (site genelinde)
-  await AdminLog.create({
-    user: req.user._id,
-    action: 'subreddit_ownership_transferred',
-    details: `r/${subreddit.name} topluluğunun sahipliği ${newOwner.username} kullanıcısına transfer edildi`,
-    ip: req.ip,
-  });
-
-  // Eski ve yeni sahibe bildirim gönder
-  await Notification.create({
-    recipient: userId,
-    type: 'ownership_received',
-    message: `r/${subreddit.name} topluluğunun sahipliği size transfer edildi`,
-    reference: {
-      type: 'Subreddit',
-      id: subredditId,
-    },
-    isRead: false,
-  });
-
-  await Notification.create({
-    recipient: req.user._id,
-    type: 'ownership_transferred',
-    message: `r/${subreddit.name} topluluğunun sahipliğini ${newOwner.username} kullanıcısına transfer ettiniz`,
-    reference: {
-      type: 'Subreddit',
-      id: subredditId,
-    },
-    isRead: false,
-  });
-
-  res.status(200).json({
-    success: true,
-    message: `Topluluk sahipliği başarıyla ${newOwner.username} kullanıcısına transfer edildi`,
-    data: {
-      subreddit: {
-        id: subreddit._id,
-        name: subreddit.name,
-        owner: userId,
-      },
-      newOwner: {
-        id: newOwner._id,
-        username: newOwner.username,
-      },
-    },
-  });
-});
-
-/**
- * @desc    Topluluktaki yasaklı kullanıcıları listele
- * @route   GET /api/subreddits/:subredditId/bans
- * @access  Moderatör
- */
-const getBannedUsers = asyncHandler(async (req, res, next) => {
-  const { subredditId } = req.params;
-
-  // Geçerli bir ObjectId mi kontrol et
-  if (!mongoose.Types.ObjectId.isValid(subredditId)) {
-    return next(new ErrorResponse('Geçersiz Subreddit ID formatı', 400));
-  }
-
-  // Subreddit'in varlığını kontrol et
-  const subreddit = await Subreddit.findById(subredditId);
-  if (!subreddit) {
-    return next(new ErrorResponse('Subreddit bulunamadı', 404));
-  }
-
-  // Kullanıcının moderatör olup olmadığını kontrol et
-  const modMembership = await SubredditMembership.findOne({
-    user: req.user._id,
+  // Moderatörleri getir
+  const moderators = await SubredditMembership.find({
     subreddit: subredditId,
     type: { $in: ['moderator', 'admin'] },
     status: 'active',
+  })
+    .populate('user', 'username profilePicture createdAt')
+    .sort({ type: -1, joinedAt: 1 }); // Admin'ler önce, sonra eski moderatörler
+
+  // Moderatör listesini düzenle
+  const formattedModerators = moderators.map((mod) => ({
+    _id: mod._id,
+    user: {
+      _id: mod.user._id,
+      username: mod.user.username,
+      profilePicture: mod.user.profilePicture,
+    },
+    role: mod.type === 'admin' ? 'Kurucu' : 'Moderatör',
+    permissions: mod.permissions || [],
+    joinedAt: mod.joinedAt,
+  }));
+
+  res.status(200).json({
+    success: true,
+    count: moderators.length,
+    data: formattedModerators,
+  });
+});
+
+/**
+ * @desc    Bir topluluğun üyelerini listele
+ * @route   GET /api/subreddits/:subredditId/members
+ * @access  Public (Sayfalama ile)
+ */
+const getMembers = asyncHandler(async (req, res, next) => {
+  const { subredditId } = req.params;
+
+  // Sayfalama için
+  const page = parseInt(req.query.page, 10) || 1;
+  const limit = parseInt(req.query.limit, 10) || 25;
+  const startIndex = (page - 1) * limit;
+
+  // Sıralama seçeneği
+  const sortBy = req.query.sortBy || 'joinedAt';
+  const sortOrder = req.query.sortOrder || 'desc';
+
+  // Subreddit'in varlığını kontrol et
+  const subreddit = await Subreddit.findById(subredditId);
+  if (!subreddit) {
+    return next(new ErrorResponse('Topluluk bulunamadı', 404));
+  }
+
+  // Üye sayısını say (sadece aktif üyeler)
+  const total = await SubredditMembership.countDocuments({
+    subreddit: subredditId,
+    status: 'active',
   });
 
-  if (!modMembership) {
-    return next(new ErrorResponse('Bu işlem için yetkiniz yok', 403));
+  // Sıralama seçeneklerini ayarla
+  let sort = {};
+  if (sortBy === 'joinedAt') {
+    sort.joinedAt = sortOrder === 'asc' ? 1 : -1;
+  } else if (sortBy === 'username') {
+    // Kullanıcı adına göre sıralama için özel işlem gerekir
+    // Bu sorgu örnek değildir, kullanıcı adı bilgisine göre sıralama için populate edilen veriler üzerinde JS sıralama yapılabilir
+    sort = { joinedAt: -1 }; // Varsayılan sıralama
   }
 
-  // Sayfalama için parametreleri al
-  const page = parseInt(req.query.page, 10) || 1;
-  const limit = parseInt(req.query.limit, 10) || 20;
-  const startIndex = (page - 1) * limit;
-  const endIndex = page * limit;
-
-  // Filtreleme ve sıralama parametrelerini al
-  const { search, sortBy, order } = req.query;
-
-  // Sorgu parametrelerini oluştur
-  const query = {
+  // Üyeleri getir
+  let members = await SubredditMembership.find({
     subreddit: subredditId,
-    status: 'banned',
-  };
-
-  // Arama sorgusu
-  if (search) {
-    const users = await User.find({
-      $or: [
-        { username: { $regex: search, $options: 'i' } },
-        { displayName: { $regex: search, $options: 'i' } },
-      ],
-    }).select('_id');
-
-    query.user = { $in: users.map((u) => u._id) };
-  }
-
-  if (sortBy === 'username') {
-    // Kullanıcı adına göre sıralama için özel işlem yapılması gerekir
-    // Bu durumda mongodb'nin $lookup özelliğini kullanabiliriz
-    // Ama şimdilik bannedAt tarihine göre sıralayalım
-    sortOptions.bannedAt = order === 'asc' ? 1 : -1;
-  } else if (sortBy === 'bannedAt') {
-    sortOptions.bannedAt = order === 'asc' ? 1 : -1;
-  } else {
-    // Varsayılan sıralama
-    sortOptions.bannedAt = -1;
-  }
-
-  // Toplam yasaklı kullanıcı sayısını al
-  const total = await SubredditMembership.countDocuments(query);
-
-  // Yasaklı kullanıcıları getir ve kullanıcı bilgilerini popüle et
-  const memberships = await SubredditMembership.find(query)
-    .sort(sortOptions)
+    status: 'active',
+  })
+    .populate('user', 'username profilePicture karma createdAt')
+    .sort(sort)
     .skip(startIndex)
-    .limit(limit)
-    .populate('user', 'username displayName avatar')
-    .populate('bannedBy', 'username');
+    .limit(limit);
+
+  // Kullanıcı adına göre sıralama yapılacaksa
+  if (sortBy === 'username') {
+    members = members.sort((a, b) => {
+      if (!a.user || !b.user) return 0;
+      return sortOrder === 'asc'
+        ? a.user.username.localeCompare(b.user.username)
+        : b.user.username.localeCompare(a.user.username);
+    });
+  }
 
   // Sayfalama bilgisi
-  const pagination = {};
+  const pagination = {
+    page,
+    limit,
+    totalPages: Math.ceil(total / limit),
+    totalDocs: total,
+  };
 
-  if (endIndex < total) {
+  if (startIndex + limit < total) {
     pagination.next = {
       page: page + 1,
       limit,
@@ -1527,526 +1090,67 @@ const getBannedUsers = asyncHandler(async (req, res, next) => {
 
   res.status(200).json({
     success: true,
-    count: memberships.length,
-    total,
+    count: members.length,
     pagination,
-    data: {
-      subreddit: {
-        id: subreddit._id,
-        name: subreddit.name,
-      },
-      bannedUsers: memberships,
-    },
+    data: members,
   });
 });
 
 /**
- * @desc    Topluluktaki moderatörleri listele
- * @route   GET /api/subreddits/:subredditId/moderators
- * @access  Herkese Açık
+ * @desc    Üyelik detaylarını getir
+ * @route   GET /api/memberships/:membershipId
+ * @access  Private
  */
-const getModerators = asyncHandler(async (req, res, next) => {
-  const { subredditId } = req.params;
+const getMembership = asyncHandler(async (req, res, next) => {
+  const { membershipId } = req.params;
 
-  // Geçerli bir ObjectId mi kontrol et
-  if (!mongoose.Types.ObjectId.isValid(subredditId)) {
-    return next(new ErrorResponse('Geçersiz Subreddit ID formatı', 400));
+  // Üyeliğin var olup olmadığını kontrol et
+  const membership = await SubredditMembership.findById(membershipId)
+    .populate('user', 'username profilePicture')
+    .populate('subreddit', 'name title icon banner memberCount type')
+    .populate('bannedBy', 'username');
+
+  if (!membership) {
+    return next(new ErrorResponse('Üyelik bulunamadı', 404));
   }
 
-  // Subreddit'in varlığını kontrol et
-  const subreddit = await Subreddit.findById(subredditId);
-  if (!subreddit) {
-    return next(new ErrorResponse('Subreddit bulunamadı', 404));
-  }
+  // Yetki kontrolü - sadece kendi üyeliği veya mod/admin
+  const isOwnMembership = membership.user._id.toString() === req.user._id.toString();
 
-  // Moderatörleri getir
-  const moderators = await SubredditMembership.find({
-    subreddit: subredditId,
-    type: { $in: ['moderator', 'admin'] },
-    status: 'active',
-  })
-    .sort({ type: -1, joinedAt: 1 }) // Önce admin, sonra moderatörler, kıdem sırasına göre
-    .populate('user', 'username displayName avatar createdAt lastActive');
-
-  res.status(200).json({
-    success: true,
-    count: moderators.length,
-    data: {
-      subreddit: {
-        id: subreddit._id,
-        name: subreddit.name,
-      },
-      moderators: moderators.map((mod) => ({
-        id: mod._id,
-        user: mod.user,
-        type: mod.type,
-        permissions: mod.permissions,
-        joinedAt: mod.joinedAt,
-        isSelf: req.user && mod.user._id.toString() === req.user._id.toString(),
-      })),
-    },
-  });
-});
-
-/**
- * @desc    Kullanıcının moderatörlük yaptığı toplulukları getir
- * @route   GET /api/users/:userId/moderating
- * @access  Üye (kendi profili) / Admin (tüm profiller)
- */
-const getUserModeratedSubreddits = asyncHandler(async (req, res, next) => {
-  const { userId } = req.params;
-
-  // Geçerli bir ObjectId mi kontrol et
-  if (!mongoose.Types.ObjectId.isValid(userId)) {
-    return next(new ErrorResponse('Geçersiz Kullanıcı ID formatı', 400));
-  }
-
-  // Kullanıcının varlığını kontrol et
-  const user = await User.findById(userId);
-  if (!user) {
-    return next(new ErrorResponse('Kullanıcı bulunamadı', 404));
-  }
-
-  // Yetki kontrolü (sadece kendi profilini veya admin görüntüleyebilir)
-  if (userId !== req.user._id.toString() && req.user.role !== 'admin') {
-    return next(new ErrorResponse('Bu işlem için yetkiniz yok', 403));
-  }
-
-  // Kullanıcının moderatörlük yaptığı toplulukları getir
-  const memberships = await SubredditMembership.find({
-    user: userId,
-    type: { $in: ['moderator', 'admin'] },
-    status: 'active',
-  })
-    .sort({ type: -1, joinedAt: 1 }) // Önce admin, sonra moderatörler, kıdem sırasına göre
-    .populate('subreddit', 'name title description type memberCount createdAt icon banner');
-
-  res.status(200).json({
-    success: true,
-    count: memberships.length,
-    data: memberships.map((membership) => ({
-      id: membership._id,
-      subreddit: membership.subreddit,
-      type: membership.type,
-      permissions: membership.permissions,
-      joinedAt: membership.joinedAt,
-    })),
-  });
-});
-
-/**
- * @desc    Üyelik durumunu onayla (toplu işlem)
- * @route   PUT /api/subreddits/:subredditId/memberships/batch-approve
- * @access  Moderatör
- */
-const batchApproveMemberships = asyncHandler(async (req, res, next) => {
-  const { subredditId } = req.params;
-  const { membershipIds } = req.body;
-
-  // Parametreleri doğrula
-  if (!membershipIds || !Array.isArray(membershipIds) || membershipIds.length === 0) {
-    return next(new ErrorResponse("En az bir üyelik ID'si gereklidir", 400));
-  }
-
-  // Geçerli bir ObjectId mi kontrol et
-  if (!mongoose.Types.ObjectId.isValid(subredditId)) {
-    return next(new ErrorResponse('Geçersiz Subreddit ID formatı', 400));
-  }
-
-  // Subreddit'in varlığını kontrol et
-  const subreddit = await Subreddit.findById(subredditId);
-  if (!subreddit) {
-    return next(new ErrorResponse('Subreddit bulunamadı', 404));
-  }
-
-  // Kullanıcının moderatör olup olmadığını kontrol et
-  const modMembership = await SubredditMembership.findOne({
-    user: req.user._id,
-    subreddit: subredditId,
-    type: { $in: ['moderator', 'admin'] },
-    status: 'active',
-  });
-
-  if (!modMembership) {
-    return next(new ErrorResponse('Bu işlem için yetkiniz yok', 403));
-  }
-
-  // ID'lerin geçerli olup olmadığını kontrol et
-  const validIds = membershipIds.filter((id) => mongoose.Types.ObjectId.isValid(id));
-
-  if (validIds.length === 0) {
-    return next(new ErrorResponse("Geçerli üyelik ID'si bulunamadı", 400));
-  }
-
-  // Bekleyen üyelikleri bul
-  const pendingMemberships = await SubredditMembership.find({
-    _id: { $in: validIds },
-    subreddit: subredditId,
-    status: 'pending',
-  }).populate('user', 'username');
-
-  if (pendingMemberships.length === 0) {
-    return next(new ErrorResponse('Onaylanacak bekleyen üyelik bulunamadı', 404));
-  }
-
-  // Üyelikleri onayla
-  const updates = pendingMemberships.map((membership) => ({
-    updateOne: {
-      filter: { _id: membership._id },
-      update: {
-        $set: {
-          status: 'active',
-          approvedBy: req.user._id,
-          approvedAt: Date.now(),
-        },
-      },
-    },
-  }));
-
-  await SubredditMembership.bulkWrite(updates);
-
-  // Üye sayısını güncelle
-  await Subreddit.findByIdAndUpdate(subredditId, {
-    $inc: { memberCount: pendingMemberships.length },
-  });
-
-  // Moderatör logunu kaydet
-  const modLogEntries = pendingMemberships.map((membership) => ({
-    subreddit: subredditId,
-    action: 'membership_approved',
-    moderator: req.user._id,
-    target: membership.user._id,
-    details: `${membership.user.username} kullanıcısının üyelik isteği onaylandı`,
-    timestamp: Date.now(),
-  }));
-
-  await ModLog.insertMany(modLogEntries);
-
-  // Kullanıcılara bildirim gönder
-  const notifications = pendingMemberships.map((membership) => ({
-    recipient: membership.user._id,
-    type: 'membership_approved',
-    message: `r/${subreddit.name} topluluğuna üyelik isteğiniz onaylandı`,
-    reference: {
-      type: 'Subreddit',
-      id: subredditId,
-    },
-    isRead: false,
-  }));
-
-  await Notification.insertMany(notifications);
-
-  res.status(200).json({
-    success: true,
-    message: `${pendingMemberships.length} üyelik isteği onaylandı`,
-    data: {
-      approvedCount: pendingMemberships.length,
-      subreddit: {
-        id: subreddit._id,
-        name: subreddit.name,
-      },
-    },
-  });
-});
-
-/**
- * @desc    Topluluğa moderatör davet et
- * @route   POST /api/subreddits/:subredditId/moderator-invites
- * @access  Moderatör
- */
-const inviteModerator = asyncHandler(async (req, res, next) => {
-  const { subredditId } = req.params;
-  const { username, permissions, message } = req.body;
-
-  // Parametreleri doğrula
-  if (!username) {
-    return next(new ErrorResponse('Kullanıcı adı zorunludur', 400));
-  }
-
-  // Geçerli bir ObjectId mi kontrol et
-  if (!mongoose.Types.ObjectId.isValid(subredditId)) {
-    return next(new ErrorResponse('Geçersiz Subreddit ID formatı', 400));
-  }
-
-  // Subreddit'in varlığını kontrol et
-  const subreddit = await Subreddit.findById(subredditId);
-  if (!subreddit) {
-    return next(new ErrorResponse('Subreddit bulunamadı', 404));
-  }
-
-  // Kullanıcının moderatör olup olmadığını kontrol et
-  const modMembership = await SubredditMembership.findOne({
-    user: req.user._id,
-    subreddit: subredditId,
-    type: { $in: ['moderator', 'admin'] },
-    status: 'active',
-  });
-
-  if (!modMembership) {
-    return next(new ErrorResponse('Bu işlem için yetkiniz yok', 403));
-  }
-
-  // Kullanıcıyı bul
-  const user = await User.findOne({ username: { $regex: new RegExp(`^${username}$`, 'i') } });
-  if (!user) {
-    return next(new ErrorResponse('Kullanıcı bulunamadı', 404));
-  }
-
-  // Kullanıcının zaten moderatör olup olmadığını kontrol et
-  const existingMembership = await SubredditMembership.findOne({
-    user: user._id,
-    subreddit: subredditId,
-  });
-
-  if (
-    existingMembership &&
-    (existingMembership.type === 'moderator' || existingMembership.type === 'admin')
-  ) {
-    return next(new ErrorResponse('Bu kullanıcı zaten moderatör veya topluluk sahibi', 400));
-  }
-
-  // Kullanıcının yasaklı olup olmadığını kontrol et
-  if (existingMembership && existingMembership.status === 'banned') {
-    return next(
-      new ErrorResponse('Yasaklı bir kullanıcıyı moderatör olarak davet edemezsiniz', 400),
-    );
-  }
-
-  // Moderatör izinlerini kontrol et
-  const validPermissions = [
-    'all',
-    'manage_settings',
-    'manage_flair',
-    'manage_posts',
-    'manage_comments',
-    'manage_users',
-    'manage_automod',
-    'view_traffic',
-    'mail',
-    'access',
-    'wiki',
-  ];
-
-  const modPermissions =
-    permissions && Array.isArray(permissions)
-      ? permissions.filter((p) => validPermissions.includes(p))
-      : ['access', 'posts', 'mail']; // Varsayılan izinler
-
-  // Moderatör davetini oluştur
-  await ModeratorInvite.create({
-    subreddit: subredditId,
-    user: user._id,
-    invitedBy: req.user._id,
-    permissions: modPermissions,
-    message: message || '',
-    createdAt: Date.now(),
-    status: 'pending',
-  });
-
-  // Moderatör logunu kaydet
-  await ModLog.create({
-    subreddit: subredditId,
-    action: 'moderator_invited',
-    moderator: req.user._id,
-    target: user._id,
-    details: `${user.username} kullanıcısı moderatör olarak davet edildi`,
-    data: {
-      permissions: modPermissions,
-    },
-    timestamp: Date.now(),
-  });
-
-  // Kullanıcıya bildirim gönder
-  await Notification.create({
-    recipient: user._id,
-    type: 'moderator_invite',
-    message: `r/${subreddit.name} topluluğuna moderatör olarak davet edildiniz`,
-    reference: {
-      type: 'Subreddit',
-      id: subredditId,
-    },
-    isRead: false,
-  });
-
-  res.status(200).json({
-    success: true,
-    message: `${user.username} kullanıcısı moderatör olarak davet edildi`,
-    data: {
-      userId: user._id,
-      username: user.username,
-      subreddit: {
-        id: subreddit._id,
-        name: subreddit.name,
-      },
-      permissions: modPermissions,
-    },
-  });
-});
-
-/**
- * @desc    Moderatör davetini kabul et veya reddet
- * @route   PUT /api/subreddits/:subredditId/moderator-invites/:inviteId
- * @access  Davet edilen kullanıcı
- */
-const respondToModeratorInvite = asyncHandler(async (req, res, next) => {
-  const { subredditId, inviteId } = req.params;
-  const { action } = req.body;
-
-  // Parametreleri doğrula
-  if (!action || !['accept', 'decline'].includes(action)) {
-    return next(new ErrorResponse('Geçersiz işlem. "accept" veya "decline" olmalıdır', 400));
-  }
-
-  // Geçerli bir ObjectId mi kontrol et
-  if (!mongoose.Types.ObjectId.isValid(subredditId) || !mongoose.Types.ObjectId.isValid(inviteId)) {
-    return next(new ErrorResponse('Geçersiz ID formatı', 400));
-  }
-
-  // Subreddit'in varlığını kontrol et
-  const subreddit = await Subreddit.findById(subredditId);
-  if (!subreddit) {
-    return next(new ErrorResponse('Subreddit bulunamadı', 404));
-  }
-
-  // Daveti bul
-  const invite = await ModeratorInvite.findOne({
-    _id: inviteId,
-    subreddit: subredditId,
-    user: req.user._id,
-    status: 'pending',
-  });
-
-  if (!invite) {
-    return next(new ErrorResponse('Geçerli bir moderatör daveti bulunamadı', 404));
-  }
-
-  if (action === 'accept') {
-    // Kullanıcının mevcut üyeliğini kontrol et
-    let membership = await SubredditMembership.findOne({
+  if (!isOwnMembership && req.user.role !== 'admin') {
+    const modStatus = await SubredditMembership.findOne({
       user: req.user._id,
-      subreddit: subredditId,
+      subreddit: membership.subreddit._id,
+      type: { $in: ['moderator', 'admin'] },
+      status: 'active',
     });
 
-    if (membership) {
-      // Mevcut üyeliği güncelle
-      membership.type = 'moderator';
-      membership.status = 'active';
-      membership.permissions = invite.permissions;
-      membership.updatedAt = Date.now();
-      await membership.save();
-    } else {
-      // Yeni moderatör üyeliği oluştur
-      membership = await SubredditMembership.create({
-        user: req.user._id,
-        subreddit: subredditId,
-        type: 'moderator',
-        status: 'active',
-        permissions: invite.permissions,
-        joinedAt: Date.now(),
-      });
-
-      // Üye sayısını güncelle
-      await Subreddit.findByIdAndUpdate(subredditId, { $inc: { memberCount: 1 } });
+    if (!modStatus) {
+      return next(new ErrorResponse('Bu üyeliği görüntüleme yetkiniz yok', 403));
     }
-
-    // Daveti güncelle
-    invite.status = 'accepted';
-    invite.respondedAt = Date.now();
-    await invite.save();
-
-    // Moderatör logunu kaydet
-    await ModLog.create({
-      subreddit: subredditId,
-      action: 'moderator_invite_accepted',
-      moderator: invite.invitedBy,
-      target: req.user._id,
-      details: `${req.user.username} kullanıcısı moderatör davetini kabul etti`,
-      timestamp: Date.now(),
-    });
-
-    // Davet eden kişiye bildirim gönder
-    await Notification.create({
-      recipient: invite.invitedBy,
-      type: 'moderator_invite_accepted',
-      message: `${req.user.username}, r/${subreddit.name} topluluğu için moderatör davetinizi kabul etti`,
-      reference: {
-        type: 'Subreddit',
-        id: subredditId,
-      },
-      isRead: false,
-    });
-
-    res.status(200).json({
-      success: true,
-      message: `r/${subreddit.name} topluluğu için moderatör davetini kabul ettiniz`,
-      data: {
-        membership,
-        subreddit: {
-          id: subreddit._id,
-          name: subreddit.name,
-        },
-      },
-    });
-  } else {
-    // Daveti reddet
-    invite.status = 'declined';
-    invite.respondedAt = Date.now();
-    await invite.save();
-
-    // Moderatör logunu kaydet
-    await ModLog.create({
-      subreddit: subredditId,
-      action: 'moderator_invite_declined',
-      moderator: invite.invitedBy,
-      target: req.user._id,
-      details: `${req.user.username} kullanıcısı moderatör davetini reddetti`,
-      timestamp: Date.now(),
-    });
-
-    // Davet eden kişiye bildirim gönder
-    await Notification.create({
-      recipient: invite.invitedBy,
-      type: 'moderator_invite_declined',
-      message: `${req.user.username}, r/${subreddit.name} topluluğu için moderatör davetinizi reddetti`,
-      reference: {
-        type: 'Subreddit',
-        id: subredditId,
-      },
-      isRead: false,
-    });
-
-    res.status(200).json({
-      success: true,
-      message: `r/${subreddit.name} topluluğu için moderatör davetini reddettiniz`,
-      data: {
-        inviteId: invite._id,
-        subreddit: {
-          id: subreddit._id,
-          name: subreddit.name,
-        },
-      },
-    });
   }
+
+  res.status(200).json({
+    success: true,
+    data: membership,
+  });
 });
 
 module.exports = {
+  getUserMemberships,
   joinSubreddit,
   leaveSubreddit,
-  updateMembership,
-  getMembershipDetails,
-  getUserMemberships,
-  getSubredditMembers,
-  updateMembershipRequest,
+  toggleFavorite,
+  checkMembershipStatus,
   banUser,
   unbanUser,
+  getBannedUsers,
+  getPendingRequests,
+  respondToPendingRequest,
   addModerator,
   removeModerator,
   updateModeratorPermissions,
-  transferOwnership,
-  getBannedUsers,
   getModerators,
-  getUserModeratedSubreddits,
-  batchApproveMemberships,
-  inviteModerator,
-  respondToModeratorInvite,
+  getMembers,
+  getMembership,
 };

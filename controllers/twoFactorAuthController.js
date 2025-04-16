@@ -1,380 +1,252 @@
-const crypto = require('crypto');
-const speakeasy = require('speakeasy');
-const qrcode = require('qrcode');
+const User = require('../models/User');
+const TwoFactorAuth = require('../models/TwoFactorAuth');
 const asyncHandler = require('../middleware/async');
 const ErrorResponse = require('../utils/errorResponse');
-const TwoFactorAuth = require('../models/TwoFactorAuth');
-const User = require('../models/User');
-const AdminLog = require('../models/AdminLog');
+const speakeasy = require('speakeasy');
+const QRCode = require('qrcode');
+const crypto = require('crypto');
 
 /**
- * @desc    İki faktörlü doğrulama için QR kodu ve geçici secret oluştur
- * @route   GET /api/users/2fa/setup
+ * @desc    İki faktörlü kimlik doğrulama için başlangıç ayarlarını oluştur
+ * @route   POST /api/auth/2fa/setup
  * @access  Private
  */
 const setupTwoFactorAuth = asyncHandler(async (req, res, next) => {
-  const userId = req.user._id;
+  const userId = req.user.id;
 
-  // Kullanıcının mevcut 2FA durumunu kontrol et
-  const existingSetup = await TwoFactorAuth.findOne({ user: userId });
+  // Kullanıcının mevcut 2FA ayarlarını kontrol et
+  let twoFactorAuth = await TwoFactorAuth.findOne({ user: userId });
 
-  if (existingSetup && existingSetup.isEnabled) {
-    return next(
-      new ErrorResponse('İki faktörlü doğrulama zaten etkin. Önce devre dışı bırakın.', 400),
-    );
+  if (twoFactorAuth && twoFactorAuth.isEnabled) {
+    return next(new ErrorResponse('İki faktörlü kimlik doğrulama zaten etkinleştirilmiş', 400));
   }
 
-  // Geçici secret oluştur
+  // Yeni bir secret oluştur
   const secret = speakeasy.generateSecret({
     length: 20,
     name: `RedditClone:${req.user.username}`,
   });
 
-  // Eğer daha önce kurulum yapıldıysa güncelle, yoksa yeni oluştur
-  if (existingSetup) {
-    existingSetup.tempSecret = secret.base32;
-    existingSetup.updatedAt = Date.now();
-    await existingSetup.save();
-  } else {
-    await TwoFactorAuth.create({
+  // QR kodu oluştur
+  const qrCodeUrl = await QRCode.toDataURL(secret.otpauth_url);
+
+  // Eğer mevcut bir kayıt yoksa oluştur, varsa güncelle
+  if (!twoFactorAuth) {
+    twoFactorAuth = await TwoFactorAuth.create({
       user: userId,
-      tempSecret: secret.base32,
+      secret: secret.base32,
       isEnabled: false,
     });
+  } else {
+    twoFactorAuth.secret = secret.base32;
+    twoFactorAuth.isEnabled = false;
+    await twoFactorAuth.save();
   }
-
-  // QR kod URL'i oluştur
-  const qrCodeUrl = await qrcode.toDataURL(secret.otpauth_url);
 
   res.status(200).json({
     success: true,
     data: {
+      secret: secret.base32,
       qrCode: qrCodeUrl,
-      secret: secret.base32, // Manuel kurulum için
-      otpAuthUrl: secret.otpauth_url,
     },
-    message:
-      'İki faktörlü doğrulama kurulumu başlatıldı. Lütfen bir sonraki adımda doğrulama kodunu girin.',
   });
 });
 
 /**
- * @desc    Geçici secret'ı doğrula ve 2FA'yı etkinleştir
- * @route   POST /api/users/2fa/verify-setup
+ * @desc    İki faktörlü kimlik doğrulamayı etkinleştir
+ * @route   POST /api/auth/2fa/enable
  * @access  Private
  */
-const verifyAndEnableTwoFactorAuth = asyncHandler(async (req, res, next) => {
+const enableTwoFactorAuth = asyncHandler(async (req, res, next) => {
+  const userId = req.user.id;
   const { token } = req.body;
-  const userId = req.user._id;
 
   if (!token) {
     return next(new ErrorResponse('Doğrulama kodu gereklidir', 400));
   }
 
-  // Kullanıcının 2FA kurulumunu bul
-  const twoFactorAuth = await TwoFactorAuth.findOne({
-    user: userId,
-    isEnabled: false,
-    tempSecret: { $exists: true, $ne: null },
-  });
+  // Kullanıcının 2FA ayarlarını kontrol et
+  const twoFactorAuth = await TwoFactorAuth.findOne({ user: userId });
 
   if (!twoFactorAuth) {
-    return next(new ErrorResponse('Önce 2FA kurulumunu başlatmalısınız', 404));
+    return next(new ErrorResponse('Önce 2FA kurulumu yapmalısınız', 400));
+  }
+
+  if (twoFactorAuth.isEnabled) {
+    return next(new ErrorResponse('İki faktörlü kimlik doğrulama zaten etkin', 400));
   }
 
   // Token'ı doğrula
   const verified = speakeasy.totp.verify({
-    secret: twoFactorAuth.tempSecret,
-    encoding: 'base32',
-    token: token,
-    window: 1, // ±1 adım (30 saniye) tolerans
-  });
-
-  if (!verified) {
-    return next(new ErrorResponse('Geçersiz doğrulama kodu. Lütfen tekrar deneyin.', 400));
-  }
-
-  // Doğrulama başarılı, 2FA'yı etkinleştir
-  twoFactorAuth.secret = twoFactorAuth.tempSecret;
-  twoFactorAuth.tempSecret = undefined;
-  twoFactorAuth.isEnabled = true;
-  twoFactorAuth.enabledAt = Date.now();
-  twoFactorAuth.updatedAt = Date.now();
-
-  // Yedek kodlar oluştur (10 adet)
-  twoFactorAuth.backupCodes = Array(10)
-    .fill()
-    .map(() => ({
-      code: crypto.randomBytes(4).toString('hex'),
-      isUsed: false,
-    }));
-
-  await twoFactorAuth.save();
-
-  // Kullanıcı modelinde 2FA durumunu güncelle
-  await User.findByIdAndUpdate(userId, { isTwoFactorEnabled: true });
-
-  // Güvenlik log kaydı tut
-  await AdminLog.create({
-    user: userId,
-    action: '2fa_enabled',
-    details: 'İki faktörlü doğrulama etkinleştirildi',
-    ip: req.ip,
-  });
-
-  // Yedek kodları döndür
-  const backupCodes = twoFactorAuth.backupCodes.map((item) => item.code);
-
-  res.status(200).json({
-    success: true,
-    message: 'İki faktörlü doğrulama başarıyla etkinleştirildi',
-    data: {
-      isEnabled: true,
-      backupCodes,
-    },
-  });
-});
-
-/**
- * @desc    İki faktörlü doğrulama ile giriş doğrulama
- * @route   POST /api/auth/2fa/verify
- * @access  Public (token gerekir)
- */
-const verifyTwoFactorAuthToken = asyncHandler(async (req, res, next) => {
-  const { token, userId, tempAuthToken } = req.body;
-
-  if (!token || !userId || !tempAuthToken) {
-    return next(new ErrorResponse('Token, kullanıcı ID ve geçici oturum tokeni gereklidir', 400));
-  }
-
-  // Geçici oturum tokenini doğrula
-  // NOT: Bu kısım auth middleware ile entegre edilmelidir
-
-  // Kullanıcının 2FA bilgisini bul
-  const twoFactorAuth = await TwoFactorAuth.findOne({
-    user: userId,
-    isEnabled: true,
-  });
-
-  if (!twoFactorAuth) {
-    return next(new ErrorResponse('Kullanıcı için 2FA bulunamadı', 404));
-  }
-
-  // TOTP kodunu doğrula
-  const verified = speakeasy.totp.verify({
     secret: twoFactorAuth.secret,
     encoding: 'base32',
     token: token,
-    window: 1,
+    window: 1, // 30 saniyelik bir pencere içinde -1, 0, +1 adımlarını kabul eder
   });
 
   if (!verified) {
-    // Başarısız giriş denemesini log'la
-    await AdminLog.create({
-      user: userId,
-      action: '2fa_verification_failed',
-      details: 'Başarısız 2FA doğrulama denemesi',
-      ip: req.ip,
-    });
-
     return next(new ErrorResponse('Geçersiz doğrulama kodu', 400));
   }
 
-  // Son kullanımı güncelle
-  twoFactorAuth.lastUsed = Date.now();
-  twoFactorAuth.updatedAt = Date.now();
+  // Yedek kodları oluştur
+  const backupCodes = generateBackupCodes(10);
+
+  // 2FA'yı etkinleştir
+  twoFactorAuth.isEnabled = true;
+  twoFactorAuth.backupCodes = backupCodes.map((code) => ({
+    code: code,
+    isUsed: false,
+  }));
+  twoFactorAuth.lastUsed = new Date();
   await twoFactorAuth.save();
-
-  // Başarılı girişi log'la
-  await AdminLog.create({
-    user: userId,
-    action: '2fa_verification_success',
-    details: '2FA doğrulama başarılı',
-    ip: req.ip,
-  });
-
-  // AuthController ile entegre edilecek - JWT token üretimi burada yapılabilir
 
   res.status(200).json({
     success: true,
-    message: 'İki faktörlü doğrulama başarılı',
     data: {
-      // JWT token ve kullanıcı bilgileri burada döndürülecek
+      isEnabled: true,
+      backupCodes: backupCodes.map((code) => code.replace(/(.{4})(.{4})/, '$1-$2')), // Format: XXXX-XXXX
     },
+    message:
+      'İki faktörlü kimlik doğrulama başarıyla etkinleştirildi. Yedek kodlarınızı güvenli bir yerde saklayın.',
   });
 });
 
 /**
- * @desc    Yedek kod ile giriş doğrulama
- * @route   POST /api/auth/2fa/verify-backup
- * @access  Public (token gerekir)
- */
-const verifyBackupCode = asyncHandler(async (req, res, next) => {
-  const { backupCode, userId, tempAuthToken } = req.body;
-
-  if (!backupCode || !userId || !tempAuthToken) {
-    return next(
-      new ErrorResponse('Yedek kod, kullanıcı ID ve geçici oturum tokeni gereklidir', 400),
-    );
-  }
-
-  // Geçici oturum tokenini doğrula
-  // NOT: Bu kısım auth middleware ile entegre edilmelidir
-
-  // Kullanıcının 2FA bilgisini bul
-  const twoFactorAuth = await TwoFactorAuth.findOne({
-    user: userId,
-    isEnabled: true,
-  });
-
-  if (!twoFactorAuth) {
-    return next(new ErrorResponse('Kullanıcı için 2FA bulunamadı', 404));
-  }
-
-  // Yedek kod geçerli mi kontrol et
-  const backupCodeIndex = twoFactorAuth.backupCodes.findIndex(
-    (item) => item.code === backupCode && !item.isUsed,
-  );
-
-  if (backupCodeIndex === -1) {
-    // Başarısız giriş denemesini log'la
-    await AdminLog.create({
-      user: userId,
-      action: '2fa_backup_code_verification_failed',
-      details: 'Geçersiz yedek kod ile başarısız doğrulama denemesi',
-      ip: req.ip,
-    });
-
-    return next(new ErrorResponse('Geçersiz veya kullanılmış yedek kod', 400));
-  }
-
-  // Yedek kodu kullanılmış olarak işaretle
-  twoFactorAuth.backupCodes[backupCodeIndex].isUsed = true;
-  twoFactorAuth.backupCodes[backupCodeIndex].usedAt = Date.now();
-
-  // Son kullanımı güncelle
-  twoFactorAuth.lastUsed = Date.now();
-  twoFactorAuth.updatedAt = Date.now();
-
-  await twoFactorAuth.save();
-
-  // Başarılı girişi log'la
-  await AdminLog.create({
-    user: userId,
-    action: '2fa_backup_code_verification_success',
-    details: 'Yedek kod ile başarılı doğrulama',
-    ip: req.ip,
-  });
-
-  // AuthController ile entegre edilecek - JWT token üretimi burada yapılabilir
-
-  res.status(200).json({
-    success: true,
-    message: 'Yedek kod doğrulama başarılı',
-    data: {
-      // JWT token ve kullanıcı bilgileri burada döndürülecek
-    },
-  });
-});
-
-/**
- * @desc    İki faktörlü doğrulamayı devre dışı bırak
- * @route   POST /api/users/2fa/disable
+ * @desc    İki faktörlü kimlik doğrulamayı devre dışı bırak
+ * @route   POST /api/auth/2fa/disable
  * @access  Private
  */
 const disableTwoFactorAuth = asyncHandler(async (req, res, next) => {
+  const userId = req.user.id;
   const { token, password } = req.body;
-  const userId = req.user._id;
 
-  if (!password) {
-    return next(new ErrorResponse('Şifre gereklidir', 400));
+  if (!token && !password) {
+    return next(new ErrorResponse('Doğrulama kodu veya şifre gereklidir', 400));
   }
 
-  // Kullanıcı şifresini doğrula
+  // Kullanıcıyı ve 2FA ayarlarını kontrol et
   const user = await User.findById(userId).select('+password');
+  const twoFactorAuth = await TwoFactorAuth.findOne({ user: userId });
 
-  if (!user) {
-    return next(new ErrorResponse('Kullanıcı bulunamadı', 404));
+  if (!twoFactorAuth || !twoFactorAuth.isEnabled) {
+    return next(new ErrorResponse('İki faktörlü kimlik doğrulama zaten devre dışı', 400));
   }
 
-  const isPasswordMatch = await user.matchPassword(password);
+  // Şifre veya token ile doğrulama yap
+  let isVerified = false;
 
-  if (!isPasswordMatch) {
-    return next(new ErrorResponse('Geçersiz şifre', 401));
-  }
-
-  // Kullanıcının 2FA bilgisini bul
-  const twoFactorAuth = await TwoFactorAuth.findOne({
-    user: userId,
-    isEnabled: true,
-  });
-
-  if (!twoFactorAuth) {
-    return next(new ErrorResponse('İki faktörlü doğrulama zaten devre dışı', 400));
-  }
-
-  // 2FA kodunu da doğrula (ekstra güvenlik için)
-  if (token) {
-    const verified = speakeasy.totp.verify({
+  if (password) {
+    // Şifre ile doğrulama
+    const isMatch = await user.matchPassword(password);
+    if (!isMatch) {
+      return next(new ErrorResponse('Geçersiz şifre', 401));
+    }
+    isVerified = true;
+  } else if (token) {
+    // Token ile doğrulama
+    isVerified = speakeasy.totp.verify({
       secret: twoFactorAuth.secret,
       encoding: 'base32',
       token: token,
       window: 1,
     });
+  }
 
-    if (!verified) {
-      return next(new ErrorResponse('Geçersiz doğrulama kodu', 400));
-    }
+  if (!isVerified) {
+    return next(new ErrorResponse('Doğrulama başarısız', 401));
   }
 
   // 2FA'yı devre dışı bırak
-  await TwoFactorAuth.findByIdAndDelete(twoFactorAuth._id);
-
-  // Kullanıcı modelini güncelle
-  user.isTwoFactorEnabled = false;
-  await user.save();
-
-  // Güvenlik log kaydı tut
-  await AdminLog.create({
-    user: userId,
-    action: '2fa_disabled',
-    details: 'İki faktörlü doğrulama devre dışı bırakıldı',
-    ip: req.ip,
-  });
+  twoFactorAuth.isEnabled = false;
+  twoFactorAuth.backupCodes = [];
+  await twoFactorAuth.save();
 
   res.status(200).json({
     success: true,
-    message: 'İki faktörlü doğrulama başarıyla devre dışı bırakıldı',
-    data: {
-      isTwoFactorEnabled: false,
-    },
+    message: 'İki faktörlü kimlik doğrulama başarıyla devre dışı bırakıldı',
   });
 });
 
 /**
- * @desc    Kullanıcının 2FA durumunu kontrol et
- * @route   GET /api/users/2fa/status
+ * @desc    Giriş sırasında 2FA doğrulaması
+ * @route   POST /api/auth/2fa/verify
+ * @access  Public
+ */
+const verifyTwoFactorAuth = asyncHandler(async (req, res, next) => {
+  const { userId, token, backupCode } = req.body;
+
+  if (!userId) {
+    return next(new ErrorResponse('Kullanıcı kimliği gereklidir', 400));
+  }
+
+  if (!token && !backupCode) {
+    return next(new ErrorResponse('Doğrulama kodu veya yedek kod gereklidir', 400));
+  }
+
+  // Kullanıcı ve 2FA ayarlarını kontrol et
+  const user = await User.findById(userId);
+  if (!user) {
+    return next(new ErrorResponse('Kullanıcı bulunamadı', 404));
+  }
+
+  const twoFactorAuth = await TwoFactorAuth.findOne({ user: userId });
+  if (!twoFactorAuth || !twoFactorAuth.isEnabled) {
+    return next(new ErrorResponse('Bu kullanıcı için 2FA etkin değil', 400));
+  }
+
+  let isVerified = false;
+
+  if (token) {
+    // TOTP ile doğrulama
+    isVerified = speakeasy.totp.verify({
+      secret: twoFactorAuth.secret,
+      encoding: 'base32',
+      token: token,
+      window: 1,
+    });
+  } else if (backupCode) {
+    // Yedek kod ile doğrulama
+    const formattedBackupCode = backupCode.replace('-', ''); // Format: XXXXXXXX
+    const backupCodeIndex = twoFactorAuth.backupCodes.findIndex(
+      (code) => code.code === formattedBackupCode && !code.isUsed,
+    );
+
+    if (backupCodeIndex !== -1) {
+      // Yedek kodu kullanıldı olarak işaretle
+      twoFactorAuth.backupCodes[backupCodeIndex].isUsed = true;
+      isVerified = true;
+    }
+  }
+
+  if (!isVerified) {
+    return next(new ErrorResponse('Geçersiz doğrulama kodu', 401));
+  }
+
+  // Son kullanma zamanını güncelle
+  twoFactorAuth.lastUsed = new Date();
+  await twoFactorAuth.save();
+
+  // Kullanıcı oturumunu oluştur
+  sendTokenResponse(user, 200, res);
+});
+
+/**
+ * @desc    2FA durumunu kontrol et
+ * @route   GET /api/auth/2fa/status
  * @access  Private
  */
 const getTwoFactorAuthStatus = asyncHandler(async (req, res, next) => {
-  const userId = req.user._id;
+  const userId = req.user.id;
 
-  // Kullanıcının 2FA bilgisini bul
-  const twoFactorAuth = await TwoFactorAuth.findOne({
-    user: userId,
-  });
+  const twoFactorAuth = await TwoFactorAuth.findOne({ user: userId });
 
   const status = {
-    isEnabled: false,
-    enabledAt: null,
-    lastUsed: null,
+    isEnabled: twoFactorAuth ? twoFactorAuth.isEnabled : false,
+    hasBackupCodes: twoFactorAuth
+      ? twoFactorAuth.backupCodes && twoFactorAuth.backupCodes.length > 0
+      : false,
+    lastUsed: twoFactorAuth ? twoFactorAuth.lastUsed : null,
   };
-
-  if (twoFactorAuth && twoFactorAuth.isEnabled) {
-    status.isEnabled = true;
-    status.enabledAt = twoFactorAuth.enabledAt;
-    status.lastUsed = twoFactorAuth.lastUsed;
-  }
 
   res.status(200).json({
     success: true,
@@ -383,211 +255,283 @@ const getTwoFactorAuthStatus = asyncHandler(async (req, res, next) => {
 });
 
 /**
- * @desc    Yeni yedek kodlar oluştur
- * @route   POST /api/users/2fa/backup-codes/regenerate
+ * @desc    Yeni yedek kodları oluştur
+ * @route   POST /api/auth/2fa/backup-codes
  * @access  Private
  */
 const regenerateBackupCodes = asyncHandler(async (req, res, next) => {
-  const { token, password } = req.body;
-  const userId = req.user._id;
+  const userId = req.user.id;
+  const { token } = req.body;
+
+  if (!token) {
+    return next(new ErrorResponse('Doğrulama kodu gereklidir', 400));
+  }
+
+  const twoFactorAuth = await TwoFactorAuth.findOne({ user: userId });
+
+  if (!twoFactorAuth || !twoFactorAuth.isEnabled) {
+    return next(new ErrorResponse('İki faktörlü kimlik doğrulama etkin değil', 400));
+  }
+
+  // Token doğrulama
+  const verified = speakeasy.totp.verify({
+    secret: twoFactorAuth.secret,
+    encoding: 'base32',
+    token: token,
+    window: 1,
+  });
+
+  if (!verified) {
+    return next(new ErrorResponse('Geçersiz doğrulama kodu', 401));
+  }
+
+  // Yeni yedek kodlar oluştur
+  const backupCodes = generateBackupCodes(10);
+
+  // Yedek kodları güncelle
+  twoFactorAuth.backupCodes = backupCodes.map((code) => ({
+    code: code,
+    isUsed: false,
+  }));
+
+  await twoFactorAuth.save();
+
+  res.status(200).json({
+    success: true,
+    data: {
+      backupCodes: backupCodes.map((code) => code.replace(/(.{4})(.{4})/, '$1-$2')),
+    },
+    message: 'Yeni yedek kodlar başarıyla oluşturuldu. Bu kodları güvenli bir yerde saklayın.',
+  });
+});
+
+/**
+ * @desc    2FA secret anahtarını sıfırla (güvenlik ihlali durumunda)
+ * @route   POST /api/auth/2fa/reset
+ * @access  Private
+ */
+const resetTwoFactorAuth = asyncHandler(async (req, res, next) => {
+  const userId = req.user.id;
+  const { password } = req.body;
 
   if (!password) {
     return next(new ErrorResponse('Şifre gereklidir', 400));
   }
 
-  // Kullanıcı şifresini doğrula
+  // Kullanıcıyı kontrol et
   const user = await User.findById(userId).select('+password');
 
+  // Şifre doğrulama
+  const isMatch = await user.matchPassword(password);
+  if (!isMatch) {
+    return next(new ErrorResponse('Geçersiz şifre', 401));
+  }
+
+  // 2FA kaydını bul
+  const twoFactorAuth = await TwoFactorAuth.findOne({ user: userId });
+
+  if (!twoFactorAuth) {
+    return next(new ErrorResponse('İki faktörlü kimlik doğrulama kaydı bulunamadı', 404));
+  }
+
+  // Yeni bir secret oluştur
+  const secret = speakeasy.generateSecret({
+    length: 20,
+    name: `RedditClone:${req.user.username}`,
+  });
+
+  // QR kodu oluştur
+  const qrCodeUrl = await QRCode.toDataURL(secret.otpauth_url);
+
+  // 2FA kaydını güncelle
+  twoFactorAuth.secret = secret.base32;
+  twoFactorAuth.isEnabled = false;
+  twoFactorAuth.backupCodes = [];
+  await twoFactorAuth.save();
+
+  res.status(200).json({
+    success: true,
+    data: {
+      secret: secret.base32,
+      qrCode: qrCodeUrl,
+    },
+    message:
+      '2FA anahtarı başarıyla sıfırlandı. Yeniden etkinleştirmek için yeni QR kodunu taratın.',
+  });
+});
+
+// ==================== HELPER FUNCTIONS ====================
+
+/**
+ * Yedek kodlar oluştur
+ * @param {Number} count - Kaç adet kod oluşturulacak
+ * @returns {Array} - Yedek kodlar listesi
+ */
+const generateBackupCodes = (count = 10) => {
+  const codes = [];
+  for (let i = 0; i < count; i++) {
+    // 8 karakterlik alfanumerik kod oluştur
+    const code = crypto.randomBytes(4).toString('hex').toUpperCase();
+    codes.push(code);
+  }
+  return codes;
+};
+
+/**
+ * Token oluşturup cookie içinde gönder
+ * @param {Object} user - Kullanıcı objesi
+ * @param {Number} statusCode - HTTP status kodu
+ * @param {Object} res - Response objesi
+ */
+const sendTokenResponse = (user, statusCode, res) => {
+  // Token oluştur
+  const token = user.getSignedJwtToken();
+
+  const options = {
+    expires: new Date(Date.now() + process.env.JWT_COOKIE_EXPIRE * 24 * 60 * 60 * 1000),
+    httpOnly: true,
+  };
+
+  if (process.env.NODE_ENV === 'production') {
+    options.secure = true;
+  }
+
+  // Kullanıcı bilgilerini dön, hassas bilgileri çıkar
+  const userData = {
+    id: user._id,
+    username: user.username,
+    email: user.email,
+    profilePicture: user.profilePicture,
+    createdAt: user.createdAt,
+    lastLogin: user.lastLogin,
+    accountStatus: user.accountStatus,
+    twoFactorAuthEnabled: true, // 2FA doğrulaması geçildiği için true
+  };
+
+  res.status(statusCode).cookie('token', token, options).json({
+    success: true,
+    token,
+    data: userData,
+  });
+};
+
+/**
+ * @desc    2FA durumunu kontrol et (Giriş akışı için)
+ * @route   POST /api/auth/2fa/check
+ * @access  Public
+ */
+const checkTwoFactorAuth = asyncHandler(async (req, res, next) => {
+  const { userId } = req.body;
+
+  if (!userId) {
+    return next(new ErrorResponse('Kullanıcı kimliği gereklidir', 400));
+  }
+
+  // Kullanıcı ve 2FA ayarlarını kontrol et
+  const user = await User.findById(userId);
   if (!user) {
     return next(new ErrorResponse('Kullanıcı bulunamadı', 404));
   }
 
-  const isPasswordMatch = await user.matchPassword(password);
+  const twoFactorAuth = await TwoFactorAuth.findOne({ user: userId });
 
-  if (!isPasswordMatch) {
-    return next(new ErrorResponse('Geçersiz şifre', 401));
-  }
-
-  // Kullanıcının 2FA bilgisini bul
-  const twoFactorAuth = await TwoFactorAuth.findOne({
-    user: userId,
-    isEnabled: true,
-  });
-
-  if (!twoFactorAuth) {
-    return next(new ErrorResponse('İki faktörlü doğrulama etkin değil', 400));
-  }
-
-  // 2FA kodunu da doğrula (ekstra güvenlik için)
-  if (token) {
-    const verified = speakeasy.totp.verify({
-      secret: twoFactorAuth.secret,
-      encoding: 'base32',
-      token: token,
-      window: 1,
+  if (!twoFactorAuth || !twoFactorAuth.isEnabled) {
+    // 2FA etkin değilse direkt oturum aç
+    sendTokenResponse(user, 200, res);
+  } else {
+    // 2FA etkinse doğrulama gerektiğini bildir
+    res.status(200).json({
+      success: true,
+      requires2FA: true,
+      userId: user._id,
+      message: 'İki faktörlü kimlik doğrulama gerekiyor',
     });
-
-    if (!verified) {
-      return next(new ErrorResponse('Geçersiz doğrulama kodu', 400));
-    }
   }
-
-  // Yeni yedek kodlar oluştur
-  twoFactorAuth.backupCodes = Array(10)
-    .fill()
-    .map(() => ({
-      code: crypto.randomBytes(4).toString('hex'),
-      isUsed: false,
-    }));
-
-  twoFactorAuth.updatedAt = Date.now();
-  await twoFactorAuth.save();
-
-  // Güvenlik log kaydı tut
-  await AdminLog.create({
-    user: userId,
-    action: '2fa_backup_codes_regenerated',
-    details: 'Yedek kodlar yeniden oluşturuldu',
-    ip: req.ip,
-  });
-
-  // Yedek kodları döndür
-  const backupCodes = twoFactorAuth.backupCodes.map((item) => item.code);
-
-  res.status(200).json({
-    success: true,
-    message: 'Yedek kodlar başarıyla yeniden oluşturuldu',
-    data: {
-      backupCodes,
-    },
-  });
 });
 
 /**
- * @desc    Yedek kodları getir
- * @route   GET /api/users/2fa/backup-codes
+ * @desc    Mevcut 2FA yedek kodlarını getir
+ * @route   GET /api/auth/2fa/backup-codes
  * @access  Private
  */
 const getBackupCodes = asyncHandler(async (req, res, next) => {
-  const userId = req.user._id;
+  const userId = req.user.id;
+  const { password } = req.body;
 
-  // Kullanıcının 2FA bilgisini bul
-  const twoFactorAuth = await TwoFactorAuth.findOne({
-    user: userId,
-    isEnabled: true,
-  });
-
-  if (!twoFactorAuth) {
-    return next(new ErrorResponse('İki faktörlü doğrulama etkin değil', 400));
+  if (!password) {
+    return next(new ErrorResponse('Şifre gereklidir', 400));
   }
 
-  // Yedek kodları filtrele ve sadece kullanılmamış olanları döndür
-  const unusedBackupCodes = twoFactorAuth.backupCodes
-    .filter((item) => !item.isUsed)
-    .map((item) => item.code);
+  // Kullanıcıyı kontrol et
+  const user = await User.findById(userId).select('+password');
 
-  // Kullanılmış yedek kod sayısını hesapla
-  const usedBackupCodesCount = twoFactorAuth.backupCodes.filter((item) => item.isUsed).length;
+  // Şifre doğrulama
+  const isMatch = await user.matchPassword(password);
+  if (!isMatch) {
+    return next(new ErrorResponse('Geçersiz şifre', 401));
+  }
+
+  // 2FA yedek kodlarını al
+  const twoFactorAuth = await TwoFactorAuth.findOne({ user: userId });
+
+  if (!twoFactorAuth || !twoFactorAuth.isEnabled) {
+    return next(new ErrorResponse('İki faktörlü kimlik doğrulama etkin değil', 400));
+  }
+
+  // Kullanılmamış yedek kodları filtrele
+  const unusedBackupCodes = twoFactorAuth.backupCodes
+    .filter((code) => !code.isUsed)
+    .map((code) => code.code.replace(/(.{4})(.{4})/, '$1-$2'));
 
   res.status(200).json({
     success: true,
     data: {
       backupCodes: unusedBackupCodes,
-      usedCount: usedBackupCodesCount,
-      totalCount: twoFactorAuth.backupCodes.length,
+      total: unusedBackupCodes.length,
     },
   });
 });
 
 /**
- * @desc    Recovery URL ile 2FA sıfırlama (Admin için)
- * @route   POST /api/admin/users/:userId/2fa/reset
- * @access  Admin
+ * @desc    Kullanıcının 2FA aktivite günlüğünü getir
+ * @route   GET /api/auth/2fa/activity
+ * @access  Private
  */
-const resetUserTwoFactorAuth = asyncHandler(async (req, res, next) => {
-  const { userId } = req.params;
+const getTwoFactorAuthActivity = asyncHandler(async (req, res, next) => {
+  const userId = req.user.id;
 
-  // Admin kontrolü middleware tarafından yapılıyor olmalı
+  // 2FA bilgilerini getir
+  const twoFactorAuth = await TwoFactorAuth.findOne({ user: userId });
 
-  // Kullanıcıyı kontrol et
-  const user = await User.findById(userId);
-
-  if (!user) {
-    return next(new ErrorResponse('Kullanıcı bulunamadı', 404));
+  if (!twoFactorAuth) {
+    return next(new ErrorResponse('İki faktörlü kimlik doğrulama kaydı bulunamadı', 404));
   }
 
-  // 2FA'yı kaldır
-  await TwoFactorAuth.findOneAndDelete({ user: userId });
-
-  // Kullanıcı modelini güncelle
-  user.isTwoFactorEnabled = false;
-  await user.save();
-
-  // Admin log kaydı tut
-  await AdminLog.create({
-    user: req.user._id,
-    targetUser: userId,
-    action: 'admin_reset_2fa',
-    details: `Kullanıcı ${user.username} için 2FA sıfırlandı`,
-    ip: req.ip,
-  });
+  // Aktivite bilgilerini dön
+  const activityInfo = {
+    isEnabled: twoFactorAuth.isEnabled,
+    lastUsed: twoFactorAuth.lastUsed,
+    createdAt: twoFactorAuth.createdAt,
+    updatedAt: twoFactorAuth.updatedAt,
+    backupCodesCount: twoFactorAuth.backupCodes.length,
+    backupCodesUsed: twoFactorAuth.backupCodes.filter((code) => code.isUsed).length,
+  };
 
   res.status(200).json({
     success: true,
-    message: `Kullanıcı ${user.username} için iki faktörlü doğrulama sıfırlandı`,
-    data: {
-      userId,
-      username: user.username,
-      isTwoFactorEnabled: false,
-    },
-  });
-});
-
-/**
- * @desc    Kullanıcının doğrulama adımına gerek duyup duymadığını kontrol et
- * @route   POST /api/auth/2fa/needed
- * @access  Public (first auth token required)
- */
-const checkIfTwoFactorAuthNeeded = asyncHandler(async (req, res, next) => {
-  const { userId } = req.body;
-
-  if (!userId) {
-    return next(new ErrorResponse('Kullanıcı ID gereklidir', 400));
-  }
-
-  // Kullanıcıyı kontrol et
-  const user = await User.findById(userId);
-
-  if (!user) {
-    return next(new ErrorResponse('Kullanıcı bulunamadı', 404));
-  }
-
-  // 2FA durumunu kontrol et
-  const twoFactorAuth = await TwoFactorAuth.findOne({
-    user: userId,
-    isEnabled: true,
-  });
-
-  const isTwoFactorEnabled = !!twoFactorAuth;
-
-  res.status(200).json({
-    success: true,
-    data: {
-      isTwoFactorEnabled,
-      username: user.username,
-    },
+    data: activityInfo,
   });
 });
 
 module.exports = {
   setupTwoFactorAuth,
-  verifyAndEnableTwoFactorAuth,
-  verifyTwoFactorAuthToken,
-  verifyBackupCode,
+  enableTwoFactorAuth,
   disableTwoFactorAuth,
+  verifyTwoFactorAuth,
   getTwoFactorAuthStatus,
   regenerateBackupCodes,
+  resetTwoFactorAuth,
+  checkTwoFactorAuth,
   getBackupCodes,
-  resetUserTwoFactorAuth,
-  checkIfTwoFactorAuthNeeded,
+  getTwoFactorAuthActivity,
 };

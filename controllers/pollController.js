@@ -1,1211 +1,1502 @@
-const mongoose = require('mongoose');
-const { Poll, Vote, Post, User, Subreddit, ModLog, Notification } = require('../models');
-const { validatePollOptions, checkUserPermissions } = require('../utils/validators');
-const ErrorResponse = require('../utils/errorResponse');
+const Poll = require('../models/Poll');
+const PollOption = require('../models/PollOption');
+const PollVote = require('../models/PollVote');
+const Post = require('../models/Post');
+const User = require('../models/User');
 const asyncHandler = require('../middleware/async');
+const ErrorResponse = require('../utils/errorResponse');
+const mongoose = require('mongoose');
 
 /**
  * @desc    Anket oluştur
- * @route   POST /api/polls
+ * @route   POST /api/posts/:postId/polls
  * @access  Private
  */
-const createPoll = asyncHandler(async (req, res) => {
-  const {
-    question,
-    options,
-    subredditId,
-    duration,
-    allowMultipleVotes,
-    allowAddingOptions,
-    hideResultsUntilClosed,
-    postId,
-    minimumAccountAge,
-  } = req.body;
+const createPoll = asyncHandler(async (req, res, next) => {
+  const { postId } = req.params;
+  const { options, endDate, allowMultipleVotes = false, maxSelections = 1 } = req.body;
 
-  // Zorunlu alanları kontrol et
-  if (!question || !options || !Array.isArray(options) || options.length < 2) {
-    return res.status(400).json({
-      success: false,
-      message: 'Lütfen bir soru ve en az iki seçenek giriniz',
-    });
+  // ID formatı kontrolü
+  if (!mongoose.Types.ObjectId.isValid(postId)) {
+    return next(new ErrorResponse('Geçersiz post ID formatı', 400));
   }
 
-  // Seçenek sayısını kontrol et
+  // Post'u kontrol et
+  const post = await Post.findById(postId);
+
+  if (!post) {
+    return next(new ErrorResponse('Post bulunamadı', 404));
+  }
+
+  // Post sahibi kontrolü
+  if (post.author.toString() !== req.user._id.toString()) {
+    return next(new ErrorResponse('Sadece post sahibi anket ekleyebilir', 403));
+  }
+
+  // Post türü kontrolü
+  if (post.type !== 'poll') {
+    return next(new ErrorResponse('Bu post anket türünde değil', 400));
+  }
+
+  // Zaten anket var mı kontrol et
+  const existingPoll = await Poll.findOne({ post: postId });
+
+  if (existingPoll) {
+    return next(new ErrorResponse('Bu post için zaten bir anket oluşturulmuş', 400));
+  }
+
+  // Anket seçeneklerini doğrula
+  if (!options || !Array.isArray(options) || options.length < 2) {
+    return next(new ErrorResponse('En az 2 anket seçeneği gereklidir', 400));
+  }
+
   if (options.length > 10) {
-    return res.status(400).json({
-      success: false,
-      message: 'En fazla 10 seçenek eklenebilir',
-    });
+    return next(new ErrorResponse('Bir ankette en fazla 10 seçenek olabilir', 400));
   }
 
-  // Seçeneklerin benzersiz olduğunu kontrol et
-  const uniqueOptions = [...new Set(options.map((opt) => opt.trim()))];
-  if (uniqueOptions.length !== options.length) {
-    return res.status(400).json({
-      success: false,
-      message: 'Seçenekler benzersiz olmalıdır',
-    });
+  // Boş seçenek var mı kontrol et
+  if (options.some((option) => !option.trim())) {
+    return next(new ErrorResponse('Boş anket seçeneği olamaz', 400));
   }
 
-  // Anket süresini kontrol et
-  const maxDuration = 7 * 24 * 60 * 60 * 1000; // 7 gün (ms)
-  const pollDuration = duration ? parseInt(duration) : maxDuration;
+  // Bitiş tarihini doğrula
+  const parsedEndDate = new Date(endDate);
 
-  if (pollDuration <= 0 || pollDuration > maxDuration) {
-    return res.status(400).json({
-      success: false,
-      message: `Anket süresi 1 dakika ile 7 gün arasında olmalıdır`,
-    });
+  if (isNaN(parsedEndDate.getTime())) {
+    return next(new ErrorResponse('Geçersiz bitiş tarihi formatı', 400));
   }
 
-  // Subreddit'i kontrol et
-  if (subredditId) {
-    if (!mongoose.Types.ObjectId.isValid(subredditId)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Geçersiz subreddit ID formatı',
-      });
-    }
+  const now = new Date();
+  const maxDuration = 7 * 24 * 60 * 60 * 1000; // 7 gün (milisaniye)
 
-    const subreddit = await Subreddit.findById(subredditId);
-    if (!subreddit) {
-      return res.status(404).json({
-        success: false,
-        message: 'Subreddit bulunamadı',
-      });
-    }
+  if (parsedEndDate <= now) {
+    return next(new ErrorResponse('Bitiş tarihi gelecekte olmalıdır', 400));
+  }
 
-    // Kullanıcının bu subreddit'e anket oluşturma izni var mı?
-    const hasPermission = await checkUserPermissions(
-      req.user._id,
-      subredditId,
-      'post',
-      'create_poll',
+  if (parsedEndDate > new Date(now.getTime() + maxDuration)) {
+    return next(new ErrorResponse('Anket süresi en fazla 7 gün olabilir', 400));
+  }
+
+  // Maksimum seçim sayısını doğrula
+  if (maxSelections < 1 || maxSelections > 6) {
+    return next(new ErrorResponse('Maksimum seçim sayısı 1-6 arasında olmalıdır', 400));
+  }
+
+  if (allowMultipleVotes && maxSelections > options.length) {
+    return next(new ErrorResponse('Maksimum seçim sayısı, seçenek sayısından fazla olamaz', 400));
+  }
+
+  // Transaction başlat
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
+  try {
+    // Seçenekleri oluştur
+    const pollOptions = await PollOption.create(
+      options.map((text) => ({
+        text,
+        votes: 0,
+        addedBy: req.user._id,
+      })),
+      { session },
     );
-    if (!hasPermission) {
-      return res.status(403).json({
-        success: false,
-        message: "Bu subreddit'e anket oluşturma izniniz yok",
-      });
-    }
-  }
 
-  // Post ID verilmişse, postun varlığını ve sahipliğini kontrol et
-  let post = null;
-  if (postId) {
-    if (!mongoose.Types.ObjectId.isValid(postId)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Geçersiz post ID formatı',
-      });
-    }
+    // Anket oluştur
+    const poll = await Poll.create(
+      [
+        {
+          post: postId,
+          options: pollOptions.map((option) => option._id),
+          totalVotes: 0,
+          endDate: parsedEndDate,
+          allowMultipleVotes,
+          maxSelections,
+        },
+      ],
+      { session },
+    );
 
-    post = await Post.findById(postId);
-    if (!post) {
-      return res.status(404).json({
-        success: false,
-        message: 'İlişkilendirmek istediğiniz gönderi bulunamadı',
-      });
-    }
+    await session.commitTransaction();
 
-    // Sadece gönderi sahibi veya moderatör ekleyebilir
-    if (!post.author.equals(req.user._id) && req.user.role !== 'admin') {
-      // Moderatör kontrolü
-      const isModerator =
-        subredditId &&
-        (await checkUserPermissions(req.user._id, subredditId, 'post', 'manage_any'));
-      if (!isModerator) {
-        return res.status(403).json({
-          success: false,
-          message: 'Bu gönderiye anket ekleme izniniz yok',
-        });
-      }
-    }
+    // Tam anket bilgilerini getir
+    const fullPoll = await Poll.findById(poll[0]._id).populate('options');
 
-    // Postun zaten bir anketi var mı?
-    if (post.poll) {
-      return res.status(400).json({
-        success: false,
-        message: 'Bu gönderiye zaten bir anket eklenmiş',
-      });
-    }
-  }
-
-  // Anket seçeneklerini hazırla
-  const pollOptions = options.map((option) => ({
-    text: option.trim(),
-    votes: 0,
-  }));
-
-  // Anket bitiş zamanını hesapla
-  const endDate = new Date(Date.now() + pollDuration);
-
-  // Anket oluştur
-  const poll = await Poll.create({
-    question: question.trim(),
-    options: pollOptions,
-    creator: req.user._id,
-    subreddit: subredditId || null,
-    endDate,
-    status: 'active',
-    allowMultipleVotes: !!allowMultipleVotes,
-    allowAddingOptions: !!allowAddingOptions,
-    hideResultsUntilClosed: !!hideResultsUntilClosed,
-    minimumAccountAge: minimumAccountAge || 0,
-    totalVotes: 0,
-  });
-
-  // Eğer postId verilmişse, posta anketi ekle
-  if (post) {
-    post.poll = poll._id;
-    await post.save();
-  }
-
-  // Subreddit'e moderasyon kaydı ekle
-  if (subredditId) {
-    await ModLog.create({
-      subreddit: subredditId,
-      user: req.user._id,
-      action: 'poll_created',
-      details: `"${question.slice(0, 50)}" anketi oluşturuldu`,
-      targetType: 'poll',
-      targetId: poll._id,
+    res.status(201).json({
+      success: true,
+      data: fullPoll,
     });
+  } catch (error) {
+    await session.abortTransaction();
+    return next(new ErrorResponse('Anket oluşturulurken bir hata oluştu', 500));
+  } finally {
+    session.endSession();
   }
-
-  res.status(201).json({
-    success: true,
-    data: poll,
-    post: post
-      ? {
-          _id: post._id,
-          title: post.title,
-        }
-      : null,
-  });
 });
 
 /**
- * @desc    Anket detayını getir
+ * @desc    Bir anketi getir
  * @route   GET /api/polls/:id
  * @access  Public
  */
-const getPoll = asyncHandler(async (req, res) => {
+const getPoll = asyncHandler(async (req, res, next) => {
   const { id } = req.params;
 
+  // ID formatı kontrolü
   if (!mongoose.Types.ObjectId.isValid(id)) {
-    return res.status(400).json({
-      success: false,
-      message: 'Geçersiz anket ID formatı',
-    });
+    return next(new ErrorResponse('Geçersiz anket ID formatı', 400));
   }
 
-  // Anket sorgusu - oyları sayarak ve kullanıcı bilgileriyle
+  // Anketi ve seçeneklerini getir
   const poll = await Poll.findById(id)
-    .populate('creator', 'username avatar')
-    .populate('subreddit', 'name title icon');
+    .populate('options')
+    .populate('post', 'title author subreddit')
+    .populate({
+      path: 'post',
+      populate: {
+        path: 'author',
+        select: 'username profilePicture',
+      },
+    })
+    .populate({
+      path: 'post',
+      populate: {
+        path: 'subreddit',
+        select: 'name',
+      },
+    });
 
   if (!poll) {
-    return res.status(404).json({
-      success: false,
-      message: 'Anket bulunamadı',
-    });
+    return next(new ErrorResponse('Anket bulunamadı', 404));
   }
 
-  // İlgili gönderiyi bul
-  const relatedPost = await Post.findOne({ poll: id }).select('_id title slug createdAt');
+  // Kullanıcının oyları
+  let userVotes = [];
 
-  // Kullanıcının oyu
-  let userVote = null;
   if (req.user) {
-    userVote = await Vote.findOne({
+    userVotes = await PollVote.find({
       poll: id,
       user: req.user._id,
-    }).select('options timestamp');
+    }).distinct('option');
   }
 
-  // Sonuçları gösterme durumunu kontrol et
+  // Anket sonuçlarını belirli durumlarda gizle
   let hideResults = false;
 
-  if (poll.hideResultsUntilClosed && poll.status !== 'closed') {
-    if (!req.user || (!req.user._id.equals(poll.creator._id) && req.user.role !== 'admin')) {
+  if (poll.hideResultsUntilClosed && poll.isActive) {
+    // Kullanıcı oy vermedi ve admin/moderatör değilse sonuçları gizle
+    if (userVotes.length === 0 && (!req.user || req.user.role !== 'admin')) {
       hideResults = true;
     }
   }
 
-  // Sonuçların gizlenmesi gerekiyorsa, oy sayılarını gizle
-  let response = {
-    success: true,
-    data: {
-      ...poll.toObject(),
-      options: hideResults
-        ? poll.options.map((opt) => ({
-            _id: opt._id,
-            text: opt.text,
-            votes: userVote && userVote.options.includes(opt._id.toString()) ? 1 : 0,
-            percentage: 0,
-          }))
-        : poll.options,
-    },
-    userVote: userVote
-      ? {
-          optionIds: userVote.options,
-          timestamp: userVote.timestamp,
-        }
-      : null,
-    post: relatedPost || null,
+  // Sonuçları hazırla
+  const preparedPoll = {
+    ...poll.toObject(),
+    userVotes,
+    options: poll.options.map((option) => {
+      const optionObj = option.toObject();
+
+      if (hideResults && !userVotes.includes(option._id.toString())) {
+        optionObj.votes = 0;
+        optionObj.percentage = 0;
+      } else {
+        optionObj.percentage =
+          poll.totalVotes > 0 ? Math.round((option.votes / poll.totalVotes) * 100) : 0;
+        optionObj.userVoted = userVotes.includes(option._id.toString());
+      }
+
+      return optionObj;
+    }),
     hideResults,
   };
 
-  res.status(200).json(response);
+  res.status(200).json({
+    success: true,
+    data: preparedPoll,
+  });
 });
 
 /**
- * @desc    Bir ankete oy ver
+ * @desc    Post'a ait anketi getir
+ * @route   GET /api/posts/:postId/poll
+ * @access  Public
+ */
+const getPostPoll = asyncHandler(async (req, res, next) => {
+  const { postId } = req.params;
+
+  // ID formatı kontrolü
+  if (!mongoose.Types.ObjectId.isValid(postId)) {
+    return next(new ErrorResponse('Geçersiz post ID formatı', 400));
+  }
+
+  // Post'u kontrol et
+  const post = await Post.findById(postId);
+
+  if (!post) {
+    return next(new ErrorResponse('Post bulunamadı', 404));
+  }
+
+  // Anketi bul
+  const poll = await Poll.findOne({ post: postId })
+    .populate('options')
+    .populate('post', 'title author subreddit')
+    .populate({
+      path: 'post',
+      populate: {
+        path: 'author',
+        select: 'username profilePicture',
+      },
+    });
+
+  if (!poll) {
+    return next(new ErrorResponse('Bu post için anket bulunamadı', 404));
+  }
+
+  // Kullanıcının oyları
+  let userVotes = [];
+
+  if (req.user) {
+    userVotes = await PollVote.find({
+      poll: poll._id,
+      user: req.user._id,
+    }).distinct('option');
+  }
+
+  // Anket sonuçlarını belirli durumlarda gizle
+  let hideResults = false;
+
+  if (poll.hideResultsUntilClosed && poll.isActive) {
+    // Kullanıcı oy vermedi ve admin/moderatör değilse sonuçları gizle
+    if (userVotes.length === 0 && (!req.user || req.user.role !== 'admin')) {
+      hideResults = true;
+    }
+  }
+
+  // Sonuçları hazırla
+  const preparedPoll = {
+    ...poll.toObject(),
+    userVotes,
+    isActive: new Date() < poll.endDate,
+    remainingTime:
+      new Date() < poll.endDate
+        ? Math.floor((poll.endDate - new Date()) / 1000) // kalan süre (saniye)
+        : 0,
+    options: poll.options.map((option) => {
+      const optionObj = option.toObject();
+
+      if (hideResults && !userVotes.includes(option._id.toString())) {
+        optionObj.votes = 0;
+        optionObj.percentage = 0;
+      } else {
+        optionObj.percentage =
+          poll.totalVotes > 0 ? Math.round((option.votes / poll.totalVotes) * 100) : 0;
+        optionObj.userVoted = userVotes.includes(option._id.toString());
+      }
+
+      return optionObj;
+    }),
+    hideResults,
+  };
+
+  res.status(200).json({
+    success: true,
+    data: preparedPoll,
+  });
+});
+
+/**
+ * @desc    Ankete oy ver
  * @route   POST /api/polls/:id/vote
  * @access  Private
  */
-const voteOnPoll = asyncHandler(async (req, res) => {
+const votePoll = asyncHandler(async (req, res, next) => {
   const { id } = req.params;
   const { optionIds } = req.body;
-  const userId = req.user._id;
 
-  // Geçerli bir ID ve seçenek kontrolü
+  // ID formatı kontrolü
   if (!mongoose.Types.ObjectId.isValid(id)) {
-    return res.status(400).json({
-      success: false,
-      message: 'Geçersiz anket ID formatı',
-    });
+    return next(new ErrorResponse('Geçersiz anket ID formatı', 400));
   }
 
+  // Seçenekleri doğrula
   if (!optionIds || !Array.isArray(optionIds) || optionIds.length === 0) {
-    return res.status(400).json({
-      success: false,
-      message: 'En az bir seçenek belirtmelisiniz',
-    });
+    return next(new ErrorResponse('En az bir seçenek belirtilmelidir', 400));
   }
 
-  // Anket bilgilerini getir
-  const poll = await Poll.findById(id);
+  // Anketi bul
+  const poll = await Poll.findById(id).populate('options');
 
   if (!poll) {
-    return res.status(404).json({
-      success: false,
-      message: 'Anket bulunamadı',
-    });
+    return next(new ErrorResponse('Anket bulunamadı', 404));
   }
 
-  // Anketin durumunu kontrol et
-  if (poll.status !== 'active') {
-    return res.status(400).json({
-      success: false,
-      message: 'Bu anket artık aktif değil, oy veremezsiniz',
-    });
-  }
-
-  // Anketin süresi dolmuş mu kontrol et
+  // Anketin aktif olup olmadığını kontrol et
   if (new Date() > poll.endDate) {
-    // Anket süresini güncelle
-    poll.status = 'closed';
-    await poll.save();
-
-    return res.status(400).json({
-      success: false,
-      message: 'Bu anketin süresi doldu, oy veremezsiniz',
-    });
-  }
-
-  // Minimum hesap yaşı kontrolü
-  if (poll.minimumAccountAge > 0) {
-    const user = await User.findById(userId).select('createdAt');
-    const accountAge = Date.now() - user.createdAt.getTime();
-    const minAgeInMillis = poll.minimumAccountAge * 24 * 60 * 60 * 1000; // gün -> ms
-
-    if (accountAge < minAgeInMillis) {
-      return res.status(403).json({
-        success: false,
-        message: `Bu ankete oy vermek için hesabınızın en az ${poll.minimumAccountAge} günlük olması gerekiyor`,
-      });
-    }
-  }
-
-  // Verilen seçeneklerin geçerliliğini kontrol et
-  const validOptionIds = poll.options.map((opt) => opt._id.toString());
-  const allOptionsValid = optionIds.every((optId) => validOptionIds.includes(optId));
-
-  if (!allOptionsValid) {
-    return res.status(400).json({
-      success: false,
-      message: "Geçersiz seçenek ID'si belirtildi",
-    });
-  }
-
-  // Çoklu oy seçeneği kontrolü
-  if (!poll.allowMultipleVotes && optionIds.length > 1) {
-    return res.status(400).json({
-      success: false,
-      message: 'Bu ankette sadece bir seçeneğe oy verebilirsiniz',
-    });
+    return next(new ErrorResponse('Bu anket sona ermiş, artık oy verilemez', 400));
   }
 
   // Kullanıcının daha önce oy verip vermediğini kontrol et
-  const existingVote = await Vote.findOne({
+  const existingVotes = await PollVote.find({
     poll: id,
-    user: userId,
+    user: req.user._id,
   });
 
-  // Bu bir anket güncellemesi mi?
-  if (existingVote) {
-    // Önceki oyları kaldır
-    for (const optionId of existingVote.options) {
-      const option = poll.options.id(optionId);
-      if (option && option.votes > 0) {
-        option.votes -= 1;
+  // Eğer zaten oy verilmişse ve çoklu oy verme izni yoksa hata ver
+  if (existingVotes.length > 0 && !poll.allowMultipleVotes) {
+    return next(new ErrorResponse('Bu ankete zaten oy verdiniz', 400));
+  }
+
+  // Maksimum seçim sayısını aşmadığından emin ol
+  if (optionIds.length > poll.maxSelections) {
+    return next(new ErrorResponse(`En fazla ${poll.maxSelections} seçenek seçebilirsiniz`, 400));
+  }
+
+  // Seçeneklerin geçerliliğini kontrol et
+  const validOptionIds = poll.options.map((option) => option._id.toString());
+  const invalidOptions = optionIds.filter((id) => !validOptionIds.includes(id));
+
+  if (invalidOptions.length > 0) {
+    return next(new ErrorResponse("Geçersiz seçenek ID'leri: " + invalidOptions.join(', '), 400));
+  }
+
+  // Transaction başlat
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
+  try {
+    // Eğer kullanıcı daha önce oy verdiyse ve yeniden oy veriyorsa, önceki oyları sil
+    if (existingVotes.length > 0) {
+      // Önceki oyların seçeneklerindeki oy sayılarını azalt
+      for (const vote of existingVotes) {
+        await PollOption.findByIdAndUpdate(vote.option, { $inc: { votes: -1 } }, { session });
+
+        // Toplam oy sayısını azalt
+        await Poll.findByIdAndUpdate(id, { $inc: { totalVotes: -1 } }, { session });
       }
+
+      // Önceki oyları sil
+      await PollVote.deleteMany({ poll: id, user: req.user._id }, { session });
     }
 
-    // Yeni oyları ekle
+    // Yeni oyları oluştur ve seçenek oy sayılarını artır
+    const votes = [];
+
     for (const optionId of optionIds) {
-      const option = poll.options.id(optionId);
-      if (option) {
-        option.votes += 1;
-      }
+      // Yeni oy oluştur
+      const vote = new PollVote({
+        poll: id,
+        option: optionId,
+        user: req.user._id,
+      });
+
+      votes.push(vote);
+
+      // Seçeneğin oy sayısını artır
+      await PollOption.findByIdAndUpdate(optionId, { $inc: { votes: 1 } }, { session });
     }
 
-    // Toplam oy sayısını güncelle (toplam oy sayısı değişmez, sadece dağılım değişir)
+    // Oyları kaydet
+    await PollVote.insertMany(votes, { session });
 
-    // Oyu güncelle
-    existingVote.options = optionIds;
-    existingVote.timestamp = Date.now();
-    await existingVote.save();
+    // Anketin toplam oy sayısını güncelle
+    await Poll.findByIdAndUpdate(id, { $inc: { totalVotes: optionIds.length } }, { session });
 
-    // Anketi kaydet
-    await poll.save();
+    await session.commitTransaction();
 
-    return res.status(200).json({
+    // Güncellenmiş anketi getir
+    const updatedPoll = await Poll.findById(id).populate('options');
+
+    // Kullanıcının oylarını getir
+    const userVotes = await PollVote.find({
+      poll: id,
+      user: req.user._id,
+    }).select('option');
+
+    // Sonuçları hazırla
+    const preparedPoll = {
+      ...updatedPoll.toObject(),
+      userVotes: userVotes.map((vote) => vote.option.toString()),
+      isActive: new Date() < updatedPoll.endDate,
+      remainingTime:
+        new Date() < updatedPoll.endDate
+          ? Math.floor((updatedPoll.endDate - new Date()) / 1000) // kalan süre (saniye)
+          : 0,
+      options: updatedPoll.options.map((option) => {
+        const optionObj = option.toObject();
+        optionObj.percentage =
+          updatedPoll.totalVotes > 0
+            ? Math.round((option.votes / updatedPoll.totalVotes) * 100)
+            : 0;
+        optionObj.userVoted = userVotes.some(
+          (vote) => vote.option.toString() === option._id.toString(),
+        );
+        return optionObj;
+      }),
+    };
+
+    res.status(200).json({
       success: true,
-      message: 'Oyunuz başarıyla güncellendi',
-      data: {
-        pollId: poll._id,
-        optionIds,
-        updated: true,
-      },
+      data: preparedPoll,
+      message: 'Oyunuz başarıyla kaydedildi',
     });
+  } catch (error) {
+    await session.abortTransaction();
+    return next(new ErrorResponse('Oy verilirken bir hata oluştu', 500));
+  } finally {
+    session.endSession();
   }
-
-  // Yeni oy oluştur
-  for (const optionId of optionIds) {
-    const option = poll.options.id(optionId);
-    if (option) {
-      option.votes += 1;
-    }
-  }
-
-  // Toplam oy sayısını güncelle
-  poll.totalVotes += 1;
-
-  // Yeni oy kaydı oluştur
-  const vote = await Vote.create({
-    poll: id,
-    user: userId,
-    options: optionIds,
-    timestamp: Date.now(),
-  });
-
-  // Anketi kaydet
-  await poll.save();
-
-  // Anketin sahibine bildirim gönder (kendi oyu değilse)
-  if (!poll.creator.equals(userId)) {
-    await Notification.create({
-      recipient: poll.creator,
-      type: 'poll_vote',
-      sender: userId,
-      reference: {
-        type: 'Poll',
-        id: poll._id,
-      },
-      message: `${req.user.username} anketinize oy verdi: "${poll.question.substring(0, 40)}${poll.question.length > 40 ? '...' : ''}"`,
-      isRead: false,
-    });
-  }
-
-  res.status(200).json({
-    success: true,
-    message: 'Oyunuz başarıyla kaydedildi',
-    data: {
-      pollId: poll._id,
-      optionIds,
-      vote: {
-        _id: vote._id,
-        timestamp: vote.timestamp,
-      },
-    },
-  });
 });
 
 /**
- * @desc    Ankete yeni seçenek ekle
+ * @desc    Anket seçeneği ekle
  * @route   POST /api/polls/:id/options
  * @access  Private
  */
-const addPollOption = asyncHandler(async (req, res) => {
+const addPollOption = asyncHandler(async (req, res, next) => {
   const { id } = req.params;
-  const { optionText } = req.body;
-  const userId = req.user._id;
+  const { text } = req.body;
 
+  // ID formatı kontrolü
   if (!mongoose.Types.ObjectId.isValid(id)) {
-    return res.status(400).json({
-      success: false,
-      message: 'Geçersiz anket ID formatı',
-    });
+    return next(new ErrorResponse('Geçersiz anket ID formatı', 400));
   }
 
-  if (!optionText || typeof optionText !== 'string' || optionText.trim().length === 0) {
-    return res.status(400).json({
-      success: false,
-      message: 'Lütfen geçerli bir seçenek metni girin',
-    });
+  // Seçenek metnini doğrula
+  if (!text || !text.trim()) {
+    return next(new ErrorResponse('Seçenek metni gereklidir', 400));
   }
 
-  // Anket bilgilerini getir
-  const poll = await Poll.findById(id);
+  // Anketi bul
+  const poll = await Poll.findById(id).populate('options');
 
   if (!poll) {
-    return res.status(404).json({
-      success: false,
-      message: 'Anket bulunamadı',
-    });
+    return next(new ErrorResponse('Anket bulunamadı', 404));
   }
 
-  // Anketin durumunu kontrol et
-  if (poll.status !== 'active') {
-    return res.status(400).json({
-      success: false,
-      message: 'Bu anket artık aktif değil, seçenek ekleyemezsiniz',
-    });
+  // Anketin aktif olup olmadığını kontrol et
+  if (new Date() > poll.endDate) {
+    return next(new ErrorResponse('Bu anket sona ermiş, artık seçenek eklenemez', 400));
   }
 
-  // Seçenek ekleme özelliği açık mı?
-  if (!poll.allowAddingOptions) {
-    return res.status(403).json({
-      success: false,
-      message: 'Bu ankete yeni seçenek ekleme özelliği kapalı',
-    });
+  // Post'u bul ve kontrol et
+  const post = await Post.findById(poll.post);
+
+  if (!post) {
+    return next(new ErrorResponse('İlgili post bulunamadı', 404));
   }
 
-  // Kullanıcının izni var mı? (anket sahibi veya admin)
-  const isCreator = poll.creator.equals(userId);
+  // Yetki kontrolü - Post sahibi veya moderatör/admin olmalı
+  const isPostAuthor = post.author.toString() === req.user._id.toString();
   const isAdmin = req.user.role === 'admin';
 
-  // Subreddit moderatörü kontrolü
-  let isModerator = false;
-  if (poll.subreddit) {
-    isModerator = await checkUserPermissions(userId, poll.subreddit, 'poll', 'manage_any');
+  if (!isPostAuthor && !isAdmin) {
+    // Moderatör kontrolü
+    const subredditId = post.subreddit;
+    const isModerator =
+      req.user.role === 'moderator' ||
+      (await SubredditMembership.findOne({
+        user: req.user._id,
+        subreddit: subredditId,
+        type: 'moderator',
+      }));
+
+    if (!isModerator) {
+      return next(new ErrorResponse('Bu ankete seçenek ekleme yetkiniz yok', 403));
+    }
   }
 
-  if (!isCreator && !isAdmin && !isModerator) {
-    return res.status(403).json({
-      success: false,
-      message: 'Bu ankete seçenek ekleme yetkiniz yok',
-    });
+  // Aynı metinde bir seçenek var mı kontrol et
+  const existingOption = poll.options.find(
+    (option) => option.text.toLowerCase() === text.trim().toLowerCase(),
+  );
+
+  if (existingOption) {
+    return next(new ErrorResponse('Bu seçenek zaten mevcut', 400));
   }
 
   // Maksimum seçenek sayısını kontrol et
-  if (poll.options.length >= 20) {
-    return res.status(400).json({
-      success: false,
-      message: 'Bir ankete en fazla 20 seçenek eklenebilir',
-    });
+  if (poll.options.length >= 10) {
+    return next(new ErrorResponse('Bir ankette en fazla 10 seçenek olabilir', 400));
   }
 
-  // Aynı seçeneğin zaten var olup olmadığını kontrol et
-  const normalizedOption = optionText.trim();
-  const optionExists = poll.options.some(
-    (option) => option.text.toLowerCase() === normalizedOption.toLowerCase(),
-  );
-
-  if (optionExists) {
-    return res.status(400).json({
-      success: false,
-      message: 'Bu seçenek zaten ankette mevcut',
-    });
-  }
-
-  // Yeni seçeneği ekle
-  poll.options.push({
-    text: normalizedOption,
+  // Yeni seçeneği oluştur
+  const newOption = await PollOption.create({
+    text: text.trim(),
     votes: 0,
-    addedBy: userId,
-    addedAt: Date.now(),
+    addedBy: req.user._id,
   });
 
+  // Seçeneği ankete ekle
+  poll.options.push(newOption._id);
   await poll.save();
 
-  // Moderasyon logu oluştur (subreddit varsa)
-  if (poll.subreddit) {
-    await ModLog.create({
-      subreddit: poll.subreddit,
-      user: userId,
-      action: 'poll_option_added',
-      details: `"${normalizedOption}" seçeneği ankete eklendi: "${poll.question.substring(0, 40)}${poll.question.length > 40 ? '...' : ''}"`,
-      targetType: 'poll',
-      targetId: poll._id,
-    });
+  // Güncellenmiş anketi getir
+  const updatedPoll = await Poll.findById(id).populate('options');
+
+  res.status(201).json({
+    success: true,
+    data: updatedPoll,
+    message: 'Anket seçeneği başarıyla eklendi',
+  });
+});
+
+/**
+ * @desc    Anket seçeneği sil (oy yoksa)
+ * @route   DELETE /api/polls/:id/options/:optionId
+ * @access  Private
+ */
+const removePollOption = asyncHandler(async (req, res, next) => {
+  const { id, optionId } = req.params;
+
+  // ID formatları kontrolü
+  if (!mongoose.Types.ObjectId.isValid(id) || !mongoose.Types.ObjectId.isValid(optionId)) {
+    return next(new ErrorResponse('Geçersiz ID formatı', 400));
   }
 
-  // Anket sahibine bildirim gönder (kendi eklemediyse)
-  if (!isCreator) {
-    await Notification.create({
-      recipient: poll.creator,
-      type: 'poll_option_added',
-      sender: userId,
-      reference: {
-        type: 'Poll',
-        id: poll._id,
-      },
-      message: `${req.user.username} anketinize yeni bir seçenek ekledi: "${normalizedOption}"`,
-      isRead: false,
-    });
+  // Anketi bul
+  const poll = await Poll.findById(id).populate('options');
+
+  if (!poll) {
+    return next(new ErrorResponse('Anket bulunamadı', 404));
   }
+
+  // Anketin aktif olup olmadığını kontrol et
+  if (new Date() > poll.endDate) {
+    return next(new ErrorResponse('Bu anket sona ermiş, artık seçenek silinemez', 400));
+  }
+
+  // Seçeneği bul
+  const option = await PollOption.findById(optionId);
+
+  if (!option) {
+    return next(new ErrorResponse('Seçenek bulunamadı', 404));
+  }
+
+  // Seçeneğin bu ankete ait olup olmadığını kontrol et
+  if (!poll.options.some((opt) => opt._id.toString() === optionId)) {
+    return next(new ErrorResponse('Bu seçenek bu ankete ait değil', 400));
+  }
+
+  // Post'u bul ve kontrol et
+  const post = await Post.findById(poll.post);
+
+  if (!post) {
+    return next(new ErrorResponse('İlgili post bulunamadı', 404));
+  }
+
+  // Yetki kontrolü - Post sahibi veya moderatör/admin olmalı
+  const isPostAuthor = post.author.toString() === req.user._id.toString();
+  const isAdmin = req.user.role === 'admin';
+
+  if (!isPostAuthor && !isAdmin) {
+    // Moderatör kontrolü
+    const subredditId = post.subreddit;
+    const isModerator =
+      req.user.role === 'moderator' ||
+      (await SubredditMembership.findOne({
+        user: req.user._id,
+        subreddit: subredditId,
+        type: 'moderator',
+      }));
+
+    if (!isModerator) {
+      return next(new ErrorResponse('Bu anketten seçenek silme yetkiniz yok', 403));
+    }
+  }
+
+  // Seçeneğe ait oyları kontrol et
+  if (option.votes > 0) {
+    return next(new ErrorResponse('Oy alan bir seçenek silinemez', 400));
+  }
+
+  // Minimum 2 seçenek olmalı
+  if (poll.options.length <= 2) {
+    return next(new ErrorResponse('Bir ankette en az 2 seçenek olmalıdır', 400));
+  }
+
+  // Seçeneği anketten kaldır
+  poll.options = poll.options.filter((opt) => opt._id.toString() !== optionId);
+  await poll.save();
+
+  // Seçeneği sil
+  await PollOption.findByIdAndDelete(optionId);
+
+  // Güncellenmiş anketi getir
+  const updatedPoll = await Poll.findById(id).populate('options');
 
   res.status(200).json({
     success: true,
-    message: 'Seçenek başarıyla eklendi',
-    data: {
-      pollId: poll._id,
-      newOption: poll.options[poll.options.length - 1],
-    },
+    data: updatedPoll,
+    message: 'Anket seçeneği başarıyla silindi',
   });
 });
 
 /**
- * @desc    Anketi kapat/sonlandır
- * @route   PATCH /api/polls/:id/close
+ * @desc    Anket süresini değiştir
+ * @route   PUT /api/polls/:id/duration
  * @access  Private
  */
-const closePoll = asyncHandler(async (req, res) => {
+const updatePollDuration = asyncHandler(async (req, res, next) => {
   const { id } = req.params;
-  const userId = req.user._id;
+  const { endDate } = req.body;
 
+  // ID formatı kontrolü
   if (!mongoose.Types.ObjectId.isValid(id)) {
-    return res.status(400).json({
-      success: false,
-      message: 'Geçersiz anket ID formatı',
-    });
+    return next(new ErrorResponse('Geçersiz anket ID formatı', 400));
   }
 
-  // Anket bilgilerini getir
+  // Bitiş tarihini doğrula
+  const parsedEndDate = new Date(endDate);
+
+  if (isNaN(parsedEndDate.getTime())) {
+    return next(new ErrorResponse('Geçersiz bitiş tarihi formatı', 400));
+  }
+
+  // Anketi bul
   const poll = await Poll.findById(id);
 
   if (!poll) {
-    return res.status(404).json({
-      success: false,
-      message: 'Anket bulunamadı',
-    });
+    return next(new ErrorResponse('Anket bulunamadı', 404));
   }
 
-  // Anket zaten kapalı mı?
-  if (poll.status === 'closed') {
-    return res.status(400).json({
-      success: false,
-      message: 'Bu anket zaten kapatılmış',
-    });
+  // Anketin aktif olup olmadığını kontrol et
+  if (new Date() > poll.endDate) {
+    return next(new ErrorResponse('Bu anket zaten sona ermiş', 400));
   }
 
-  // Kullanıcının izni var mı? (anket sahibi veya admin)
-  const isCreator = poll.creator.equals(userId);
+  // Post'u bul ve kontrol et
+  const post = await Post.findById(poll.post);
+
+  if (!post) {
+    return next(new ErrorResponse('İlgili post bulunamadı', 404));
+  }
+
+  // Yetki kontrolü - Post sahibi veya moderatör/admin olmalı
+  const isPostAuthor = post.author.toString() === req.user._id.toString();
   const isAdmin = req.user.role === 'admin';
 
-  // Subreddit moderatörü kontrolü
-  let isModerator = false;
-  if (poll.subreddit) {
-    isModerator = await checkUserPermissions(userId, poll.subreddit, 'poll', 'manage_any');
-  }
+  if (!isPostAuthor && !isAdmin) {
+    // Moderatör kontrolü
+    const subredditId = post.subreddit;
+    const isModerator =
+      req.user.role === 'moderator' ||
+      (await SubredditMembership.findOne({
+        user: req.user._id,
+        subreddit: subredditId,
+        type: 'moderator',
+      }));
 
-  if (!isCreator && !isAdmin && !isModerator) {
-    return res.status(403).json({
-      success: false,
-      message: 'Bu anketi kapatma yetkiniz yok',
-    });
-  }
-
-  // Anketi kapat
-  poll.status = 'closed';
-  poll.closedAt = Date.now();
-  poll.closedBy = userId;
-
-  await poll.save();
-
-  // İlgili gönderiyi bul
-  const relatedPost = await Post.findOne({ poll: id }).select('_id title slug subreddit');
-
-  // Moderasyon logu oluştur (subreddit varsa)
-  if (poll.subreddit) {
-    await ModLog.create({
-      subreddit: poll.subreddit,
-      user: userId,
-      action: 'poll_closed',
-      details: `"${poll.question.substring(0, 40)}${poll.question.length > 40 ? '...' : ''}" anketi kapatıldı`,
-      targetType: 'poll',
-      targetId: poll._id,
-    });
-  }
-
-  // Anket sahibine bildirim gönder (kendi kapatmadıysa)
-  if (!isCreator) {
-    await Notification.create({
-      recipient: poll.creator,
-      type: 'poll_closed',
-      sender: userId,
-      reference: {
-        type: 'Poll',
-        id: poll._id,
-      },
-      message: `${req.user.username} anketinizi kapattı: "${poll.question.substring(0, 40)}${poll.question.length > 40 ? '...' : ''}"`,
-      isRead: false,
-    });
-  }
-
-  res.status(200).json({
-    success: true,
-    message: 'Anket başarıyla kapatıldı',
-    data: {
-      pollId: poll._id,
-      status: poll.status,
-      closedAt: poll.closedAt,
-      post: relatedPost || null,
-    },
-  });
-});
-
-/**
- * @desc    Anketleri listele (subreddit bazlı veya genel)
- * @route   GET /api/polls
- * @route   GET /api/subreddits/:subredditId/polls
- * @access  Public
- */
-const listPolls = asyncHandler(async (req, res) => {
-  // URL'den subreddit ID'sini al
-  const subredditId = req.params.subredditId;
-
-  // Query parametreleri
-  const page = parseInt(req.query.page, 10) || 1;
-  const limit = parseInt(req.query.limit, 10) || 10;
-  const sort = req.query.sort || '-createdAt';
-  const status =
-    req.query.status && ['active', 'closed'].includes(req.query.status) ? req.query.status : null;
-
-  // Sorgu oluştur
-  const query = {};
-
-  // Subreddit filtresi ekle
-  if (subredditId) {
-    if (!mongoose.Types.ObjectId.isValid(subredditId)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Geçersiz subreddit ID formatı',
-      });
+    if (!isModerator) {
+      return next(new ErrorResponse('Bu anketin süresini değiştirme yetkiniz yok', 403));
     }
-
-    // Subreddit'in varlığını kontrol et
-    const subreddit = await Subreddit.findById(subredditId);
-    if (!subreddit) {
-      return res.status(404).json({
-        success: false,
-        message: 'Subreddit bulunamadı',
-      });
-    }
-
-    query.subreddit = subredditId;
   }
 
-  // Durum filtresi ekle
-  if (status) {
-    query.status = status;
+  const now = new Date();
+  const maxDuration = 7 * 24 * 60 * 60 * 1000; // 7 gün (milisaniye)
+
+  // Yeni bitiş tarihi şu anki zamandan sonra olmalı
+  if (parsedEndDate <= now) {
+    return next(new ErrorResponse('Bitiş tarihi gelecekte olmalıdır', 400));
   }
 
-  // Sayfalama
-  const startIndex = (page - 1) * limit;
-  const endIndex = page * limit;
-  const total = await Poll.countDocuments(query);
-
-  // Anketleri getir
-  const polls = await Poll.find(query)
-    .populate('creator', 'username avatar')
-    .populate('subreddit', 'name title icon')
-    .sort(sort)
-    .skip(startIndex)
-    .limit(limit);
-
-  // İlgili gönderileri bul
-  const pollIds = polls.map((poll) => poll._id);
-  const relatedPosts = await Post.find({ poll: { $in: pollIds } }).select(
-    '_id title slug poll createdAt',
-  );
-
-  // Kullanıcının oylarını getir (giriş yapmışsa)
-  let userVotes = [];
-  if (req.user) {
-    userVotes = await Vote.find({
-      poll: { $in: pollIds },
-      user: req.user._id,
-    }).select('poll options timestamp');
-  }
-
-  // Anketleri formatla ve post bilgilerini ekle
-  const formattedPolls = polls.map((poll) => {
-    // İlgili gönderiyi bul
-    const relatedPost = relatedPosts.find(
-      (post) => post.poll && post.poll.toString() === poll._id.toString(),
-    );
-
-    // Kullanıcının oyunu bul
-    const userVote = userVotes.find((vote) => vote.poll.toString() === poll._id.toString());
-
-    // Sonuçları gizleme durumunu kontrol et
-    let hideResults = false;
-    if (poll.hideResultsUntilClosed && poll.status !== 'closed') {
-      if (!req.user || (!req.user._id.equals(poll.creator._id) && req.user.role !== 'admin')) {
-        hideResults = true;
-      }
-    }
-
-    // Anket nesnesini formatla
-    const formattedPoll = {
-      ...poll.toObject(),
-      options: hideResults
-        ? poll.options.map((opt) => ({
-            _id: opt._id,
-            text: opt.text,
-            votes: userVote && userVote.options.includes(opt._id.toString()) ? 1 : 0,
-            percentage: 0,
-          }))
-        : poll.options,
-      post: relatedPost
-        ? {
-            _id: relatedPost._id,
-            title: relatedPost.title,
-            slug: relatedPost.slug,
-            createdAt: relatedPost.createdAt,
-          }
-        : null,
-      userVote: userVote
-        ? {
-            optionIds: userVote.options,
-            timestamp: userVote.timestamp,
-          }
-        : null,
-      hideResults,
-    };
-
-    return formattedPoll;
-  });
-
-  // Yanıt nesnesi
-  const response = {
-    success: true,
-    count: formattedPolls.length,
-    totalPages: Math.ceil(total / limit),
-    currentPage: page,
-    data: formattedPolls,
-  };
-
-  // Sayfalama meta verileri
-  if (endIndex < total) {
-    response.pagination = {
-      next: {
-        page: page + 1,
-        limit,
-      },
-    };
-  }
-
-  if (startIndex > 0) {
-    response.pagination = {
-      ...response.pagination,
-      prev: {
-        page: page - 1,
-        limit,
-      },
-    };
-  }
-
-  res.status(200).json(response);
-});
-
-/**
- * @desc    Anket güncelle
- * @route   PUT /api/polls/:id
- * @access  Private
- */
-const updatePoll = asyncHandler(async (req, res) => {
-  const { id } = req.params;
-  const {
-    question,
-    allowMultipleVotes,
-    allowAddingOptions,
-    hideResultsUntilClosed,
-    minimumAccountAge,
-    endDate,
-  } = req.body;
-
-  if (!mongoose.Types.ObjectId.isValid(id)) {
-    return res.status(400).json({
-      success: false,
-      message: 'Geçersiz anket ID formatı',
-    });
-  }
-
-  // Anket bilgilerini getir
-  const poll = await Poll.findById(id);
-
-  if (!poll) {
-    return res.status(404).json({
-      success: false,
-      message: 'Anket bulunamadı',
-    });
-  }
-
-  // Kullanıcının izni var mı? (anket sahibi veya admin)
-  const isCreator = poll.creator.equals(req.user._id);
-  const isAdmin = req.user.role === 'admin';
-
-  // Subreddit moderatörü kontrolü
-  let isModerator = false;
-  if (poll.subreddit) {
-    isModerator = await checkUserPermissions(req.user._id, poll.subreddit, 'poll', 'manage_any');
-  }
-
-  if (!isCreator && !isAdmin && !isModerator) {
-    return res.status(403).json({
-      success: false,
-      message: 'Bu anketi düzenleme yetkiniz yok',
-    });
-  }
-
-  // Anket kapalı mı kontrol et
-  if (poll.status === 'closed') {
-    return res.status(400).json({
-      success: false,
-      message: 'Kapatılmış anketler düzenlenemez',
-    });
-  }
-
-  // Ankette oy var mı kontrol et - varsa bazı ayarlar değiştirilemez
-  const hasVotes = poll.totalVotes > 0;
-
-  // Güncellenecek alanları belirle
-  const updateData = {};
-
-  if (question && typeof question === 'string' && question.trim() !== '') {
-    if (hasVotes && question !== poll.question) {
-      return res.status(400).json({
-        success: false,
-        message: 'Oy verilmiş anketin sorusu değiştirilemez',
-      });
-    }
-    updateData.question = question.trim();
-  }
-
-  // Boolean değerleri kontrol et ve güncelle
-  if (typeof allowMultipleVotes === 'boolean') {
-    if (hasVotes && allowMultipleVotes !== poll.allowMultipleVotes) {
-      return res.status(400).json({
-        success: false,
-        message: 'Oy verilmiş anketin çoklu oy ayarı değiştirilemez',
-      });
-    }
-    updateData.allowMultipleVotes = allowMultipleVotes;
-  }
-
-  if (typeof allowAddingOptions === 'boolean') {
-    updateData.allowAddingOptions = allowAddingOptions;
-  }
-
-  if (typeof hideResultsUntilClosed === 'boolean') {
-    updateData.hideResultsUntilClosed = hideResultsUntilClosed;
-  }
-
-  if (minimumAccountAge !== undefined && !isNaN(minimumAccountAge)) {
-    const maxAge = 365; // 1 yıl
-    if (minimumAccountAge < 0 || minimumAccountAge > maxAge) {
-      return res.status(400).json({
-        success: false,
-        message: `Minimum hesap yaşı 0 ile ${maxAge} gün arasında olmalıdır`,
-      });
-    }
-    updateData.minimumAccountAge = minimumAccountAge;
-  }
-
-  // Bitiş tarihi kontrolü
-  if (endDate) {
-    const newEndDate = new Date(endDate);
-    const now = new Date();
-
-    if (isNaN(newEndDate.getTime())) {
-      return res.status(400).json({
-        success: false,
-        message: 'Geçersiz tarih formatı',
-      });
-    }
-
-    // Bitiş tarihi geçmiş olamaz
-    if (newEndDate <= now) {
-      return res.status(400).json({
-        success: false,
-        message: 'Bitiş tarihi gelecekte olmalıdır',
-      });
-    }
-
-    // Maksimum süre kontrolü
-    const maxDuration = 7 * 24 * 60 * 60 * 1000; // 7 gün (ms)
-    if (newEndDate.getTime() - now.getTime() > maxDuration) {
-      return res.status(400).json({
-        success: false,
-        message: 'Anket süresi en fazla 7 gün olabilir',
-      });
-    }
-
-    updateData.endDate = newEndDate;
+  // Şu anki tarihten itibaren 7 günden fazla olamaz
+  if (parsedEndDate > new Date(now.getTime() + maxDuration)) {
+    return next(new ErrorResponse('Anket süresi şu andan itibaren en fazla 7 gün olabilir', 400));
   }
 
   // Anketi güncelle
-  const updatedPoll = await Poll.findByIdAndUpdate(
-    id,
-    { $set: updateData },
-    { new: true, runValidators: true },
-  );
-
-  // Moderasyon logu oluştur (subreddit varsa)
-  if (poll.subreddit) {
-    await ModLog.create({
-      subreddit: poll.subreddit,
-      user: req.user._id,
-      action: 'poll_updated',
-      details: `"${poll.question.substring(0, 40)}${poll.question.length > 40 ? '...' : ''}" anketi güncellendi`,
-      targetType: 'poll',
-      targetId: poll._id,
-    });
-  }
+  poll.endDate = parsedEndDate;
+  await poll.save();
 
   res.status(200).json({
     success: true,
-    message: 'Anket başarıyla güncellendi',
-    data: updatedPoll,
+    data: poll,
+    message: 'Anket süresi başarıyla güncellendi',
   });
 });
 
 /**
- * @desc    Anketi sil
- * @route   DELETE /api/polls/:id
+ * @desc    Anketi erken sonlandır
+ * @route   PUT /api/polls/:id/close
  * @access  Private
  */
-const deletePoll = asyncHandler(async (req, res) => {
+const closePoll = asyncHandler(async (req, res, next) => {
   const { id } = req.params;
 
+  // ID formatı kontrolü
   if (!mongoose.Types.ObjectId.isValid(id)) {
-    return res.status(400).json({
-      success: false,
-      message: 'Geçersiz anket ID formatı',
-    });
+    return next(new ErrorResponse('Geçersiz anket ID formatı', 400));
   }
 
-  // Anket bilgilerini getir
+  // Anketi bul
   const poll = await Poll.findById(id);
 
   if (!poll) {
-    return res.status(404).json({
-      success: false,
-      message: 'Anket bulunamadı',
-    });
+    return next(new ErrorResponse('Anket bulunamadı', 404));
   }
 
-  // Kullanıcının izni var mı? (anket sahibi veya admin)
-  const isCreator = poll.creator.equals(req.user._id);
+  // Anketin zaten kapanıp kapanmadığını kontrol et
+  if (new Date() > poll.endDate) {
+    return next(new ErrorResponse('Bu anket zaten sona ermiş', 400));
+  }
+
+  // Post'u bul ve kontrol et
+  const post = await Post.findById(poll.post);
+
+  if (!post) {
+    return next(new ErrorResponse('İlgili post bulunamadı', 404));
+  }
+
+  // Yetki kontrolü - Post sahibi veya moderatör/admin olmalı
+  const isPostAuthor = post.author.toString() === req.user._id.toString();
   const isAdmin = req.user.role === 'admin';
 
-  // Subreddit moderatörü kontrolü
-  let isModerator = false;
-  if (poll.subreddit) {
-    isModerator = await checkUserPermissions(req.user._id, poll.subreddit, 'poll', 'manage_any');
+  if (!isPostAuthor && !isAdmin) {
+    // Moderatör kontrolü
+    const subredditId = post.subreddit;
+    const isModerator =
+      req.user.role === 'moderator' ||
+      (await SubredditMembership.findOne({
+        user: req.user._id,
+        subreddit: subredditId,
+        type: 'moderator',
+      }));
+
+    if (!isModerator) {
+      return next(new ErrorResponse('Bu anketi sonlandırma yetkiniz yok', 403));
+    }
   }
 
-  if (!isCreator && !isAdmin && !isModerator) {
-    return res.status(403).json({
-      success: false,
-      message: 'Bu anketi silme yetkiniz yok',
-    });
-  }
+  // Anketi şimdi sonlandır
+  poll.endDate = new Date();
+  await poll.save();
 
-  // İlgili gönderiyi bul ve anket referansını kaldır
-  if (poll.subreddit) {
-    await Post.updateOne({ poll: id }, { $unset: { poll: 1 } });
-  }
+  // Güncellenmiş anketi getir
+  const updatedPoll = await Poll.findById(id).populate('options');
 
-  // İlgili oyları sil
-  await Vote.deleteMany({ poll: id });
+  // Kullanıcının oylarını getir
+  let userVotes = [];
 
-  // Anketi sil
-  await poll.remove();
-
-  // Moderasyon logu oluştur (subreddit varsa)
-  if (poll.subreddit) {
-    await ModLog.create({
-      subreddit: poll.subreddit,
+  if (req.user) {
+    userVotes = await PollVote.find({
+      poll: id,
       user: req.user._id,
-      action: 'poll_deleted',
-      details: `"${poll.question.substring(0, 40)}${poll.question.length > 40 ? '...' : ''}" anketi silindi`,
-      targetType: 'poll',
-      targetId: poll._id,
-    });
+    }).distinct('option');
   }
+
+  // Sonuçları hazırla
+  const preparedPoll = {
+    ...updatedPoll.toObject(),
+    userVotes,
+    isActive: false,
+    remainingTime: 0,
+    options: updatedPoll.options.map((option) => {
+      const optionObj = option.toObject();
+      optionObj.percentage =
+        updatedPoll.totalVotes > 0 ? Math.round((option.votes / updatedPoll.totalVotes) * 100) : 0;
+      optionObj.userVoted = userVotes.includes(option._id.toString());
+      return optionObj;
+    }),
+  };
 
   res.status(200).json({
     success: true,
-    message: 'Anket başarıyla silindi',
-    data: {
-      id: poll._id,
-      question: poll.question,
+    data: preparedPoll,
+    message: 'Anket başarıyla sonlandırıldı',
+  });
+});
+
+/**
+ * @desc    Anket ayarlarını güncelle
+ * @route   PUT /api/polls/:id/settings
+ * @access  Private
+ */
+const updatePollSettings = asyncHandler(async (req, res, next) => {
+  const { id } = req.params;
+  const { allowMultipleVotes, maxSelections, hideResultsUntilClosed } = req.body;
+
+  // ID formatı kontrolü
+  if (!mongoose.Types.ObjectId.isValid(id)) {
+    return next(new ErrorResponse('Geçersiz anket ID formatı', 400));
+  }
+
+  // Anketi bul
+  const poll = await Poll.findById(id).populate('options');
+
+  if (!poll) {
+    return next(new ErrorResponse('Anket bulunamadı', 404));
+  }
+
+  // Anketin zaten kapanıp kapanmadığını kontrol et
+  if (new Date() > poll.endDate) {
+    return next(new ErrorResponse('Bu anket sona ermiş, artık ayarları değiştirilemez', 400));
+  }
+
+  // Post'u bul ve kontrol et
+  const post = await Post.findById(poll.post);
+
+  if (!post) {
+    return next(new ErrorResponse('İlgili post bulunamadı', 404));
+  }
+
+  // Yetki kontrolü - Post sahibi veya moderatör/admin olmalı
+  const isPostAuthor = post.author.toString() === req.user._id.toString();
+  const isAdmin = req.user.role === 'admin';
+
+  if (!isPostAuthor && !isAdmin) {
+    // Moderatör kontrolü
+    const subredditId = post.subreddit;
+    const isModerator =
+      req.user.role === 'moderator' ||
+      (await SubredditMembership.findOne({
+        user: req.user._id,
+        subreddit: subredditId,
+        type: 'moderator',
+      }));
+
+    if (!isModerator) {
+      return next(new ErrorResponse('Bu anketin ayarlarını değiştirme yetkiniz yok', 403));
+    }
+  }
+
+  // Ayarları doğrula
+  if (maxSelections !== undefined) {
+    if (maxSelections < 1 || maxSelections > 6) {
+      return next(new ErrorResponse('Maksimum seçim sayısı 1-6 arasında olmalıdır', 400));
+    }
+
+    if (maxSelections > poll.options.length) {
+      return next(new ErrorResponse('Maksimum seçim sayısı, seçenek sayısından fazla olamaz', 400));
+    }
+  }
+
+  // Anketi güncelle
+  const updates = {};
+
+  if (allowMultipleVotes !== undefined) {
+    updates.allowMultipleVotes = allowMultipleVotes;
+  }
+
+  if (maxSelections !== undefined) {
+    updates.maxSelections = maxSelections;
+  }
+
+  if (hideResultsUntilClosed !== undefined) {
+    updates.hideResultsUntilClosed = hideResultsUntilClosed;
+  }
+
+  const updatedPoll = await Poll.findByIdAndUpdate(id, { $set: updates }, { new: true }).populate(
+    'options',
+  );
+
+  // Kullanıcının oylarını getir
+  let userVotes = [];
+
+  if (req.user) {
+    userVotes = await PollVote.find({
+      poll: id,
+      user: req.user._id,
+    }).distinct('option');
+  }
+
+  // Sonuçları hazırla
+  const preparedPoll = {
+    ...updatedPoll.toObject(),
+    userVotes,
+    isActive: new Date() < updatedPoll.endDate,
+    remainingTime:
+      new Date() < updatedPoll.endDate
+        ? Math.floor((updatedPoll.endDate - new Date()) / 1000) // kalan süre (saniye)
+        : 0,
+    options: updatedPoll.options.map((option) => {
+      const optionObj = option.toObject();
+
+      // Sonuçları gizle
+      if (
+        updatedPoll.hideResultsUntilClosed &&
+        new Date() < updatedPoll.endDate &&
+        !userVotes.includes(option._id.toString())
+      ) {
+        optionObj.votes = 0;
+        optionObj.percentage = 0;
+      } else {
+        optionObj.percentage =
+          updatedPoll.totalVotes > 0
+            ? Math.round((option.votes / updatedPoll.totalVotes) * 100)
+            : 0;
+      }
+
+      optionObj.userVoted = userVotes.includes(option._id.toString());
+      return optionObj;
+    }),
+  };
+
+  res.status(200).json({
+    success: true,
+    data: preparedPoll,
+    message: 'Anket ayarları başarıyla güncellendi',
+  });
+});
+
+/**
+ * @desc    Popüler anketleri getir
+ * @route   GET /api/polls/popular
+ * @access  Public
+ */
+const getPopularPolls = asyncHandler(async (req, res, next) => {
+  const { limit = 5, subredditId, activeOnly = true } = req.query;
+
+  // Filtreleme seçenekleri
+  const filter = {};
+
+  // Aktif anketleri filtrele
+  if (activeOnly === 'true') {
+    filter.endDate = { $gt: new Date() };
+  }
+
+  // Belirli bir subreddit için filtrele
+  if (subredditId) {
+    if (!mongoose.Types.ObjectId.isValid(subredditId)) {
+      return next(new ErrorResponse('Geçersiz subreddit ID formatı', 400));
+    }
+
+    // Önce subreddit'in var olduğunu kontrol et
+    const subreddit = await Subreddit.findById(subredditId);
+
+    if (!subreddit) {
+      return next(new ErrorResponse('Subreddit bulunamadı', 404));
+    }
+
+    // Post'ları bu subreddit'e ait olanları bul
+    const posts = await Post.find({ subreddit: subredditId }).select('_id');
+    filter.post = { $in: posts.map((post) => post._id) };
+  }
+
+  // En popüler anketleri bul (en fazla oy alanlar)
+  const polls = await Poll.find(filter)
+    .sort({ totalVotes: -1 })
+    .limit(parseInt(limit))
+    .populate('options')
+    .populate({
+      path: 'post',
+      select: 'title author subreddit createdAt',
+      populate: [
+        { path: 'author', select: 'username profilePicture' },
+        { path: 'subreddit', select: 'name icon' },
+      ],
+    });
+
+  // Kullanıcının oylarını getir
+  let userVotes = {};
+
+  if (req.user) {
+    const votes = await PollVote.find({
+      poll: { $in: polls.map((poll) => poll._id) },
+      user: req.user._id,
+    });
+
+    // Anket ID'lerine göre oyları grupla
+    votes.forEach((vote) => {
+      if (!userVotes[vote.poll]) {
+        userVotes[vote.poll] = [];
+      }
+      userVotes[vote.poll].push(vote.option.toString());
+    });
+  }
+
+  // Anketleri hazırla
+  const preparedPolls = polls.map((poll) => {
+    const pollObj = poll.toObject();
+    const userPollVotes = userVotes[poll._id] || [];
+
+    // Sonuçları hazırla
+    pollObj.isActive = new Date() < poll.endDate;
+    pollObj.remainingTime =
+      new Date() < poll.endDate
+        ? Math.floor((poll.endDate - new Date()) / 1000) // kalan süre (saniye)
+        : 0;
+
+    // Sonuçları gizle
+    const hideResults =
+      poll.hideResultsUntilClosed && pollObj.isActive && userPollVotes.length === 0;
+
+    pollObj.options = poll.options.map((option) => {
+      const optionObj = option.toObject();
+
+      if (hideResults) {
+        optionObj.votes = 0;
+        optionObj.percentage = 0;
+      } else {
+        optionObj.percentage =
+          poll.totalVotes > 0 ? Math.round((option.votes / poll.totalVotes) * 100) : 0;
+      }
+
+      optionObj.userVoted = userPollVotes.includes(option._id.toString());
+      return optionObj;
+    });
+
+    pollObj.userVotes = userPollVotes;
+    pollObj.hideResults = hideResults;
+
+    return pollObj;
+  });
+
+  res.status(200).json({
+    success: true,
+    count: preparedPolls.length,
+    data: preparedPolls,
+  });
+});
+
+/**
+ * @desc    Kullanıcının oy verdiği anketleri getir
+ * @route   GET /api/polls/voted
+ * @access  Private
+ */
+const getUserVotedPolls = asyncHandler(async (req, res, next) => {
+  const { page = 1, limit = 10 } = req.query;
+  const userId = req.user._id;
+
+  // Kullanıcının oylarını bul
+  const userVoteGroups = await PollVote.aggregate([
+    { $match: { user: mongoose.Types.ObjectId(userId) } },
+    { $group: { _id: '$poll', options: { $push: '$option' } } },
+  ]);
+
+  // Oy verilen anket ID'lerini al
+  const pollIds = userVoteGroups.map((group) => group._id);
+
+  // Toplam anketi say
+  const total = pollIds.length;
+
+  // Sayfalama
+  const skip = (parseInt(page) - 1) * parseInt(limit);
+  const paginatedPollIds = pollIds.slice(skip, skip + parseInt(limit));
+
+  // Anketleri getir
+  const polls = await Poll.find({ _id: { $in: paginatedPollIds } })
+    .populate('options')
+    .populate({
+      path: 'post',
+      select: 'title author subreddit createdAt',
+      populate: [
+        { path: 'author', select: 'username profilePicture' },
+        { path: 'subreddit', select: 'name icon' },
+      ],
+    });
+
+  // Oy verilen seçenekleri eşleştir
+  const pollsWithVotes = polls.map((poll) => {
+    const pollObj = poll.toObject();
+    const voteGroup = userVoteGroups.find((group) => group._id.toString() === poll._id.toString());
+    const userVotes = voteGroup ? voteGroup.options.map((opt) => opt.toString()) : [];
+
+    pollObj.isActive = new Date() < poll.endDate;
+    pollObj.remainingTime =
+      new Date() < poll.endDate
+        ? Math.floor((poll.endDate - new Date()) / 1000) // kalan süre (saniye)
+        : 0;
+
+    pollObj.options = poll.options.map((option) => {
+      const optionObj = option.toObject();
+      optionObj.percentage =
+        poll.totalVotes > 0 ? Math.round((option.votes / poll.totalVotes) * 100) : 0;
+      optionObj.userVoted = userVotes.includes(option._id.toString());
+      return optionObj;
+    });
+
+    pollObj.userVotes = userVotes;
+
+    return pollObj;
+  });
+
+  res.status(200).json({
+    success: true,
+    count: pollsWithVotes.length,
+    total,
+    pagination: {
+      page: parseInt(page),
+      limit: parseInt(limit),
+      pages: Math.ceil(total / parseInt(limit)),
     },
+    data: pollsWithVotes,
   });
 });
 
 /**
  * @desc    Anket istatistiklerini getir
  * @route   GET /api/polls/:id/stats
- * @access  Public
+ * @access  Private (moderatör, admin veya anket sahibi)
  */
-const getPollStats = asyncHandler(async (req, res) => {
+const getPollStats = asyncHandler(async (req, res, next) => {
   const { id } = req.params;
 
+  // ID formatı kontrolü
   if (!mongoose.Types.ObjectId.isValid(id)) {
-    return res.status(400).json({
-      success: false,
-      message: 'Geçersiz anket ID formatı',
-    });
+    return next(new ErrorResponse('Geçersiz anket ID formatı', 400));
   }
 
-  // Anket bilgilerini getir
+  // Anketi bul
   const poll = await Poll.findById(id)
-    .populate('creator', 'username avatar')
-    .populate('subreddit', 'name title icon');
+    .populate('options')
+    .populate({
+      path: 'post',
+      select: 'title author subreddit createdAt',
+      populate: [
+        { path: 'author', select: 'username' },
+        { path: 'subreddit', select: 'name' },
+      ],
+    });
 
   if (!poll) {
-    return res.status(404).json({
-      success: false,
-      message: 'Anket bulunamadı',
-    });
+    return next(new ErrorResponse('Anket bulunamadı', 404));
   }
 
-  // Sonuçları gösterme durumunu kontrol et
-  let hideResults = false;
+  // Yetki kontrolü
+  const isPostAuthor = poll.post.author._id.toString() === req.user._id.toString();
+  const isAdmin = req.user.role === 'admin';
 
-  if (poll.hideResultsUntilClosed && poll.status !== 'closed') {
-    if (!req.user || (!req.user._id.equals(poll.creator._id) && req.user.role !== 'admin')) {
-      // Subreddit moderatörü kontrolü
-      if (poll.subreddit) {
-        const isModerator =
-          req.user &&
-          (await checkUserPermissions(req.user._id, poll.subreddit, 'poll', 'manage_any'));
-        if (!isModerator) {
-          hideResults = true;
-        }
-      } else {
-        hideResults = true;
-      }
+  if (!isPostAuthor && !isAdmin) {
+    const subredditId = poll.post.subreddit._id;
+    const isModerator =
+      req.user.role === 'moderator' ||
+      (await SubredditMembership.findOne({
+        user: req.user._id,
+        subreddit: subredditId,
+        type: 'moderator',
+      }));
+
+    if (!isModerator) {
+      return next(new ErrorResponse('Bu anketin istatistiklerini görüntüleme yetkiniz yok', 403));
     }
   }
 
-  if (hideResults) {
-    return res.status(403).json({
-      success: false,
-      message: 'Bu anketin sonuçları anket kapanana kadar gizlidir',
-    });
-  }
+  // Oy istatistiklerini getir
+  const voteStats = await PollVote.aggregate([
+    { $match: { poll: mongoose.Types.ObjectId(id) } },
+    { $group: { _id: '$option', count: { $sum: 1 } } },
+  ]);
 
-  // İstatistikler için oyları getir
-  const votes = await Vote.find({ poll: id })
-    .populate('user', 'username avatar createdAt')
-    .sort('-timestamp');
-
-  // Oy zaman dağılımı
-  const hourlyData = {};
-  const dailyData = {};
-
-  votes.forEach((vote) => {
-    // Saat bazlı dağılım
-    const hourKey = new Date(vote.timestamp).toISOString().slice(0, 13);
-    hourlyData[hourKey] = (hourlyData[hourKey] || 0) + 1;
-
-    // Gün bazlı dağılım
-    const dayKey = new Date(vote.timestamp).toISOString().slice(0, 10);
-    dailyData[dayKey] = (dailyData[dayKey] || 0) + 1;
-  });
+  // Oylama zamanı dağılımı
+  const hourlyVotes = await PollVote.aggregate([
+    { $match: { poll: mongoose.Types.ObjectId(id) } },
+    {
+      $group: {
+        _id: {
+          year: { $year: '$createdAt' },
+          month: { $month: '$createdAt' },
+          day: { $dayOfMonth: '$createdAt' },
+          hour: { $hour: '$createdAt' },
+        },
+        count: { $sum: 1 },
+      },
+    },
+    { $sort: { '_id.year': 1, '_id.month': 1, '_id.day': 1, '_id.hour': 1 } },
+  ]);
 
   // Seçeneklere göre oy dağılımı
-  const optionStats = {};
-  poll.options.forEach((option) => {
-    optionStats[option._id] = {
+  const optionStats = poll.options.map((option) => {
+    const voteStat = voteStats.find((stat) => stat._id.toString() === option._id.toString());
+    const votes = voteStat ? voteStat.count : 0;
+
+    return {
+      _id: option._id,
       text: option.text,
-      votes: option.votes,
-      percentage: poll.totalVotes > 0 ? Math.round((option.votes / poll.totalVotes) * 100) : 0,
+      votes,
+      percentage: poll.totalVotes > 0 ? Math.round((votes / poll.totalVotes) * 100) : 0,
     };
   });
 
-  // İlk 10 oy veren kullanıcı (gizlilik için sınırlı bilgi)
-  const recentVoters = votes.slice(0, 10).map((vote) => ({
-    username: vote.user.username,
-    avatar: vote.user.avatar,
-    timestamp: vote.timestamp,
+  // Zamansal veri formatını düzenle
+  const voteTimeline = hourlyVotes.map((hourData) => ({
+    timestamp: new Date(
+      hourData._id.year,
+      hourData._id.month - 1,
+      hourData._id.day,
+      hourData._id.hour,
+    ).toISOString(),
+    count: hourData.count,
   }));
+
+  // Anket istatistiklerini hazırla
+  const pollStats = {
+    _id: poll._id,
+    title: poll.post.title,
+    author: poll.post.author.username,
+    subreddit: poll.post.subreddit.name,
+    createdAt: poll.createdAt,
+    endDate: poll.endDate,
+    isActive: new Date() < poll.endDate,
+    remainingTime:
+      new Date() < poll.endDate
+        ? Math.floor((poll.endDate - new Date()) / 1000) // kalan süre (saniye)
+        : 0,
+    totalVotes: poll.totalVotes,
+    options: optionStats,
+    voteTimeline,
+  };
+
+  res.status(200).json({
+    success: true,
+    data: pollStats,
+  });
+});
+
+/**
+ * @desc    Anket detaylarını getir (admin arayüzü için)
+ * @route   GET /api/polls/:id/admin
+ * @access  Private (Admin)
+ */
+const getAdminPollDetails = asyncHandler(async (req, res, next) => {
+  const { id } = req.params;
+
+  // Yetki kontrolü
+  if (req.user.role !== 'admin') {
+    return next(new ErrorResponse('Bu işlem için admin yetkiniz yok', 403));
+  }
+
+  // ID formatı kontrolü
+  if (!mongoose.Types.ObjectId.isValid(id)) {
+    return next(new ErrorResponse('Geçersiz anket ID formatı', 400));
+  }
+
+  // Anketi bul
+  const poll = await Poll.findById(id)
+    .populate('options')
+    .populate({
+      path: 'post',
+      select: 'title author subreddit createdAt',
+      populate: [
+        { path: 'author', select: 'username email' },
+        { path: 'subreddit', select: 'name' },
+      ],
+    });
+
+  if (!poll) {
+    return next(new ErrorResponse('Anket bulunamadı', 404));
+  }
+
+  // Son 10 oy
+  const recentVotes = await PollVote.find({ poll: id })
+    .sort({ createdAt: -1 })
+    .limit(10)
+    .populate('user', 'username email')
+    .populate('option');
+
+  // IP bazlı oy sayımı
+  const ipVoteCounts = await PollVote.aggregate([
+    { $match: { poll: mongoose.Types.ObjectId(id) } },
+    { $group: { _id: '$ip', count: { $sum: 1 } } },
+    { $sort: { count: -1 } },
+    { $limit: 10 },
+  ]);
+
+  // Kullanıcı bazlı oy sayımı
+  const userVoteCounts = await PollVote.aggregate([
+    { $match: { poll: mongoose.Types.ObjectId(id) } },
+    { $group: { _id: '$user', count: { $sum: 1 } } },
+    { $sort: { count: -1 } },
+    { $limit: 10 },
+  ]);
+
+  // Kullanıcı bilgilerini getir
+  const userIds = userVoteCounts.map((item) => item._id).filter((id) => id !== null);
+  const users = await User.find({ _id: { $in: userIds } }).select('username');
+
+  // Kullanıcı adlarını eşleştir
+  const userVoteCountsWithNames = userVoteCounts.map((item) => {
+    if (!item._id) {
+      return { user: 'Anonim', count: item.count };
+    }
+
+    const user = users.find((u) => u._id.toString() === item._id.toString());
+    return {
+      userId: item._id,
+      username: user ? user.username : 'Silinmiş Kullanıcı',
+      count: item.count,
+    };
+  });
 
   res.status(200).json({
     success: true,
     data: {
-      poll: {
-        _id: poll._id,
-        question: poll.question,
-        status: poll.status,
-        createdAt: poll.createdAt,
-        endDate: poll.endDate,
-        closedAt: poll.closedAt,
-        totalVotes: poll.totalVotes,
-      },
-      creator: {
-        _id: poll.creator._id,
-        username: poll.creator.username,
-        avatar: poll.creator.avatar,
-      },
-      subreddit: poll.subreddit
-        ? {
-            _id: poll.subreddit._id,
-            name: poll.subreddit.name,
-            title: poll.subreddit.title,
-            icon: poll.subreddit.icon,
-          }
-        : null,
-      stats: {
-        optionStats,
-        totalVotes: poll.totalVotes,
-        timeDistribution: {
-          hourly: hourlyData,
-          daily: dailyData,
-        },
-        recentVoters,
-      },
+      poll,
+      recentVotes,
+      ipVoteCounts,
+      userVoteCounts: userVoteCountsWithNames,
     },
   });
+});
+
+/**
+ * @desc    Anket oylama geçmişini temizle
+ * @route   DELETE /api/polls/:id/votes
+ * @access  Private (Admin)
+ */
+const clearPollVotes = asyncHandler(async (req, res, next) => {
+  const { id } = req.params;
+  const { reason } = req.body;
+
+  // Yetki kontrolü
+  if (req.user.role !== 'admin') {
+    return next(new ErrorResponse('Bu işlem için admin yetkiniz yok', 403));
+  }
+
+  // ID formatı kontrolü
+  if (!mongoose.Types.ObjectId.isValid(id)) {
+    return next(new ErrorResponse('Geçersiz anket ID formatı', 400));
+  }
+
+  // Anketi bul
+  const poll = await Poll.findById(id).populate('options');
+
+  if (!poll) {
+    return next(new ErrorResponse('Anket bulunamadı', 404));
+  }
+
+  // Transaction başlat
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
+  try {
+    // Tüm oyları sil
+    await PollVote.deleteMany({ poll: id }, { session });
+
+    // Seçenek oy sayılarını sıfırla
+    for (const option of poll.options) {
+      await PollOption.findByIdAndUpdate(option._id, { votes: 0 }, { session });
+    }
+
+    // Toplam oy sayısını sıfırla
+    poll.totalVotes = 0;
+    await poll.save({ session });
+
+    // Admin log kaydı oluştur
+    await AdminLog.create(
+      [
+        {
+          user: req.user._id,
+          action: 'poll_votes_cleared',
+          details: `Anket oyları temizlendi: ${poll._id}`,
+          reason: reason || 'Belirtilmemiş',
+          targetType: 'poll',
+          targetId: poll._id,
+        },
+      ],
+      { session },
+    );
+
+    await session.commitTransaction();
+
+    res.status(200).json({
+      success: true,
+      message: 'Anket oyları başarıyla temizlendi',
+      data: {},
+    });
+  } catch (error) {
+    await session.abortTransaction();
+    return next(new ErrorResponse('Anket oyları temizlenirken bir hata oluştu', 500));
+  } finally {
+    session.endSession();
+  }
+});
+
+/**
+ * @desc    Anket sil
+ * @route   DELETE /api/polls/:id
+ * @access  Private (Post sahibi, Moderatör veya Admin)
+ */
+const deletePoll = asyncHandler(async (req, res, next) => {
+  const { id } = req.params;
+
+  // ID formatı kontrolü
+  if (!mongoose.Types.ObjectId.isValid(id)) {
+    return next(new ErrorResponse('Geçersiz anket ID formatı', 400));
+  }
+
+  // Anketi bul
+  const poll = await Poll.findById(id);
+
+  if (!poll) {
+    return next(new ErrorResponse('Anket bulunamadı', 404));
+  }
+
+  // Post'u bul ve kontrol et
+  const post = await Post.findById(poll.post);
+
+  if (!post) {
+    return next(new ErrorResponse('İlgili post bulunamadı', 404));
+  }
+
+  // Yetki kontrolü
+  const isPostAuthor = post.author.toString() === req.user._id.toString();
+  const isAdmin = req.user.role === 'admin';
+
+  if (!isPostAuthor && !isAdmin) {
+    // Moderatör kontrolü
+    const subredditId = post.subreddit;
+    const isModerator =
+      req.user.role === 'moderator' ||
+      (await SubredditMembership.findOne({
+        user: req.user._id,
+        subreddit: subredditId,
+        type: 'moderator',
+      }));
+
+    if (!isModerator) {
+      return next(new ErrorResponse('Bu anketi silme yetkiniz yok', 403));
+    }
+  }
+
+  // Transaction başlat
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
+  try {
+    // Anket oylarını sil
+    await PollVote.deleteMany({ poll: id }, { session });
+
+    // Anket seçeneklerini sil
+    for (const optionId of poll.options) {
+      await PollOption.findByIdAndDelete(optionId, { session });
+    }
+
+    // Anketi sil
+    await Poll.findByIdAndDelete(id, { session });
+
+    // Post'un türünü güncelle
+    post.type = 'text';
+    await post.save({ session });
+
+    await session.commitTransaction();
+
+    res.status(200).json({
+      success: true,
+      message: 'Anket başarıyla silindi',
+      data: {},
+    });
+  } catch (error) {
+    await session.abortTransaction();
+    return next(new ErrorResponse('Anket silinirken bir hata oluştu', 500));
+  } finally {
+    session.endSession();
+  }
 });
 
 module.exports = {
   createPoll,
   getPoll,
-  voteOnPoll,
+  getPostPoll,
+  votePoll,
   addPollOption,
+  removePollOption,
+  updatePollDuration,
   closePoll,
-  listPolls,
-  updatePoll,
-  deletePoll,
+  updatePollSettings,
+  getPopularPolls,
+  getUserVotedPolls,
   getPollStats,
+  getAdminPollDetails,
+  clearPollVotes,
+  deletePoll,
 };

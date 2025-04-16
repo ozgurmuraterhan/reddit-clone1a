@@ -1,7 +1,10 @@
-const mongoose = require('mongoose');
-const { Transaction, User, AwardInstance, UserPremium } = require('../models');
+const Transaction = require('../models/Transaction');
+const User = require('../models/User');
+const AwardInstance = require('../models/AwardInstance'); // Varsayımsal model
+const UserPremium = require('../models/UserPremium'); // Varsayımsal model
 const asyncHandler = require('../middleware/async');
 const ErrorResponse = require('../utils/errorResponse');
+const mongoose = require('mongoose');
 
 /**
  * @desc    Kullanıcının işlemlerini getir
@@ -10,16 +13,18 @@ const ErrorResponse = require('../utils/errorResponse');
  */
 const getUserTransactions = asyncHandler(async (req, res, next) => {
   const userId = req.user._id;
-  const page = parseInt(req.query.page) || 1;
-  const limit = parseInt(req.query.limit) || 20;
-  const skip = (page - 1) * limit;
-  const { type, status, sortBy = 'createdAt', order = 'desc' } = req.query;
+
+  // Pagination
+  const page = parseInt(req.query.page, 10) || 1;
+  const limit = parseInt(req.query.limit, 10) || 20;
+  const startIndex = (page - 1) * limit;
 
   // Filtreleme seçenekleri
   const filter = { user: userId };
 
+  // İşlem tipine göre filtreleme
   if (
-    type &&
+    req.query.type &&
     [
       'purchase',
       'award_given',
@@ -28,50 +33,105 @@ const getUserTransactions = asyncHandler(async (req, res, next) => {
       'premium_gift',
       'refund',
       'other',
-    ].includes(type)
+    ].includes(req.query.type)
   ) {
-    filter.type = type;
+    filter.type = req.query.type;
   }
 
-  if (status && ['pending', 'completed', 'failed', 'refunded'].includes(status)) {
-    filter.status = status;
+  // Duruma göre filtreleme
+  if (
+    req.query.status &&
+    ['pending', 'completed', 'failed', 'refunded'].includes(req.query.status)
+  ) {
+    filter.status = req.query.status;
   }
 
-  // Sıralama ayarları
-  const sortOptions = {};
-  if (['createdAt', 'amount', 'updatedAt'].includes(sortBy)) {
-    sortOptions[sortBy] = order === 'asc' ? 1 : -1;
-  } else {
-    sortOptions.createdAt = -1;
+  // Para birimine göre filtreleme
+  if (req.query.currency && ['USD', 'EUR', 'GBP', 'coins'].includes(req.query.currency)) {
+    filter.currency = req.query.currency;
   }
+
+  // Tarih aralığına göre filtreleme
+  if (req.query.startDate) {
+    if (!filter.createdAt) filter.createdAt = {};
+    filter.createdAt.$gte = new Date(req.query.startDate);
+  }
+
+  if (req.query.endDate) {
+    if (!filter.createdAt) filter.createdAt = {};
+    filter.createdAt.$lte = new Date(req.query.endDate);
+  }
+
+  // Toplam sayıyı hesapla
+  const total = await Transaction.countDocuments(filter);
 
   // İşlemleri getir
   const transactions = await Transaction.find(filter)
-    .sort(sortOptions)
-    .skip(skip)
+    .sort({ createdAt: -1 })
+    .skip(startIndex)
     .limit(limit)
-    .populate('relatedAward', 'awardType recipientType')
-    .populate('relatedPremium', 'tier duration startDate endDate')
-    .populate('relatedTransaction', 'type amount status');
+    .populate('relatedTransaction', 'type amount currency status')
+    .populate('relatedAward', 'name value icon')
+    .populate('relatedPremium', 'type duration startDate endDate');
 
-  const total = await Transaction.countDocuments(filter);
+  // Özet istatistikleri hesapla (isteğe bağlı)
+  let summary = null;
+  if (req.query.includeSummary === 'true') {
+    const aggregationResults = await Transaction.aggregate([
+      { $match: { user: mongoose.Types.ObjectId(userId) } },
+      {
+        $group: {
+          _id: '$currency',
+          totalSpent: {
+            $sum: {
+              $cond: [
+                { $in: ['$type', ['purchase', 'award_given', 'premium_purchase']] },
+                '$amount',
+                0,
+              ],
+            },
+          },
+          totalReceived: {
+            $sum: {
+              $cond: [{ $in: ['$type', ['award_received', 'refund']] }, '$amount', 0],
+            },
+          },
+          count: { $sum: 1 },
+        },
+      },
+    ]);
+
+    // Özeti düzenle
+    summary = {};
+    aggregationResults.forEach((result) => {
+      summary[result._id] = {
+        totalSpent: result.totalSpent,
+        totalReceived: result.totalReceived,
+        balance: result.totalReceived - result.totalSpent,
+        count: result.count,
+      };
+    });
+  }
 
   res.status(200).json({
     success: true,
-    count: transactions.length,
-    total,
-    totalPages: Math.ceil(total / limit),
-    currentPage: page,
+    count: total,
+    pagination: {
+      page,
+      limit,
+      totalPages: Math.ceil(total / limit),
+    },
+    summary,
     data: transactions,
   });
 });
 
 /**
- * @desc    İşlem detaylarını getir
+ * @desc    Belirli bir işlemi getir
  * @route   GET /api/transactions/:id
  * @access  Private
  */
-const getTransactionById = asyncHandler(async (req, res, next) => {
+const getTransaction = asyncHandler(async (req, res, next) => {
   const { id } = req.params;
   const userId = req.user._id;
 
@@ -80,15 +140,15 @@ const getTransactionById = asyncHandler(async (req, res, next) => {
   }
 
   const transaction = await Transaction.findById(id)
-    .populate('relatedAward', 'awardType recipientType')
-    .populate('relatedPremium', 'tier duration startDate endDate')
-    .populate('relatedTransaction', 'type amount status');
+    .populate('relatedTransaction', 'type amount currency status')
+    .populate('relatedAward', 'name value icon')
+    .populate('relatedPremium', 'type duration startDate endDate');
 
   if (!transaction) {
     return next(new ErrorResponse('İşlem bulunamadı', 404));
   }
 
-  // Yetki kontrolü
+  // Yetki kontrolü - sadece kendi işlemlerini görebilir (admin hariç)
   if (transaction.user.toString() !== userId.toString() && req.user.role !== 'admin') {
     return next(new ErrorResponse('Bu işlemi görüntüleme yetkiniz yok', 403));
   }
@@ -100,437 +160,699 @@ const getTransactionById = asyncHandler(async (req, res, next) => {
 });
 
 /**
- * @desc    Coin satın alma işlemi oluştur
+ * @desc    Coin satın alma işlemi başlat
  * @route   POST /api/transactions/purchase/coins
  * @access  Private
  */
-const createCoinPurchase = asyncHandler(async (req, res, next) => {
-  const { packageId, amount, paymentMethod, paymentReference } = req.body;
+const purchaseCoins = asyncHandler(async (req, res, next) => {
   const userId = req.user._id;
+  const { amount, currency, paymentMethod, packageId } = req.body;
 
-  // Giriş doğrulaması
-  if (!packageId || !amount || amount <= 0 || !paymentMethod) {
-    return next(new ErrorResponse('Lütfen gerekli tüm alanları doldurun', 400));
+  // Gerekli alanları kontrol et
+  if (!amount || amount <= 0) {
+    return next(new ErrorResponse('Geçerli bir miktar gerekli', 400));
   }
 
-  // Ödeme yöntemi doğrulaması
-  const validPaymentMethods = ['credit_card', 'paypal', 'apple_pay', 'google_pay', 'other'];
-  if (!validPaymentMethods.includes(paymentMethod)) {
-    return next(new ErrorResponse('Geçersiz ödeme yöntemi', 400));
+  if (!currency || !['USD', 'EUR', 'GBP'].includes(currency)) {
+    return next(new ErrorResponse('Geçerli bir para birimi gerekli (USD, EUR, GBP)', 400));
   }
 
-  // Coin paketi bilgilerini al (gerçek uygulamada veritabanından gelir)
-  const coinPackages = {
-    basic: { coins: 500, price: 4.99, currency: 'USD' },
-    standard: { coins: 1100, price: 9.99, currency: 'USD' },
-    premium: { coins: 2400, price: 19.99, currency: 'USD' },
-    ultimate: { coins: 7200, price: 49.99, currency: 'USD' },
-  };
-
-  const selectedPackage = coinPackages[packageId];
-  if (!selectedPackage) {
-    return next(new ErrorResponse('Geçersiz coin paketi', 400));
+  if (
+    !paymentMethod ||
+    !['credit_card', 'paypal', 'apple_pay', 'google_pay', 'other'].includes(paymentMethod)
+  ) {
+    return next(new ErrorResponse('Geçerli bir ödeme yöntemi gerekli', 400));
   }
 
-  // Tutar doğrulaması
-  if (selectedPackage.price !== amount) {
-    return next(new ErrorResponse('Geçersiz ödeme tutarı', 400));
+  // Coin paketlerini kontrol et (varsayımsal bir yapı)
+  let coinAmount = 0;
+  let description = '';
+
+  switch (packageId) {
+    case 'basic':
+      coinAmount = 500;
+      description = `${coinAmount} Coin Satın Alma - Temel Paket`;
+      break;
+    case 'standard':
+      coinAmount = 1200;
+      description = `${coinAmount} Coin Satın Alma - Standart Paket`;
+      break;
+    case 'premium':
+      coinAmount = 3000;
+      description = `${coinAmount} Coin Satın Alma - Premium Paket`;
+      break;
+    case 'custom':
+      coinAmount = calculateCustomCoinAmount(amount, currency);
+      description = `${coinAmount} Coin Satın Alma - Özel Miktar`;
+      break;
+    default:
+      return next(new ErrorResponse('Geçersiz paket ID', 400));
   }
 
-  // İşlem oluştur
+  // Ödeme işlemini başlat (varsayımsal)
+  // Gerçek uygulamada burada Stripe, PayPal vb. entegrasyonu olacaktır
+  const paymentResponse = await processPayment({
+    userId,
+    amount,
+    currency,
+    paymentMethod,
+    description,
+  });
+
+  // İşlemi oluştur
   const transaction = await Transaction.create({
     user: userId,
     type: 'purchase',
-    amount: selectedPackage.price,
-    currency: selectedPackage.currency,
-    description: `${selectedPackage.coins} Coin satın alımı`,
-    status: 'pending', // Başlangıçta beklemede
+    amount,
+    currency,
+    description,
+    status: 'pending',
     paymentMethod,
-    paymentReference: paymentReference || null,
+    paymentReference: paymentResponse.paymentId,
     metadata: {
+      coinAmount,
       packageId,
-      coinAmount: selectedPackage.coins,
+      paymentDetails: paymentResponse.details,
     },
   });
 
-  // Ödeme entegrasyonu burada gerçekleşir
-  // Bu örnek için işlemi hemen tamamlıyoruz
-  transaction.status = 'completed';
-  await transaction.save();
-
-  // Kullanıcının coin bakiyesini güncelle
-  const user = await User.findById(userId);
-  user.coins = (user.coins || 0) + selectedPackage.coins;
-  await user.save();
-
   res.status(201).json({
     success: true,
-    data: transaction,
-    coins: user.coins,
+    message: 'Coin satın alma işlemi başlatıldı',
+    data: {
+      transaction,
+      paymentDetails: paymentResponse.clientResponse,
+    },
   });
 });
 
 /**
- * @desc    Premium üyelik satın alma işlemi oluştur
+ * @desc    Premium üyelik satın alma işlemi başlat
  * @route   POST /api/transactions/purchase/premium
  * @access  Private
  */
-const createPremiumPurchase = asyncHandler(async (req, res, next) => {
-  const { tier, duration, paymentMethod, paymentReference, useCoins } = req.body;
+const purchasePremium = asyncHandler(async (req, res, next) => {
   const userId = req.user._id;
+  const { planType, duration, paymentMethod, payWithCoins } = req.body;
 
-  // Giriş doğrulaması
-  if (!tier || !duration || (!paymentMethod && !useCoins)) {
-    return next(new ErrorResponse('Lütfen gerekli tüm alanları doldurun', 400));
+  // Gerekli alanları kontrol et
+  if (!planType || !['standard', 'gold', 'platinum'].includes(planType)) {
+    return next(new ErrorResponse('Geçerli bir premium plan tipi gerekli', 400));
   }
 
-  // Premium paket bilgilerini al
-  const premiumPlans = {
-    basic: {
-      1: { price: 5.99, coins: 700 },
-      3: { price: 14.99, coins: 1750 },
-      12: { price: 49.99, coins: 5800 },
-    },
-    standard: {
-      1: { price: 8.99, coins: 1050 },
-      3: { price: 22.99, coins: 2650 },
-      12: { price: 79.99, coins: 9300 },
-    },
-    pro: {
-      1: { price: 12.99, coins: 1500 },
-      3: { price: 33.99, coins: 3950 },
-      12: { price: 119.99, coins: 13900 },
-    },
-    ultimate: {
-      1: { price: 19.99, coins: 2300 },
-      3: { price: 53.99, coins: 6250 },
-      12: { price: 189.99, coins: 22000 },
-    },
-  };
-
-  // Plan geçerliliğini kontrol et
-  if (!premiumPlans[tier] || !premiumPlans[tier][duration]) {
-    return next(new ErrorResponse('Geçersiz premium paket veya süre', 400));
+  if (!duration || !['month', 'year'].includes(duration)) {
+    return next(new ErrorResponse('Geçerli bir süre gerekli (month, year)', 400));
   }
 
-  const selectedPlan = premiumPlans[tier][duration];
-  let transactionData;
+  // Planın fiyatını hesapla (varsayımsal fiyat yapısı)
+  const { amount, currency, coinPrice } = calculatePremiumPrice(planType, duration);
 
-  // Kullanıcıyı al
-  const user = await User.findById(userId);
-
-  // Coin ile ödeme işlemi
-  if (useCoins) {
-    // Kullanıcının yeterli coini var mı kontrol et
-    if (!user.coins || user.coins < selectedPlan.coins) {
-      return next(new ErrorResponse('Yetersiz coin bakiyesi', 400));
-    }
-
-    // Coin işlemini oluştur
-    transactionData = {
-      user: userId,
-      type: 'premium_purchase',
-      amount: selectedPlan.coins,
-      currency: 'coins',
-      description: `${tier} premium üyelik (${duration} ay) - Coin ile ödeme`,
-      status: 'completed',
-      metadata: {
-        premiumTier: tier,
-        durationMonths: duration,
-      },
-    };
-
-    // Kullanıcının coin bakiyesini düşür
-    user.coins -= selectedPlan.coins;
-    await user.save();
-  }
-  // Gerçek para ile ödeme işlemi
-  else {
-    // Ödeme yöntemi doğrulaması
-    const validPaymentMethods = ['credit_card', 'paypal', 'apple_pay', 'google_pay', 'other'];
-    if (!validPaymentMethods.includes(paymentMethod)) {
-      return next(new ErrorResponse('Geçersiz ödeme yöntemi', 400));
-    }
-
-    transactionData = {
-      user: userId,
-      type: 'premium_purchase',
-      amount: selectedPlan.price,
-      currency: 'USD',
-      description: `${tier} premium üyelik (${duration} ay)`,
-      status: 'pending',
-      paymentMethod,
-      paymentReference: paymentReference || null,
-      metadata: {
-        premiumTier: tier,
-        durationMonths: duration,
-      },
-    };
-
-    // Ödeme entegrasyonu burada gerçekleşir
-    // Bu örnek için işlemi hemen tamamlıyoruz
-    transactionData.status = 'completed';
-  }
-
-  // İşlemi oluştur
-  const transaction = await Transaction.create(transactionData);
-
-  // Premium üyelik kaydı oluştur
-  const startDate = new Date();
-  const endDate = new Date();
-  endDate.setMonth(endDate.getMonth() + parseInt(duration));
-
-  const userPremium = await UserPremium.create({
+  // Kullanıcının mevcut premium durumunu kontrol et
+  const existingPremium = await UserPremium.findOne({
     user: userId,
-    tier,
-    startDate,
-    endDate,
-    duration: parseInt(duration),
-    active: true,
-    source: useCoins ? 'coin_purchase' : 'direct_purchase',
+    status: 'active',
+    endDate: { $gt: new Date() },
   });
 
-  // İşlem ve premium üyelik arasında bağlantı kur
-  transaction.relatedPremium = userPremium._id;
-  await transaction.save();
+  // Eğer aktif premium varsa, uzatma işlemi yap
+  const isPremiumExtension = !!existingPremium;
 
-  // Kullanıcı premium durumunu güncelle
-  user.isPremium = true;
-  user.premiumTier = tier;
-  user.premiumExpiry = endDate;
-  await user.save();
+  // Coin ile ödeme yapılacaksa
+  if (payWithCoins) {
+    // Kullanıcının coin bakiyesini kontrol et
+    const user = await User.findById(userId);
+    if (!user.coins || user.coins < coinPrice) {
+      return next(
+        new ErrorResponse(
+          `Yetersiz coin bakiyesi. Gereken: ${coinPrice}, Mevcut: ${user.coins || 0}`,
+          400,
+        ),
+      );
+    }
+
+    // Premium üyelik oluştur
+    const premiumMembership = await createPremiumMembership(
+      userId,
+      planType,
+      duration,
+      existingPremium,
+    );
+
+    // İşlemi oluştur
+    const transaction = await Transaction.create({
+      user: userId,
+      type: 'premium_purchase',
+      amount: coinPrice,
+      currency: 'coins',
+      description: `${planType.charAt(0).toUpperCase() + planType.slice(1)} Premium Üyelik - ${duration === 'month' ? 'Aylık' : 'Yıllık'}`,
+      status: 'completed',
+      paymentMethod: 'coins',
+      relatedPremium: premiumMembership._id,
+      metadata: {
+        planType,
+        duration,
+        isPremiumExtension,
+      },
+    });
+
+    // Kullanıcının coin bakiyesini güncelle
+    await User.findByIdAndUpdate(userId, {
+      $inc: { coins: -coinPrice },
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: 'Premium üyelik satın alındı',
+      data: {
+        transaction,
+        premium: premiumMembership,
+        coinBalance: user.coins - coinPrice,
+      },
+    });
+  }
+
+  // Kredi kartı/diğer ödeme yöntemleri ile ödeme
+  if (
+    !paymentMethod ||
+    !['credit_card', 'paypal', 'apple_pay', 'google_pay', 'other'].includes(paymentMethod)
+  ) {
+    return next(new ErrorResponse('Geçerli bir ödeme yöntemi gerekli', 400));
+  }
+
+  // Ödeme işlemini başlat (varsayımsal)
+  const description = `${planType.charAt(0).toUpperCase() + planType.slice(1)} Premium Üyelik - ${duration === 'month' ? 'Aylık' : 'Yıllık'}`;
+  const paymentResponse = await processPayment({
+    userId,
+    amount,
+    currency,
+    paymentMethod,
+    description,
+  });
+
+  // Premium üyelik oluştur (ödeme tamamlandığında aktifleşecek)
+  const premiumMembership = await createPendingPremiumMembership(
+    userId,
+    planType,
+    duration,
+    existingPremium,
+  );
+
+  // İşlemi oluştur
+  const transaction = await Transaction.create({
+    user: userId,
+    type: 'premium_purchase',
+    amount,
+    currency,
+    description,
+    status: 'pending',
+    paymentMethod,
+    paymentReference: paymentResponse.paymentId,
+    relatedPremium: premiumMembership._id,
+    metadata: {
+      planType,
+      duration,
+      isPremiumExtension,
+    },
+  });
 
   res.status(201).json({
     success: true,
+    message: 'Premium üyelik satın alma işlemi başlatıldı',
     data: {
       transaction,
-      premium: userPremium,
-      userCoins: user.coins,
+      paymentDetails: paymentResponse.clientResponse,
     },
   });
 });
 
 /**
- * @desc    Ödül verme işlemi oluştur
+ * @desc    Ödül verme işlemi
  * @route   POST /api/transactions/award
  * @access  Private
  */
-const createAwardTransaction = asyncHandler(async (req, res, next) => {
-  const { awardType, recipientId, targetType, targetId } = req.body;
+const giveAward = asyncHandler(async (req, res, next) => {
   const userId = req.user._id;
+  const { awardId, recipientId, itemType, itemId, message } = req.body;
 
-  // Giriş doğrulaması
-  if (!awardType || !recipientId || !targetType || !targetId) {
-    return next(new ErrorResponse('Lütfen gerekli tüm alanları doldurun', 400));
+  // Gerekli alanları kontrol et
+  if (!awardId || !mongoose.Types.ObjectId.isValid(awardId)) {
+    return next(new ErrorResponse('Geçerli bir ödül ID gerekli', 400));
   }
 
-  if (!mongoose.Types.ObjectId.isValid(recipientId) || !mongoose.Types.ObjectId.isValid(targetId)) {
-    return next(new ErrorResponse('Geçersiz ID formatı', 400));
+  if (!recipientId || !mongoose.Types.ObjectId.isValid(recipientId)) {
+    return next(new ErrorResponse('Geçerli bir alıcı ID gerekli', 400));
   }
 
-  if (!['post', 'comment'].includes(targetType)) {
-    return next(new ErrorResponse('Geçersiz hedef türü', 400));
+  if (!itemType || !['post', 'comment'].includes(itemType)) {
+    return next(new ErrorResponse('Geçerli bir öğe tipi gerekli (post, comment)', 400));
   }
 
-  // Ödül bilgilerini al
-  const awardTypes = {
-    silver: { price: 100, benefits: { karma: 10, coins: 0, premium: 0 } },
-    gold: { price: 500, benefits: { karma: 50, coins: 100, premium: 7 } },
-    platinum: { price: 1800, benefits: { karma: 100, coins: 700, premium: 30 } },
-    wholesome: { price: 150, benefits: { karma: 15, coins: 0, premium: 0 } },
-    helpful: { price: 150, benefits: { karma: 15, coins: 0, premium: 0 } },
-  };
-
-  const selectedAward = awardTypes[awardType];
-  if (!selectedAward) {
-    return next(new ErrorResponse('Geçersiz ödül türü', 400));
+  if (!itemId || !mongoose.Types.ObjectId.isValid(itemId)) {
+    return next(new ErrorResponse('Geçerli bir öğe ID gerekli', 400));
   }
 
-  // Kullanıcının coin bakiyesini kontrol et
-  const user = await User.findById(userId);
-  if (!user) {
-    return next(new ErrorResponse('Kullanıcı bulunamadı', 404));
+  // Ödülü kontrol et
+  const award = await Award.findById(awardId);
+  if (!award) {
+    return next(new ErrorResponse('Ödül bulunamadı', 404));
   }
 
-  if (!user.coins || user.coins < selectedAward.price) {
-    return next(new ErrorResponse('Yetersiz coin bakiyesi', 400));
-  }
-
-  // Alıcı kullanıcıyı kontrol et
+  // Alıcıyı kontrol et
   const recipient = await User.findById(recipientId);
   if (!recipient) {
     return next(new ErrorResponse('Alıcı kullanıcı bulunamadı', 404));
   }
 
-  // Hedef içeriği kontrol et (post veya comment)
-  let targetModel, targetContent;
-  if (targetType === 'post') {
-    targetModel = Post;
+  // Öğeyi kontrol et
+  let item;
+  let Model;
+  if (itemType === 'post') {
+    Model = mongoose.model('Post');
+    item = await Model.findById(itemId);
   } else {
-    targetModel = Comment;
+    Model = mongoose.model('Comment');
+    item = await Model.findById(itemId);
   }
 
-  targetContent = await targetModel.findById(targetId);
-  if (!targetContent) {
+  if (!item) {
+    return next(new ErrorResponse(`${itemType === 'post' ? 'Gönderi' : 'Yorum'} bulunamadı`, 404));
+  }
+
+  // Öğenin sahibinin alıcı olduğunu kontrol et
+  if (item.author.toString() !== recipientId.toString()) {
+    return next(new ErrorResponse('Alıcı ID, öğenin sahibi ile eşleşmiyor', 400));
+  }
+
+  // Kullanıcının coin bakiyesini kontrol et
+  const user = await User.findById(userId);
+  if (!user.coins || user.coins < award.cost) {
     return next(
-      new ErrorResponse(`Hedef ${targetType === 'post' ? 'gönderi' : 'yorum'} bulunamadı`, 404),
+      new ErrorResponse(
+        `Yetersiz coin bakiyesi. Gereken: ${award.cost}, Mevcut: ${user.coins || 0}`,
+        400,
+      ),
     );
   }
 
-  // Kullanıcının coin bakiyesini düşür
-  user.coins -= selectedAward.price;
-  await user.save();
+  // Ödül verme işlemini başlat
+  const session = await mongoose.startSession();
+  session.startTransaction();
 
-  // Ödül örneği oluştur
-  const awardInstance = await AwardInstance.create({
-    awardType,
-    giver: userId,
-    recipient: recipientId,
-    targetType,
-    targetId,
-    benefits: selectedAward.benefits,
-  });
+  try {
+    // Kullanıcının coin bakiyesini düşür
+    await User.findByIdAndUpdate(userId, { $inc: { coins: -award.cost } }, { session });
 
-  // Verilen ödül için işlem oluştur
-  const giverTransaction = await Transaction.create({
-    user: userId,
-    type: 'award_given',
-    amount: -selectedAward.price,
-    currency: 'coins',
-    description: `${awardType} ödülü verildi`,
-    status: 'completed',
-    relatedAward: awardInstance._id,
-    metadata: {
-      recipientId,
-      targetType,
-      targetId,
-      awardType,
-    },
-  });
-
-  // Alınan ödül için işlem oluştur (coin hediyesi varsa)
-  if (selectedAward.benefits.coins > 0) {
-    const recipientTransaction = await Transaction.create({
-      user: recipientId,
-      type: 'award_received',
-      amount: selectedAward.benefits.coins,
-      currency: 'coins',
-      description: `${awardType} ödülü alındı`,
-      status: 'completed',
-      relatedAward: awardInstance._id,
-      relatedTransaction: giverTransaction._id,
-      metadata: {
-        giverId: userId,
-        targetType,
-        targetId,
-        awardType,
-      },
-    });
-
-    // Alıcının coin bakiyesini güncelle
-    recipient.coins = (recipient.coins || 0) + selectedAward.benefits.coins;
-
-    // Gönderici işlemini güncelle
-    giverTransaction.relatedTransaction = recipientTransaction._id;
-    await giverTransaction.save();
-  }
-
-  // Alıcının karma puanını güncelle
-  if (selectedAward.benefits.karma > 0) {
-    recipient.karma = (recipient.karma || 0) + selectedAward.benefits.karma;
-  }
-
-  // Premium süre eklemesi varsa
-  if (selectedAward.benefits.premium > 0) {
-    const premiumDays = selectedAward.benefits.premium;
-    let currentExpiry = recipient.premiumExpiry || new Date();
-
-    // Eğer zaten süresi geçmişse şimdiki tarihten başlat
-    if (currentExpiry < new Date()) {
-      currentExpiry = new Date();
+    // Alıcının coin bakiyesini arttır (eğer ödülün coin ödülü varsa)
+    if (award.coinReward > 0) {
+      await User.findByIdAndUpdate(recipientId, { $inc: { coins: award.coinReward } }, { session });
     }
 
-    // Premium süresini uzat
-    const newExpiry = new Date(currentExpiry);
-    newExpiry.setDate(newExpiry.getDate() + premiumDays);
+    // Ödül örneği oluştur
+    const awardInstance = await AwardInstance.create(
+      [
+        {
+          award: awardId,
+          giver: userId,
+          recipient: recipientId,
+          item: itemId,
+          itemType,
+          message: message || '',
+          isAnonymous: !!req.body.isAnonymous,
+        },
+      ],
+      { session },
+    );
 
-    // Kullanıcı premium bilgilerini güncelle
-    recipient.isPremium = true;
-    recipient.premiumExpiry = newExpiry;
+    // Verilen ödül işlemini oluştur
+    const giverTransaction = await Transaction.create(
+      [
+        {
+          user: userId,
+          type: 'award_given',
+          amount: award.cost,
+          currency: 'coins',
+          description: `${award.name} ödülü verme`,
+          status: 'completed',
+          relatedAward: awardInstance[0]._id,
+          metadata: {
+            recipientId,
+            itemType,
+            itemId,
+            awardName: award.name,
+          },
+        },
+      ],
+      { session },
+    );
 
-    // Premium kaydı oluştur
-    const userPremium = await UserPremium.create({
-      user: recipientId,
-      tier: 'basic', // Ödül premium'u basic seviyesinden başlar
-      startDate: new Date(),
-      endDate: newExpiry,
-      duration: premiumDays / 30, // Ay olarak (yaklaşık)
-      active: true,
-      source: 'award_gift',
+    // Alınan ödül işlemini oluştur (eğer coin ödülü varsa)
+    let recipientTransaction = null;
+    if (award.coinReward > 0) {
+      recipientTransaction = await Transaction.create(
+        [
+          {
+            user: recipientId,
+            type: 'award_received',
+            amount: award.coinReward,
+            currency: 'coins',
+            description: `${award.name} ödülü alındı`,
+            status: 'completed',
+            relatedAward: awardInstance[0]._id,
+            relatedTransaction: giverTransaction[0]._id,
+            metadata: {
+              giverId: userId,
+              itemType,
+              itemId,
+              awardName: award.name,
+              isAnonymous: !!req.body.isAnonymous,
+            },
+          },
+        ],
+        { session },
+      );
+    }
+
+    // Öğeye ödülü ekle
+    await Model.findByIdAndUpdate(itemId, { $push: { awards: awardInstance[0]._id } }, { session });
+
+    await session.commitTransaction();
+
+    // Verilen transaksiyon ID'sini ilgili işleme ekle
+    if (recipientTransaction) {
+      await Transaction.findByIdAndUpdate(giverTransaction[0]._id, {
+        relatedTransaction: recipientTransaction[0]._id,
+      });
+    }
+
+    res.status(201).json({
+      success: true,
+      message: 'Ödül başarıyla verildi',
+      data: {
+        transaction: giverTransaction[0],
+        awardInstance: awardInstance[0],
+        remainingCoins: user.coins - award.cost,
+      },
     });
-
-    // İşlem ve premium arasında bağlantı kur
-    giverTransaction.relatedPremium = userPremium._id;
-    await giverTransaction.save();
+  } catch (error) {
+    await session.abortTransaction();
+    return next(new ErrorResponse('Ödül verme işlemi başarısız oldu', 500));
+  } finally {
+    session.endSession();
   }
-
-  // Alıcı kullanıcıyı kaydet
-  await recipient.save();
-
-  // Bildirim gönder
-  await Notification.create({
-    type: 'award_received',
-    recipient: recipientId,
-    sender: userId,
-    [`related${targetType.charAt(0).toUpperCase() + targetType.slice(1)}`]: targetId,
-    message: `${user.username} size ${awardType} ödülü verdi`,
-  });
-
-  res.status(201).json({
-    success: true,
-    data: {
-      awardInstance,
-      transaction: giverTransaction,
-      remainingCoins: user.coins,
-    },
-  });
 });
 
 /**
- * @desc    İade işlemi oluştur
- * @route   POST /api/transactions/refund
- * @access  Private (Admin)
+ * @desc    Premium hediye etme
+ * @route   POST /api/transactions/gift/premium
+ * @access  Private
  */
-const processRefund = asyncHandler(async (req, res, next) => {
-  const { transactionId, reason } = req.body;
+const giftPremium = asyncHandler(async (req, res, next) => {
+  const userId = req.user._id;
+  const { recipientId, planType, duration, payWithCoins, paymentMethod } = req.body;
+
+  // Gerekli alanları kontrol et
+  if (!recipientId || !mongoose.Types.ObjectId.isValid(recipientId)) {
+    return next(new ErrorResponse('Geçerli bir alıcı ID gerekli', 400));
+  }
+
+  if (!planType || !['standard', 'gold', 'platinum'].includes(planType)) {
+    return next(new ErrorResponse('Geçerli bir premium plan tipi gerekli', 400));
+  }
+
+  if (!duration || !['month', 'year'].includes(duration)) {
+    return next(new ErrorResponse('Geçerli bir süre gerekli (month, year)', 400));
+  }
+
+  // Alıcıyı kontrol et
+  const recipient = await User.findById(recipientId);
+  if (!recipient) {
+    return next(new ErrorResponse('Alıcı kullanıcı bulunamadı', 404));
+  }
+
+  // Planın fiyatını hesapla
+  const { amount, currency, coinPrice } = calculatePremiumPrice(planType, duration);
+
+  // Hediye açıklaması
+  const giftDescription = `${planType.charAt(0).toUpperCase() + planType.slice(1)} Premium Hediyesi - ${duration === 'month' ? 'Aylık' : 'Yıllık'} (${recipient.username})`;
+
+  // Alıcının mevcut premium durumunu kontrol et
+  const existingPremium = await UserPremium.findOne({
+    user: recipientId,
+    status: 'active',
+    endDate: { $gt: new Date() },
+  });
+
+  // Eğer aktif premium varsa, uzatma işlemi yap
+  const isPremiumExtension = !!existingPremium;
+
+  // Coin ile ödeme yapılacaksa
+  if (payWithCoins) {
+    // Kullanıcının coin bakiyesini kontrol et
+    const user = await User.findById(userId);
+    if (!user.coins || user.coins < coinPrice) {
+      return next(
+        new ErrorResponse(
+          `Yetersiz coin bakiyesi. Gereken: ${coinPrice}, Mevcut: ${user.coins || 0}`,
+          400,
+        ),
+      );
+    }
+
+    // Premium üyelik oluştur
+    const premiumMembership = await createPremiumMembership(
+      recipientId,
+      planType,
+      duration,
+      existingPremium,
+    );
+
+    // İşlem başlat
+    const session = await mongoose.startSession();
+    session.startTransaction();
+
+    try {
+      // Kullanıcının coin bakiyesini düşür
+      await User.findByIdAndUpdate(userId, { $inc: { coins: -coinPrice } }, { session });
+
+      // Hediye veren işlemini oluştur
+      const transaction = await Transaction.create(
+        [
+          {
+            user: userId,
+            type: 'premium_gift',
+            amount: coinPrice,
+            currency: 'coins',
+            description: giftDescription,
+            status: 'completed',
+            paymentMethod: 'coins',
+            relatedPremium: premiumMembership._id,
+            metadata: {
+              recipientId,
+              planType,
+              duration,
+              isPremiumExtension,
+            },
+          },
+        ],
+        { session },
+      );
+
+      await session.commitTransaction();
+
+      res.status(201).json({
+        success: true,
+        message: 'Premium üyelik hediye edildi',
+        data: {
+          transaction: transaction[0],
+          premium: premiumMembership,
+          coinBalance: user.coins - coinPrice,
+        },
+      });
+    } catch (error) {
+      await session.abortTransaction();
+      return next(new ErrorResponse('Premium hediye etme işlemi başarısız oldu', 500));
+    } finally {
+      session.endSession();
+    }
+  } else {
+    // Kredi kartı/diğer ödeme yöntemleri ile ödeme
+    if (
+      !paymentMethod ||
+      !['credit_card', 'paypal', 'apple_pay', 'google_pay', 'other'].includes(paymentMethod)
+    ) {
+      return next(new ErrorResponse('Geçerli bir ödeme yöntemi gerekli', 400));
+    }
+
+    // Ödeme işlemini başlat (varsayımsal)
+    const paymentResponse = await processPayment({
+      userId,
+      amount,
+      currency,
+      paymentMethod,
+      description: giftDescription,
+    });
+
+    // Premium üyelik oluştur (ödeme tamamlandığında aktifleşecek)
+    const premiumMembership = await createPendingPremiumMembership(
+      recipientId,
+      planType,
+      duration,
+      existingPremium,
+    );
+
+    // İşlemi oluştur
+    const transaction = await Transaction.create({
+      user: userId,
+      type: 'premium_gift',
+      amount,
+      currency,
+      description: giftDescription,
+      status: 'pending',
+      paymentMethod,
+      paymentReference: paymentResponse.paymentId,
+      relatedPremium: premiumMembership._id,
+      metadata: {
+        recipientId,
+        planType,
+        duration,
+        isPremiumExtension,
+      },
+    });
+
+    res.status(201).json({
+      success: true,
+      message: 'Premium üyelik hediye etme işlemi başlatıldı',
+      data: {
+        transaction,
+        paymentDetails: paymentResponse.clientResponse,
+      },
+    });
+  }
+});
+
+/**
+ * @desc    İade işlemi başlat
+ * @route   POST /api/transactions/:id/refund
+ * @access  Private (Admin only)
+ */
+const initiateRefund = asyncHandler(async (req, res, next) => {
+  const { id } = req.params;
+  const { reason } = req.body;
+  const adminId = req.user._id;
 
   // Admin yetkisi kontrolü
   if (req.user.role !== 'admin') {
-    return next(new ErrorResponse('Bu işlem için admin yetkisi gereklidir', 403));
+    return next(new ErrorResponse('Bu işlem için admin yetkisi gerekiyor', 403));
   }
 
-  if (!transactionId || !mongoose.Types.ObjectId.isValid(transactionId)) {
-    return next(new ErrorResponse("Geçerli bir işlem ID'si giriniz", 400));
+  if (!mongoose.Types.ObjectId.isValid(id)) {
+    return next(new ErrorResponse('Geçersiz işlem ID formatı', 400));
   }
 
-  // İşlemi bul
-  const transaction = await Transaction.findById(transactionId);
+  // İşlemi kontrol et
+  const transaction = await Transaction.findById(id);
   if (!transaction) {
     return next(new ErrorResponse('İşlem bulunamadı', 404));
   }
 
-  // İşlemin iade edilebilir olup olmadığını kontrol et
-  if (['failed', 'refunded'].includes(transaction.status)) {
-    return next(new ErrorResponse('Bu işlem zaten başarısız olmuş veya iade edilmiş', 400));
+  // Sadece tamamlanmış işlemler iade edilebilir
+  if (transaction.status !== 'completed') {
+    return next(new ErrorResponse(`${transaction.status} durumundaki işlemler iade edilemez`, 400));
   }
 
-  if (!['purchase', 'premium_purchase'].includes(transaction.type)) {
-    return next(new ErrorResponse('Yalnızca satın alma işlemleri iade edilebilir', 400));
+  // Zaten iade edilmiş mi kontrol et
+  const existingRefund = await Transaction.findOne({
+    type: 'refund',
+    relatedTransaction: id,
+  });
+
+  if (existingRefund) {
+    return next(new ErrorResponse('Bu işlem zaten iade edilmiş', 400));
   }
 
-  // İşlemin durumunu güncelle
-  transaction.status = 'refunded';
-  await transaction.save();
+  // İşlem tipine göre iade işlemi yap
+  switch (transaction.type) {
+    case 'purchase':
+    case 'premium_purchase':
+    case 'premium_gift':
+      // Gerçek para ile yapılan işlemler için ödeme sistemine iade talebi (varsayımsal)
+      if (transaction.currency !== 'coins' && transaction.paymentReference) {
+        await processRefund(transaction.paymentReference, transaction.amount);
+      }
+
+      // İşlem sonucu kullanıcıya coinler verildiyse, coinleri geri al
+      if (transaction.metadata && transaction.metadata.coinAmount) {
+        // Kullanıcının mevcut coin bakiyesini kontrol et
+        const user = await User.findById(transaction.user);
+        if (!user) {
+          return next(new ErrorResponse('Kullanıcı bulunamadı', 404));
+        }
+
+        // Verilen coinlerden daha az coin varsa kısmi iade yap
+        const coinAmount = transaction.metadata.coinAmount;
+        const refundableCoins = Math.min(user.coins || 0, coinAmount);
+
+        if (refundableCoins > 0) {
+          await User.findByIdAndUpdate(transaction.user, {
+            $inc: { coins: -refundableCoins },
+          });
+        }
+      }
+      break;
+
+    case 'award_given':
+      // Ödül işlemleri için, ödül örneğini kaldır ve coinleri iade et
+      if (transaction.relatedAward) {
+        const awardInstance = await AwardInstance.findById(transaction.relatedAward);
+        if (awardInstance) {
+          // Ödül örneğini kaldır
+          await AwardInstance.findByIdAndDelete(transaction.relatedAward);
+
+          // İlgili öğeden ödülü kaldır
+          const Model = mongoose.model(awardInstance.itemType === 'post' ? 'Post' : 'Comment');
+          await Model.findByIdAndUpdate(awardInstance.item, {
+            $pull: { awards: transaction.relatedAward },
+          });
+
+          // Kullanıcıya coinleri iade et
+          await User.findByIdAndUpdate(transaction.user, {
+            $inc: { coins: transaction.amount },
+          });
+
+          // Eğer alıcı kullanıcı coin kazandıysa, bu coinleri geri al
+          if (transaction.relatedTransaction) {
+            const relatedTransaction = await Transaction.findById(transaction.relatedTransaction);
+            if (
+              relatedTransaction &&
+              relatedTransaction.type === 'award_received' &&
+              relatedTransaction.amount > 0
+            ) {
+              const recipient = await User.findById(relatedTransaction.user);
+              if (recipient) {
+                const refundableRecipientCoins = Math.min(
+                  recipient.coins || 0,
+                  relatedTransaction.amount,
+                );
+                if (refundableRecipientCoins > 0) {
+                  await User.findByIdAndUpdate(relatedTransaction.user, {
+                    $inc: { coins: -refundableRecipientCoins },
+                  });
+                }
+              }
+
+              // Alıcı işlemini de iade edilmiş olarak işaretle
+              await Transaction.findByIdAndUpdate(transaction.relatedTransaction, {
+                status: 'refunded',
+              });
+            }
+          }
+        }
+      }
+      break;
+
+    default:
+      return next(new ErrorResponse(`${transaction.type} türündeki işlemler iade edilemez`, 400));
+  }
 
   // İade işlemi oluştur
   const refundTransaction = await Transaction.create({
@@ -541,481 +863,808 @@ const processRefund = asyncHandler(async (req, res, next) => {
     description: `İade: ${transaction.description}`,
     status: 'completed',
     paymentMethod: transaction.paymentMethod,
-    paymentReference: `refund_${transaction.paymentReference || transaction._id}`,
+    paymentReference: transaction.paymentReference
+      ? `refund_${transaction.paymentReference}`
+      : null,
     relatedTransaction: transaction._id,
+    relatedAward: transaction.relatedAward,
+    relatedPremium: transaction.relatedPremium,
     metadata: {
-      originalTransactionId: transaction._id,
-      reason: reason || 'Müşteri talebi üzerine iade edildi',
+      originalTransactionType: transaction.type,
+      reason: reason || 'Admin tarafından başlatıldı',
+      initiatedBy: adminId,
     },
   });
 
-  // Eğer premium satın alımı ise premium üyeliği iptal et
-  if (transaction.type === 'premium_purchase' && transaction.relatedPremium) {
-    const premium = await UserPremium.findById(transaction.relatedPremium);
-    if (premium && premium.active) {
-      premium.active = false;
-      premium.cancelledAt = Date.now();
-      premium.cancellationReason = 'Ödeme iadesi';
-      await premium.save();
-
-      // Kullanıcının premium durumunu güncelle
-      const user = await User.findById(transaction.user);
-      if (user) {
-        // Diğer aktif premium'lar var mı kontrol et
-        const hasOtherActivePremium = await UserPremium.exists({
-          user: user._id,
-          active: true,
-          endDate: { $gt: new Date() },
-        });
-
-        if (!hasOtherActivePremium) {
-          user.isPremium = false;
-          user.premiumTier = null;
-          user.premiumExpiry = null;
-          await user.save();
-        }
-      }
-    }
-  }
+  // Orijinal işlemi iade edilmiş olarak işaretle
+  await Transaction.findByIdAndUpdate(id, {
+    status: 'refunded',
+  });
 
   res.status(200).json({
     success: true,
+    message: 'İade işlemi başarıyla tamamlandı',
+    data: refundTransaction,
+  });
+});
+
+/**
+ * @desc    Kullanıcının coin işlemlerinin özeti
+ * @route   GET /api/transactions/coin-summary
+ * @access  Private
+ */
+const getCoinSummary = asyncHandler(async (req, res, next) => {
+  const userId = req.user._id;
+
+  // Kullanıcının mevcut coin bakiyesini al
+  const user = await User.findById(userId, 'coins');
+  if (!user) {
+    return next(new ErrorResponse('Kullanıcı bulunamadı', 404));
+  }
+
+  // Son 30 günlük coin işlemleri
+  const thirtyDaysAgo = new Date();
+  thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+
+  // Aggregation pipeline
+  const coinTransactions = await Transaction.aggregate([
+    {
+      $match: {
+        user: mongoose.Types.ObjectId(userId),
+        $or: [
+          { currency: 'coins' },
+          {
+            type: 'purchase',
+            'metadata.coinAmount': { $exists: true, $ne: null },
+          },
+        ],
+        createdAt: { $gte: thirtyDaysAgo },
+      },
+    },
+    {
+      $addFields: {
+        effectiveAmount: {
+          $cond: {
+            if: { $eq: ['$type', 'purchase'] },
+            then: { $ifNull: ['$metadata.coinAmount', 0] },
+            else: {
+              $cond: {
+                if: { $in: ['$type', ['award_given', 'premium_purchase', 'premium_gift']] },
+                then: { $multiply: ['$amount', -1] },
+                else: '$amount',
+              },
+            },
+          },
+        },
+      },
+    },
+    {
+      $group: {
+        _id: {
+          $dateToString: { format: '%Y-%m-%d', date: '$createdAt' },
+        },
+        totalChange: { $sum: '$effectiveAmount' },
+        awarded: {
+          $sum: {
+            $cond: [{ $eq: ['$type', 'award_given'] }, '$amount', 0],
+          },
+        },
+        received: {
+          $sum: {
+            $cond: [{ $eq: ['$type', 'award_received'] }, '$amount', 0],
+          },
+        },
+        purchased: {
+          $sum: {
+            $cond: [{ $eq: ['$type', 'purchase'] }, { $ifNull: ['$metadata.coinAmount', 0] }, 0],
+          },
+        },
+        spent: {
+          $sum: {
+            $cond: [{ $in: ['$type', ['premium_purchase', 'premium_gift']] }, '$amount', 0],
+          },
+        },
+        refunded: {
+          $sum: {
+            $cond: [{ $eq: ['$type', 'refund'] }, '$amount', 0],
+          },
+        },
+        count: { $sum: 1 },
+      },
+    },
+    {
+      $sort: { _id: 1 },
+    },
+  ]);
+
+  // Toplam istatistikler
+  const totalStats = await Transaction.aggregate([
+    {
+      $match: {
+        user: mongoose.Types.ObjectId(userId),
+        $or: [
+          { currency: 'coins' },
+          {
+            type: 'purchase',
+            'metadata.coinAmount': { $exists: true, $ne: null },
+          },
+        ],
+      },
+    },
+    {
+      $addFields: {
+        effectiveAmount: {
+          $cond: {
+            if: { $eq: ['$type', 'purchase'] },
+            then: { $ifNull: ['$metadata.coinAmount', 0] },
+            else: {
+              $cond: {
+                if: { $in: ['$type', ['award_given', 'premium_purchase', 'premium_gift']] },
+                then: { $multiply: ['$amount', -1] },
+                else: '$amount',
+              },
+            },
+          },
+        },
+      },
+    },
+    {
+      $group: {
+        _id: null,
+        totalAwarded: {
+          $sum: {
+            $cond: [{ $eq: ['$type', 'award_given'] }, '$amount', 0],
+          },
+        },
+        totalReceived: {
+          $sum: {
+            $cond: [{ $eq: ['$type', 'award_received'] }, '$amount', 0],
+          },
+        },
+        totalPurchased: {
+          $sum: {
+            $cond: [{ $eq: ['$type', 'purchase'] }, { $ifNull: ['$metadata.coinAmount', 0] }, 0],
+          },
+        },
+        totalSpent: {
+          $sum: {
+            $cond: [{ $in: ['$type', ['premium_purchase', 'premium_gift']] }, '$amount', 0],
+          },
+        },
+        totalRefunded: {
+          $sum: {
+            $cond: [{ $eq: ['$type', 'refund'] }, '$amount', 0],
+          },
+        },
+        netChange: { $sum: '$effectiveAmount' },
+        transactionCount: { $sum: 1 },
+      },
+    },
+  ]);
+
+  // Coin bakiyesi ve geçmiş
+  res.status(200).json({
+    success: true,
     data: {
-      originalTransaction: transaction,
-      refundTransaction,
+      currentBalance: user.coins || 0,
+      history: coinTransactions,
+      totals:
+        totalStats.length > 0
+          ? totalStats[0]
+          : {
+              totalAwarded: 0,
+              totalReceived: 0,
+              totalPurchased: 0,
+              totalSpent: 0,
+              totalRefunded: 0,
+              netChange: 0,
+              transactionCount: 0,
+            },
     },
   });
 });
 
 /**
- * @desc    İşlem durumunu güncelle
- * @route   PATCH /api/transactions/:id/status
- * @access  Private (Admin)
+ * @desc    Ödeme webhook işleyici
+ * @route   POST /api/transactions/webhook
+ * @access  Public (with secret validation)
  */
-const updateTransactionStatus = asyncHandler(async (req, res, next) => {
-  const { id } = req.params;
-  const { status, note } = req.body;
+const handlePaymentWebhook = asyncHandler(async (req, res, next) => {
+  // Webhook'un geçerliliğini doğrula
+  const isValidWebhook = validatePaymentWebhook(req);
 
-  // Admin yetkisi kontrolü
-  if (req.user.role !== 'admin') {
-    return next(new ErrorResponse('Bu işlem için admin yetkisi gereklidir', 403));
+  if (!isValidWebhook) {
+    return res.status(403).json({
+      success: false,
+      message: 'Geçersiz webhook imzası',
+    });
   }
+
+  const { event_type, payment_id, status, metadata } = req.body;
+
+  // İlgili işlemi bul
+  const transaction = await Transaction.findOne({
+    paymentReference: payment_id,
+    status: { $in: ['pending', 'processing'] },
+  });
+
+  if (!transaction) {
+    return res.status(200).json({
+      success: false,
+      message: 'İlgili işlem bulunamadı',
+    });
+  }
+
+  // Webhook türüne göre işlem yap
+  switch (event_type) {
+    case 'payment.succeeded':
+      // İşlemi tamamlandı olarak işaretle
+      await Transaction.findByIdAndUpdate(transaction._id, {
+        status: 'completed',
+        metadata: { ...transaction.metadata, webhookData: req.body },
+      });
+
+      // İşlem türüne göre ek işlemler yap
+      if (
+        transaction.type === 'purchase' &&
+        transaction.metadata &&
+        transaction.metadata.coinAmount
+      ) {
+        // Coin satın alma - kullanıcının bakiyesini güncelle
+        await User.findByIdAndUpdate(transaction.user, {
+          $inc: { coins: transaction.metadata.coinAmount },
+        });
+      } else if (transaction.type === 'premium_purchase' || transaction.type === 'premium_gift') {
+        // Premium satın alma - premium üyeliği aktifleştir
+        if (transaction.relatedPremium) {
+          await UserPremium.findByIdAndUpdate(transaction.relatedPremium, {
+            status: 'active',
+          });
+        }
+      }
+      break;
+
+    case 'payment.failed':
+      // İşlemi başarısız olarak işaretle
+      await Transaction.findByIdAndUpdate(transaction._id, {
+        status: 'failed',
+        metadata: {
+          ...transaction.metadata,
+          webhookData: req.body,
+          failureReason: req.body.failure_reason || 'Ödeme başarısız oldu',
+        },
+      });
+
+      // İlgili premium üyelik varsa iptal et
+      if (
+        (transaction.type === 'premium_purchase' || transaction.type === 'premium_gift') &&
+        transaction.relatedPremium
+      ) {
+        await UserPremium.findByIdAndUpdate(transaction.relatedPremium, {
+          status: 'cancelled',
+        });
+      }
+      break;
+
+    case 'payment.refunded':
+      // İşlemi iade edildi olarak işaretle
+      await Transaction.findByIdAndUpdate(transaction._id, {
+        status: 'refunded',
+        metadata: { ...transaction.metadata, webhookData: req.body },
+      });
+
+      // İade işlemi oluştur
+      await Transaction.create({
+        user: transaction.user,
+        type: 'refund',
+        amount: transaction.amount,
+        currency: transaction.currency,
+        description: `Otomatik İade: ${transaction.description}`,
+        status: 'completed',
+        paymentMethod: transaction.paymentMethod,
+        paymentReference: `refund_${payment_id}`,
+        relatedTransaction: transaction._id,
+        metadata: {
+          webhookData: req.body,
+          reason: 'Ödeme sistemi tarafından iade edildi',
+        },
+      });
+      break;
+
+    default:
+      // Diğer event türlerini log'la ama işlem yapma
+      console.log(`Bilinmeyen ödeme webhook eventi: ${event_type}`);
+  }
+
+  // Webhook'u başarıyla aldığımızı bildir
+  res.status(200).json({
+    success: true,
+    message: 'Webhook başarıyla işlendi',
+  });
+});
+
+/**
+ * @desc    Fatura oluştur
+ * @route   GET /api/transactions/:id/invoice
+ * @access  Private
+ */
+const generateInvoice = asyncHandler(async (req, res, next) => {
+  const { id } = req.params;
+  const userId = req.user._id;
 
   if (!mongoose.Types.ObjectId.isValid(id)) {
     return next(new ErrorResponse('Geçersiz işlem ID formatı', 400));
   }
 
-  // Durum kontrolü
-  if (!['pending', 'completed', 'failed', 'refunded'].includes(status)) {
-    return next(new ErrorResponse('Geçersiz işlem durumu', 400));
-  }
+  const transaction = await Transaction.findById(id).populate('user', 'username email');
 
-  // İşlemi bul
-  const transaction = await Transaction.findById(id);
   if (!transaction) {
     return next(new ErrorResponse('İşlem bulunamadı', 404));
   }
 
-  // Durum güncellemesi
-  transaction.status = status;
-  transaction.updatedAt = Date.now();
-
-  // Not ekle
-  if (note) {
-    if (!transaction.metadata) {
-      transaction.metadata = {};
-    }
-    transaction.metadata.statusUpdateNote = note;
-    transaction.metadata.statusUpdatedBy = req.user._id;
-    transaction.metadata.statusUpdatedAt = Date.now();
+  // Yetki kontrolü - sadece kendi işlemlerinin faturasını görebilir (admin hariç)
+  if (transaction.user._id.toString() !== userId.toString() && req.user.role !== 'admin') {
+    return next(new ErrorResponse('Bu işlemin faturasını görüntüleme yetkiniz yok', 403));
   }
 
-  await transaction.save();
-
-  // İşlem tamamlandıysa ve satın alma ise, kullanıcı bakiyesini güncelle
+  // Sadece para ile yapılan gerçek işlemlerin faturası oluşturulabilir
   if (
-    status === 'completed' &&
-    transaction.type === 'purchase' &&
-    transaction.currency === 'coins'
+    transaction.currency === 'coins' ||
+    !['purchase', 'premium_purchase', 'premium_gift'].includes(transaction.type)
   ) {
-    const user = await User.findById(transaction.user);
-    if (user) {
-      const coinAmount =
-        transaction.metadata && transaction.metadata.coinAmount
-          ? parseInt(transaction.metadata.coinAmount)
-          : 0;
-
-      if (coinAmount > 0) {
-        user.coins = (user.coins || 0) + coinAmount;
-        await user.save();
-      }
-    }
+    return next(new ErrorResponse('Bu işlem türü için fatura oluşturulamaz', 400));
   }
 
-  res.status(200).json({
-    success: true,
-    data: transaction,
-  });
-});
-
-/**
- * @desc    Tüm işlemleri getir (Admin)
- * @route   GET /api/transactions/admin
- * @access  Private (Admin)
- */
-const getAllTransactions = asyncHandler(async (req, res, next) => {
-  // Admin yetkisi kontrolü
-  if (req.user.role !== 'admin') {
-    return next(new ErrorResponse('Bu işlem için admin yetkisi gereklidir', 403));
+  // İşlem tamamlanmış olmalı
+  if (transaction.status !== 'completed') {
+    return next(new ErrorResponse('Tamamlanmamış işlemler için fatura oluşturulamaz', 400));
   }
 
-  const page = parseInt(req.query.page) || 1;
-  const limit = parseInt(req.query.limit) || 20;
-  const skip = (page - 1) * limit;
-  const {
-    type,
-    status,
-    currency,
-    userId,
-    minAmount,
-    maxAmount,
-    startDate,
-    endDate,
-    sortBy = 'createdAt',
-    order = 'desc',
-  } = req.query;
-
-  // Filtreleme seçenekleri
-  const filter = {};
-
-  if (type) {
-    filter.type = type;
-  }
-
-  if (status) {
-    filter.status = status;
-  }
-
-  if (currency) {
-    filter.currency = currency;
-  }
-
-  if (userId && mongoose.Types.ObjectId.isValid(userId)) {
-    filter.user = userId;
-  }
-
-  if (minAmount) {
-    filter.amount = { ...filter.amount, $gte: parseFloat(minAmount) };
-  }
-
-  if (maxAmount) {
-    filter.amount = { ...filter.amount, $lte: parseFloat(maxAmount) };
-  }
-
-  // Tarih filtreleri
-  if (startDate) {
-    filter.createdAt = { ...filter.createdAt, $gte: new Date(startDate) };
-  }
-
-  if (endDate) {
-    filter.createdAt = { ...filter.createdAt, $lte: new Date(endDate) };
-  }
-
-  // Sıralama ayarları
-  const sortOptions = {};
-  if (['createdAt', 'amount', 'updatedAt'].includes(sortBy)) {
-    sortOptions[sortBy] = order === 'asc' ? 1 : -1;
-  } else {
-    sortOptions.createdAt = -1;
-  }
-
-  // İşlemleri getir
-  const transactions = await Transaction.find(filter)
-    .sort(sortOptions)
-    .skip(skip)
-    .limit(limit)
-    .populate('user', 'username email')
-    .populate('relatedAward', 'awardType recipientType')
-    .populate('relatedPremium', 'tier duration startDate endDate')
-    .populate('relatedTransaction', 'type amount status');
-
-  const total = await Transaction.countDocuments(filter);
-
-  res.status(200).json({
-    success: true,
-    count: transactions.length,
-    total,
-    totalPages: Math.ceil(total / limit),
-    currentPage: page,
-    data: transactions,
-  });
-});
-
-/**
- * @desc    İşlem istatistiklerini getir (Admin)
- * @route   GET /api/transactions/stats
- * @access  Private (Admin)
- */
-const getTransactionStats = asyncHandler(async (req, res, next) => {
-  // Admin yetkisi kontrolü
-  if (req.user.role !== 'admin') {
-    return next(new ErrorResponse('Bu işlem için admin yetkisi gereklidir', 403));
-  }
-
-  const { startDate, endDate, groupBy = 'day' } = req.query;
-
-  // Tarih aralığı oluştur
-  const dateFilter = {};
-  if (startDate) {
-    dateFilter.createdAt = { ...dateFilter.createdAt, $gte: new Date(startDate) };
-  } else {
-    // Varsayılan son 30 gün
-    const thirtyDaysAgo = new Date();
-    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
-    dateFilter.createdAt = { $gte: thirtyDaysAgo };
-  }
-
-  if (endDate) {
-    dateFilter.createdAt = { ...dateFilter.createdAt, $lte: new Date(endDate) };
-  }
-
-  // Zaman gruplandırma formatı
-  let dateFormat;
-  if (groupBy === 'month') {
-    dateFormat = { year: { $year: '$createdAt' }, month: { $month: '$createdAt' } };
-  } else if (groupBy === 'week') {
-    dateFormat = { year: { $year: '$createdAt' }, week: { $week: '$createdAt' } };
-  } else {
-    dateFormat = {
-      year: { $year: '$createdAt' },
-      month: { $month: '$createdAt' },
-      day: { $dayOfMonth: '$createdAt' },
-    };
-  }
-
-  // Genel istatistikler
-  const totalStats = await Transaction.aggregate([
-    { $match: dateFilter },
-    {
-      $group: {
-        _id: null,
-        totalTransactions: { $sum: 1 },
-        totalAmount: {
-          $sum: {
-            $cond: [{ $eq: ['$currency', 'coins'] }, 0, '$amount'],
-          },
-        },
-        totalCoins: {
-          $sum: {
-            $cond: [{ $eq: ['$currency', 'coins'] }, '$amount', 0],
-          },
-        },
-        avgAmount: {
-          $avg: {
-            $cond: [{ $eq: ['$currency', 'coins'] }, 0, '$amount'],
-          },
-        },
-        completedTransactions: {
-          $sum: {
-            $cond: [{ $eq: ['$status', 'completed'] }, 1, 0],
-          },
-        },
-        failedTransactions: {
-          $sum: {
-            $cond: [{ $eq: ['$status', 'failed'] }, 1, 0],
-          },
-        },
-        refundedTransactions: {
-          $sum: {
-            $cond: [{ $eq: ['$status', 'refunded'] }, 1, 0],
-          },
-        },
-      },
+  // Fatura verilerini hazırla
+  const invoiceData = {
+    invoiceNumber: `INV-${transaction._id.toString().slice(-8).toUpperCase()}`,
+    date: transaction.createdAt,
+    customer: {
+      name: transaction.user.username,
+      email: transaction.user.email,
     },
-  ]);
+    items: [
+      {
+        description: transaction.description,
+        quantity: 1,
+        unitPrice: transaction.amount,
+        currency: transaction.currency,
+        amount: transaction.amount,
+      },
+    ],
+    subtotal: transaction.amount,
+    tax: 0, // Vergi hesaplaması gerekiyorsa burada yapılabilir
+    total: transaction.amount,
+    paymentMethod: transaction.paymentMethod,
+    paymentReference: transaction.paymentReference,
+    notes: 'Bu fatura bilgilendirme amaçlıdır.',
+  };
 
-  // İşlem türüne göre istatistikler
-  const typeStats = await Transaction.aggregate([
-    { $match: dateFilter },
+  // Fatura PDF'ini oluştur (varsayımsal)
+  const pdfBuffer = await generateInvoicePDF(invoiceData);
+
+  // PDF'i gönder
+  res.set({
+    'Content-Type': 'application/pdf',
+    'Content-Disposition': `attachment; filename="invoice-${invoiceData.invoiceNumber}.pdf"`,
+    'Content-Length': pdfBuffer.length,
+  });
+
+  res.send(pdfBuffer);
+});
+
+/**
+ * @desc    Admin için işlem istatistikleri
+ * @route   GET /api/transactions/admin/stats
+ * @access  Private (Admin only)
+ */
+const getAdminTransactionStats = asyncHandler(async (req, res, next) => {
+  // Admin yetkisi kontrolü
+  if (req.user.role !== 'admin') {
+    return next(new ErrorResponse('Bu işlem için admin yetkisi gerekiyor', 403));
+  }
+
+  // Tarih aralığı parametreleri
+  const { startDate, endDate, interval = 'day' } = req.query;
+  let dateFormat = '%Y-%m-%d';
+  let dateField = { $dateToString: { format: dateFormat, date: '$createdAt' } };
+
+  // Zaman aralığına göre format belirle
+  if (interval === 'month') {
+    dateFormat = '%Y-%m';
+    dateField = { $dateToString: { format: dateFormat, date: '$createdAt' } };
+  } else if (interval === 'year') {
+    dateFormat = '%Y';
+    dateField = { $dateToString: { format: dateFormat, date: '$createdAt' } };
+  } else if (interval === 'hour') {
+    dateFormat = '%Y-%m-%d %H:00';
+    dateField = { $dateToString: { format: dateFormat, date: '$createdAt' } };
+  }
+
+  // Tarih filtreleme
+  const matchStage = {};
+  if (startDate) {
+    if (!matchStage.createdAt) matchStage.createdAt = {};
+    matchStage.createdAt.$gte = new Date(startDate);
+  }
+
+  if (endDate) {
+    if (!matchStage.createdAt) matchStage.createdAt = {};
+    matchStage.createdAt.$lte = new Date(endDate);
+  }
+
+  // İstatistikler için aggregation pipeline
+  const stats = await Transaction.aggregate([
+    {
+      $match: matchStage,
+    },
     {
       $group: {
-        _id: '$type',
+        _id: {
+          date: dateField,
+          type: '$type',
+          currency: '$currency',
+          status: '$status',
+        },
         count: { $sum: 1 },
         totalAmount: { $sum: '$amount' },
       },
     },
-    { $sort: { count: -1 } },
-  ]);
-
-  // Para birimine göre istatistikler
-  const currencyStats = await Transaction.aggregate([
-    { $match: dateFilter },
     {
       $group: {
-        _id: '$currency',
-        count: { $sum: 1 },
-        totalAmount: { $sum: '$amount' },
+        _id: {
+          date: '$_id.date',
+          type: '$_id.type',
+          currency: '$_id.currency',
+        },
+        statuses: {
+          $push: {
+            status: '$_id.status',
+            count: '$count',
+            amount: '$totalAmount',
+          },
+        },
+        totalCount: { $sum: '$count' },
+        totalAmount: { $sum: '$totalAmount' },
       },
     },
-    { $sort: { totalAmount: -1 } },
-  ]);
-
-  // Zamana göre istatistikler
-  const timeStats = await Transaction.aggregate([
-    { $match: dateFilter },
+    {
+      $group: {
+        _id: {
+          date: '$_id.date',
+          type: '$_id.type',
+        },
+        currencies: {
+          $push: {
+            currency: '$_id.currency',
+            statuses: '$statuses',
+            count: '$totalCount',
+            amount: '$totalAmount',
+          },
+        },
+        totalCount: { $sum: '$totalCount' },
+        totalAmount: { $sum: '$totalAmount' },
+      },
+    },
     {
       $group: {
-        _id: dateFormat,
-        count: { $sum: 1 },
-        totalAmount: {
-          $sum: {
-            $cond: [{ $eq: ['$currency', 'coins'] }, 0, '$amount'],
+        _id: '$_id.date',
+        types: {
+          $push: {
+            type: '$_id.type',
+            currencies: '$currencies',
+            count: '$totalCount',
+            amount: '$totalAmount',
           },
         },
-        totalCoins: {
-          $sum: {
-            $cond: [{ $eq: ['$currency', 'coins'] }, '$amount', 0],
-          },
-        },
+        totalCount: { $sum: '$totalCount' },
+        totalAmount: { $sum: '$totalAmount' },
       },
     },
     {
-      $project: {
-        _id: 0,
-        date: '$_id',
-        count: 1,
-        totalAmount: 1,
-        totalCoins: 1,
-      },
+      $sort: { _id: 1 },
     },
-    { $sort: { 'date.year': 1, 'date.month': 1, 'date.day': 1, 'date.week': 1 } },
   ]);
 
-  res.status(200).json({
-    success: true,
-    data: {
-      overview:
-        totalStats.length > 0
-          ? totalStats[0]
-          : {
-              totalTransactions: 0,
-              totalAmount: 0,
-              totalCoins: 0,
-              avgAmount: 0,
-              completedTransactions: 0,
-              failedTransactions: 0,
-              refundedTransactions: 0,
-            },
-      byType: typeStats,
-      byCurrency: currencyStats,
-      byTime: timeStats,
-    },
-  });
-});
-
-/**
- * @desc    İşlem özeti getir
- * @route   GET /api/transactions/summary
- * @access  Private
- */
-const getTransactionSummary = asyncHandler(async (req, res, next) => {
-  const userId = req.user._id;
-  const { period = '30days' } = req.query;
-
-  // Tarih aralığı oluştur
-  const startDate = new Date();
-
-  if (period === '7days') {
-    startDate.setDate(startDate.getDate() - 7);
-  } else if (period === '30days') {
-    startDate.setDate(startDate.getDate() - 30);
-  } else if (period === '90days') {
-    startDate.setDate(startDate.getDate() - 90);
-  } else if (period === '1year') {
-    startDate.setFullYear(startDate.getFullYear() - 1);
-  } else {
-    return next(new ErrorResponse('Geçersiz periyot', 400));
-  }
-
-  // Kullanıcının işlem özeti
+  // Özet istatistikler
   const summary = await Transaction.aggregate([
     {
-      $match: {
-        user: mongoose.Types.ObjectId(userId),
-        createdAt: { $gte: startDate },
-      },
+      $match: matchStage,
     },
     {
       $group: {
-        _id: '$type',
+        _id: {
+          type: '$type',
+          currency: '$currency',
+          status: '$status',
+        },
         count: { $sum: 1 },
         totalAmount: { $sum: '$amount' },
       },
     },
+    {
+      $sort: {
+        '_id.type': 1,
+        '_id.currency': 1,
+        '_id.status': 1,
+      },
+    },
   ]);
 
-  // Coin özeti
-  const coinTransactions = await Transaction.find({
-    user: userId,
-    currency: 'coins',
-    createdAt: { $gte: startDate },
-  })
-    .sort({ createdAt: -1 })
-    .limit(5);
-
-  // Premium işlemleri
-  const premiumTransactions = await Transaction.find({
-    user: userId,
-    type: 'premium_purchase',
-    createdAt: { $gte: startDate },
-  }).sort({ createdAt: -1 });
-
-  // Toplam coin harcaması ve kazancı
-  const coinStats = await Transaction.aggregate([
+  // Ödeme yöntemlerine göre dağılım
+  const paymentMethodStats = await Transaction.aggregate([
     {
       $match: {
-        user: mongoose.Types.ObjectId(userId),
-        currency: 'coins',
-        createdAt: { $gte: startDate },
+        ...matchStage,
+        paymentMethod: { $exists: true, $ne: null },
       },
     },
     {
       $group: {
-        _id: null,
-        spent: {
-          $sum: {
-            $cond: [{ $lt: ['$amount', 0] }, { $abs: '$amount' }, 0],
-          },
-        },
-        earned: {
-          $sum: {
-            $cond: [{ $gt: ['$amount', 0] }, '$amount', 0],
-          },
-        },
+        _id: '$paymentMethod',
+        count: { $sum: 1 },
+        totalAmount: { $sum: '$amount' },
       },
+    },
+    {
+      $sort: { count: -1 },
     },
   ]);
 
   res.status(200).json({
     success: true,
     data: {
+      timeSeries: stats,
       summary,
-      coinStats: coinStats.length > 0 ? coinStats[0] : { spent: 0, earned: 0 },
-      recentCoinTransactions: coinTransactions,
-      premiumTransactions,
+      paymentMethods: paymentMethodStats,
     },
   });
 });
+
+// ==================== YARDIMCI FONKSİYONLAR ====================
+
+/**
+ * Ödeme işlemini gerçekleştir (varsayımsal)
+ * @param {Object} paymentDetails - Ödeme detayları
+ * @returns {Promise<Object>} Ödeme sonucu
+ */
+const processPayment = async (paymentDetails) => {
+  // Burada gerçek ödeme işlemcisi entegrasyonu olacaktır
+  // Örneğin: Stripe, PayPal, vs.
+
+  // Simülasyon amaçlı
+  return {
+    success: true,
+    paymentId: `PAY_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+    status: 'pending',
+    details: {
+      processingTime: new Date(),
+      paymentMethod: paymentDetails.paymentMethod,
+      amount: paymentDetails.amount,
+      currency: paymentDetails.currency,
+    },
+    clientResponse: {
+      // Müşteri tarafında gösterilecek bilgiler
+      redirectUrl: '/payment/processing',
+      transactionReference: `REF_${Date.now()}`,
+      expectedCompletionTime: new Date(Date.now() + 60000), // 1 dakika sonra
+    },
+  };
+};
+
+/**
+ * İade işlemini gerçekleştir (varsayımsal)
+ * @param {String} paymentId - Ödeme ID
+ * @param {Number} amount - İade miktarı
+ * @returns {Promise<Object>} İade sonucu
+ */
+const processRefund = async (paymentId, amount) => {
+  // Burada gerçek ödeme işlemcisi entegrasyonu olacaktır
+  // Örneğin: Stripe, PayPal, vs.
+
+  // Simülasyon amaçlı
+  return {
+    success: true,
+    refundId: `REF_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+    status: 'completed',
+    details: {
+      processingTime: new Date(),
+      originalPayment: paymentId,
+      refundedAmount: amount,
+    },
+  };
+};
+
+/**
+ * Premium üyelik oluştur
+ * @param {ObjectId} userId - Kullanıcı ID
+ * @param {String} planType - Plan türü
+ * @param {String} duration - Süre
+ * @param {Object} existingPremium - Mevcut premium üyelik
+ * @returns {Promise<Object>} Premium üyelik
+ */
+const createPremiumMembership = async (userId, planType, duration, existingPremium) => {
+  // Süre hesapla
+  const durationInDays = duration === 'month' ? 30 : 365;
+  let startDate = new Date();
+  let endDate = new Date();
+
+  // Eğer aktif premium varsa, o üyeliğin bitiş tarihinden devam et
+  if (existingPremium && existingPremium.endDate > startDate) {
+    startDate = existingPremium.endDate;
+    endDate = new Date(startDate);
+    endDate.setDate(endDate.getDate() + durationInDays);
+
+    // Mevcut premium üyeliği güncelle
+    return await UserPremium.findByIdAndUpdate(
+      existingPremium._id,
+      {
+        endDate,
+        updatedAt: new Date(),
+      },
+      { new: true },
+    );
+  } else {
+    // Yeni premium üyelik oluştur
+    endDate.setDate(endDate.getDate() + durationInDays);
+
+    return await UserPremium.create({
+      user: userId,
+      type: planType,
+      duration,
+      startDate,
+      endDate,
+      status: 'active',
+    });
+  }
+};
+
+/**
+ * Bekleyen premium üyelik oluştur
+ * @param {ObjectId} userId - Kullanıcı ID
+ * @param {String} planType - Plan türü
+ * @param {String} duration - Süre
+ * @param {Object} existingPremium - Mevcut premium üyelik
+ * @returns {Promise<Object>} Premium üyelik
+ */
+const createPendingPremiumMembership = async (userId, planType, duration, existingPremium) => {
+  // Süre hesapla
+  const durationInDays = duration === 'month' ? 30 : 365;
+  let startDate = new Date();
+  let endDate = new Date();
+
+  // Eğer aktif premium varsa, o üyeliğin bitiş tarihinden devam et
+  if (existingPremium && existingPremium.endDate > startDate) {
+    startDate = existingPremium.endDate;
+    endDate = new Date(startDate);
+    endDate.setDate(endDate.getDate() + durationInDays);
+  } else {
+    // Yeni bitiş tarihi
+    endDate.setDate(endDate.getDate() + durationInDays);
+  }
+
+  // Bekleyen premium üyelik oluştur
+  return await UserPremium.create({
+    user: userId,
+    type: planType,
+    duration,
+    startDate,
+    endDate,
+    status: 'pending',
+  });
+};
+
+/**
+ * Özel coin miktarını hesapla
+ * @param {Number} amount - Para miktarı
+ * @param {String} currency - Para birimi
+ * @returns {Number} Coin miktarı
+ */
+const calculateCustomCoinAmount = (amount, currency) => {
+  // Döviz kurlarına göre hesaplama (varsayımsal)
+  const rates = {
+    USD: 100, // 1 USD = 100 coin
+    EUR: 110, // 1 EUR = 110 coin
+    GBP: 130, // 1 GBP = 130 coin
+  };
+
+  return Math.floor(amount * rates[currency]);
+};
+
+/**
+ * Premium fiyatını hesapla
+ * @param {String} planType - Plan türü
+ * @param {String} duration - Süre
+ * @returns {Object} Fiyat bilgileri
+ */
+const calculatePremiumPrice = (planType, duration) => {
+  // Varsayımsal fiyat yapısı
+  const prices = {
+    standard: {
+      month: { USD: 5.99, EUR: 5.99, GBP: 4.99, coins: 600 },
+      year: { USD: 59.99, EUR: 59.99, GBP: 49.99, coins: 6000 },
+    },
+    gold: {
+      month: { USD: 8.99, EUR: 8.99, GBP: 7.99, coins: 900 },
+      year: { USD: 89.99, EUR: 89.99, GBP: 79.99, coins: 9000 },
+    },
+    platinum: {
+      month: { USD: 12.99, EUR: 12.99, GBP: 11.99, coins: 1300 },
+      year: { USD: 129.99, EUR: 129.99, GBP: 119.99, coins: 13000 },
+    },
+  };
+
+  return {
+    amount: prices[planType][duration].USD,
+    currency: 'USD',
+    coinPrice: prices[planType][duration].coins,
+  };
+};
+
+/**
+ * Ödeme webhook'unu doğrula
+ * @param {Object} req - Request objesi
+ * @returns {Boolean} Webhook'un geçerli olup olmadığı
+ */
+const validatePaymentWebhook = (req) => {
+  // Gerçek uygulamada, ödeme sağlayıcısından gelen webhook'un
+  // imzasını doğrulama işlemi burada yapılır
+  // Örnek: Stripe'ın imza doğrulama mekanizması
+
+  const signature = req.headers['x-payment-signature'];
+  if (!signature) {
+    return false;
+  }
+
+  // Burada gerçek bir imza doğrulama algoritması kullanılmalıdır
+  // Geliştirme için basit bir kontrol
+  const webhookSecret = process.env.PAYMENT_WEBHOOK_SECRET || 'test_webhook_secret';
+
+  // Simülasyon amaçlı basit doğrulama
+  if (process.env.NODE_ENV === 'development') {
+    return true;
+  }
+
+  try {
+    // Gerçek bir uygulamada burada imza doğrulaması yapılır
+    // Örnek: Stripe veya PayPal'ın imza doğrulama mekanizması
+    return true;
+  } catch (error) {
+    console.error('Webhook imza doğrulama hatası:', error);
+    return false;
+  }
+};
+
+/**
+ * Fatura PDF oluştur
+ * @param {Object} invoiceData - Fatura verileri
+ * @returns {Promise<Buffer>} PDF buffer
+ */
+const generateInvoicePDF = async (invoiceData) => {
+  // Burada gerçek bir PDF oluşturma kütüphanesi kullanılmalıdır
+  // Örnek: PDFKit, html-pdf, puppeteer vb.
+
+  // Simülasyon amaçlı
+  return Buffer.from(
+    'Bu bir simülasyon fatura içeriğidir. Gerçek uygulamada burada bir PDF olacaktır.',
+  );
+};
 
 module.exports = {
   getUserTransactions,
-  getTransactionById,
-  createCoinPurchase,
-  createPremiumPurchase,
-  createAwardTransaction,
-  processRefund,
-  updateTransactionStatus,
-  getAllTransactions,
-  getTransactionStats,
-  getTransactionSummary,
+  getTransaction,
+  purchaseCoins,
+  purchasePremium,
+  giveAward,
+  giftPremium,
+  initiateRefund,
+  getCoinSummary,
+  handlePaymentWebhook,
+  generateInvoice,
+  getAdminTransactionStats,
 };

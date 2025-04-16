@@ -1,381 +1,1193 @@
-const { Post, Comment, User, Subreddit, Vote } = require('../models');
+const Post = require('../models/Post');
+const Comment = require('../models/Comment');
+const User = require('../models/User');
+const Subreddit = require('../models/Subreddit');
+const Vote = require('../models/Vote');
+const mongoose = require('mongoose');
+const asyncHandler = require('../middleware/async');
+const ErrorResponse = require('../utils/errorResponse');
+const moment = require('moment');
 
 /**
- * Subreddit istatistikleri
- * @route GET /api/subreddits/:subredditName/statistics
- * @access Public
+ * @desc    Tüm site istatistiklerini getir
+ * @route   GET /api/statistics/site
+ * @access  Public (Detailed stats for Admin)
  */
-const getSubredditStats = async (req, res) => {
-  try {
-    const { subredditName } = req.params;
-    const { timeRange } = req.query; // day, week, month, year, all
+const getSiteStatistics = asyncHandler(async (req, res, next) => {
+  const isAdmin = req.user && req.user.role === 'admin';
+  const timeRange = req.query.timeRange || 'all';
 
-    // Subreddit'i bul
-    const subreddit = await Subreddit.findOne({ name: subredditName });
+  // Zaman aralığı filtresi
+  const timeFilter = getTimeFilter(timeRange);
 
-    if (!subreddit) {
-      return res.status(404).json({
-        success: false,
-        message: 'Subreddit bulunamadı',
-      });
-    }
+  // Temel istatistikleri getir
+  const [totalPosts, totalComments, totalUsers, totalSubreddits, totalVotes] = await Promise.all([
+    Post.countDocuments({ isDeleted: false, ...timeFilter }),
+    Comment.countDocuments({ isDeleted: false, ...timeFilter }),
+    User.countDocuments({ isDeleted: false, ...timeFilter }),
+    Subreddit.countDocuments({ isDeleted: false, ...timeFilter }),
+    Vote.countDocuments(timeFilter),
+  ]);
 
-    // Zaman aralığını belirle
-    const timeFilter = getTimeFilter(timeRange);
+  // Temel cevap objesi
+  const statistics = {
+    totalPosts,
+    totalComments,
+    totalUsers,
+    totalSubreddits,
+    totalVotes,
+    timeRange,
+  };
 
-    // Temel subreddit bilgileri
-    const stats = {
-      name: subreddit.name,
-      title: subreddit.title,
-      description: subreddit.description,
-      subscriberCount: subreddit.subscriberCount,
-      createdAt: subreddit.createdAt,
-      age: Math.floor(
-        (Date.now() - new Date(subreddit.createdAt).getTime()) / (1000 * 60 * 60 * 24),
-      ), // Age in days
+  // Admin için daha detaylı istatistikler
+  if (isAdmin) {
+    // İçerik türü dağılımı
+    const postTypeDistribution = await Post.aggregate([
+      { $match: { isDeleted: false, ...(timeFilter || {}) } },
+      { $group: { _id: '$type', count: { $sum: 1 } } },
+      { $sort: { count: -1 } },
+    ]);
+
+    // Oy dağılımı
+    const voteDistribution = await Vote.aggregate([
+      { $match: timeFilter || {} },
+      { $group: { _id: '$value', count: { $sum: 1 } } },
+      { $sort: { _id: -1 } },
+    ]);
+
+    // Günlük aktivite
+    const now = new Date();
+    const thirtyDaysAgo = new Date(now.setDate(now.getDate() - 30));
+
+    const [dailyPosts, dailyComments, dailyUsers, dailyVotes] = await Promise.all([
+      Post.aggregate([
+        {
+          $match: {
+            isDeleted: false,
+            createdAt: { $gte: thirtyDaysAgo },
+          },
+        },
+        {
+          $group: {
+            _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },
+            count: { $sum: 1 },
+          },
+        },
+        { $sort: { _id: 1 } },
+      ]),
+      Comment.aggregate([
+        {
+          $match: {
+            isDeleted: false,
+            createdAt: { $gte: thirtyDaysAgo },
+          },
+        },
+        {
+          $group: {
+            _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },
+            count: { $sum: 1 },
+          },
+        },
+        { $sort: { _id: 1 } },
+      ]),
+      User.aggregate([
+        {
+          $match: {
+            isDeleted: false,
+            createdAt: { $gte: thirtyDaysAgo },
+          },
+        },
+        {
+          $group: {
+            _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },
+            count: { $sum: 1 },
+          },
+        },
+        { $sort: { _id: 1 } },
+      ]),
+      Vote.aggregate([
+        {
+          $match: {
+            createdAt: { $gte: thirtyDaysAgo },
+          },
+        },
+        {
+          $group: {
+            _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },
+            count: { $sum: 1 },
+          },
+        },
+        { $sort: { _id: 1 } },
+      ]),
+    ]);
+
+    // En aktif subredditler
+    const topSubreddits = await Post.aggregate([
+      { $match: { isDeleted: false, ...(timeFilter || {}) } },
+      { $group: { _id: '$subreddit', postCount: { $sum: 1 } } },
+      { $sort: { postCount: -1 } },
+      { $limit: 10 },
+      {
+        $lookup: {
+          from: 'subreddits',
+          localField: '_id',
+          foreignField: '_id',
+          as: 'subredditDetails',
+        },
+      },
+      { $unwind: '$subredditDetails' },
+      {
+        $project: {
+          _id: 1,
+          postCount: 1,
+          name: '$subredditDetails.name',
+          title: '$subredditDetails.title',
+          memberCount: '$subredditDetails.memberCount',
+        },
+      },
+    ]);
+
+    // Detaylı istatistikleri ekle
+    statistics.detailed = {
+      postTypeDistribution,
+      voteDistribution: voteDistribution.reduce((obj, item) => {
+        obj[item._id === 1 ? 'upvotes' : item._id === -1 ? 'downvotes' : 'novotes'] = item.count;
+        return obj;
+      }, {}),
+      dailyActivity: {
+        posts: dailyPosts,
+        comments: dailyComments,
+        users: dailyUsers,
+        votes: dailyVotes,
+      },
+      topSubreddits,
     };
 
-    // Post ve yorum istatistikleri
-    const postFilter = {
-      subreddit: subreddit._id,
-      isDeleted: false,
-      isRemoved: false,
-      ...timeFilter,
+    // Ortalama istatistikler
+    statistics.averages = {
+      postsPerDay: (totalPosts / Math.max(1, moment().diff(moment(thirtyDaysAgo), 'days'))).toFixed(
+        2,
+      ),
+      commentsPerPost: (totalComments / Math.max(1, totalPosts)).toFixed(2),
+      votesPerPost: (totalVotes / Math.max(1, totalPosts)).toFixed(2),
+      commentsPerUser: (totalComments / Math.max(1, totalUsers)).toFixed(2),
     };
+  }
 
-    // Post sayısı
-    stats.totalPosts = await Post.countDocuments(postFilter);
+  res.status(200).json({
+    success: true,
+    data: statistics,
+  });
+});
 
-    // Yorum sayısı (subreddit'teki tüm postlara yapılan yorumlar)
-    const subredditPosts = await Post.find({ subreddit: subreddit._id }).select('_id');
-    const postIds = subredditPosts.map((post) => post._id);
+/**
+ * @desc    Subreddit istatistiklerini getir
+ * @route   GET /api/statistics/subreddits/:subredditId
+ * @access  Public (Detailed stats for Moderators)
+ */
+const getSubredditStatistics = asyncHandler(async (req, res, next) => {
+  const { subredditId } = req.params;
+  const timeRange = req.query.timeRange || 'all';
 
-    stats.totalComments = await Comment.countDocuments({
-      post: { $in: postIds },
-      isDeleted: false,
-      isRemoved: false,
-      ...timeFilter,
-    });
+  if (!mongoose.Types.ObjectId.isValid(subredditId)) {
+    return next(new ErrorResponse('Geçersiz subreddit ID formatı', 400));
+  }
 
-    // Oy istatistikleri
-    const postVotes = await Vote.aggregate([
+  // Subreddit'in varlığını kontrol et
+  const subreddit = await Subreddit.findById(subredditId);
+  if (!subreddit) {
+    return next(new ErrorResponse('Subreddit bulunamadı', 404));
+  }
+
+  // Moderatör kontrolü - İsteğe bağlı detaylı istatistikler için
+  const isModerator =
+    req.user &&
+    (req.user.role === 'admin' ||
+      (await SubredditMembership.findOne({
+        user: req.user._id,
+        subreddit: subredditId,
+        type: { $in: ['moderator', 'admin'] },
+        status: 'active',
+      })));
+
+  // Zaman aralığı filtresi
+  const timeFilter = getTimeFilter(timeRange);
+
+  // Temel subreddit istatistikleri
+  const [postCount, commentCount, upvoteCount, downvoteCount] = await Promise.all([
+    Post.countDocuments({ subreddit: subredditId, isDeleted: false, ...timeFilter }),
+    Comment.aggregate([
+      {
+        $lookup: {
+          from: 'posts',
+          localField: 'post',
+          foreignField: '_id',
+          as: 'postDetails',
+        },
+      },
+      { $unwind: '$postDetails' },
       {
         $match: {
-          post: { $in: postIds },
-          ...timeFilter,
+          'postDetails.subreddit': mongoose.Types.ObjectId(subredditId),
+          isDeleted: false,
+          ...(timeFilter || {}),
+        },
+      },
+      { $count: 'total' },
+    ]).then((result) => (result.length > 0 ? result[0].total : 0)),
+    Vote.aggregate([
+      {
+        $lookup: {
+          from: 'posts',
+          localField: 'post',
+          foreignField: '_id',
+          as: 'postDetails',
+        },
+      },
+      {
+        $match: {
+          'postDetails.subreddit': mongoose.Types.ObjectId(subredditId),
+          value: 1,
+          ...(timeFilter || {}),
+        },
+      },
+      { $count: 'total' },
+    ]).then((result) => (result.length > 0 ? result[0].total : 0)),
+    Vote.aggregate([
+      {
+        $lookup: {
+          from: 'posts',
+          localField: 'post',
+          foreignField: '_id',
+          as: 'postDetails',
+        },
+      },
+      {
+        $match: {
+          'postDetails.subreddit': mongoose.Types.ObjectId(subredditId),
+          value: -1,
+          ...(timeFilter || {}),
+        },
+      },
+      { $count: 'total' },
+    ]).then((result) => (result.length > 0 ? result[0].total : 0)),
+  ]);
+
+  // İçerik türü dağılımı
+  const postTypeDistribution = await Post.aggregate([
+    {
+      $match: {
+        subreddit: mongoose.Types.ObjectId(subredditId),
+        isDeleted: false,
+        ...(timeFilter || {}),
+      },
+    },
+    { $group: { _id: '$type', count: { $sum: 1 } } },
+    { $sort: { count: -1 } },
+  ]);
+
+  // Popüler postlar
+  const topPosts = await Post.aggregate([
+    {
+      $match: {
+        subreddit: mongoose.Types.ObjectId(subredditId),
+        isDeleted: false,
+        ...(timeFilter || {}),
+      },
+    },
+    { $sort: { voteScore: -1 } },
+    { $limit: 5 },
+    {
+      $lookup: {
+        from: 'users',
+        localField: 'author',
+        foreignField: '_id',
+        as: 'authorDetails',
+      },
+    },
+    { $unwind: '$authorDetails' },
+    {
+      $project: {
+        _id: 1,
+        title: 1,
+        type: 1,
+        createdAt: 1,
+        voteScore: 1,
+        commentCount: 1,
+        author: {
+          _id: '$authorDetails._id',
+          username: '$authorDetails.username',
+        },
+      },
+    },
+  ]);
+
+  // Temel istatistik objesi
+  const statistics = {
+    subreddit: {
+      _id: subreddit._id,
+      name: subreddit.name,
+      title: subreddit.title,
+      memberCount: subreddit.memberCount,
+      createdAt: subreddit.createdAt,
+    },
+    stats: {
+      postCount,
+      commentCount,
+      voteCount: {
+        upvotes: upvoteCount,
+        downvotes: downvoteCount,
+        total: upvoteCount + downvoteCount,
+      },
+      postTypeDistribution,
+      topPosts,
+    },
+    timeRange,
+  };
+
+  // Moderatörler için detaylı istatistikler
+  if (isModerator) {
+    // Günlük aktivite (son 30 gün)
+    const now = new Date();
+    const thirtyDaysAgo = new Date(now.setDate(now.getDate() - 30));
+
+    const dailyActivity = await Post.aggregate([
+      {
+        $match: {
+          subreddit: mongoose.Types.ObjectId(subredditId),
+          isDeleted: false,
+          createdAt: { $gte: thirtyDaysAgo },
         },
       },
       {
         $group: {
-          _id: '$voteType',
-          count: { $sum: 1 },
+          _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },
+          posts: { $sum: 1 },
+          score: { $sum: '$voteScore' },
+        },
+      },
+      { $sort: { _id: 1 } },
+    ]);
+
+    // En aktif kullanıcılar
+    const topContributors = await Post.aggregate([
+      {
+        $match: {
+          subreddit: mongoose.Types.ObjectId(subredditId),
+          isDeleted: false,
+          ...(timeFilter || {}),
+        },
+      },
+      { $group: { _id: '$author', postCount: { $sum: 1 }, totalScore: { $sum: '$voteScore' } } },
+      { $sort: { postCount: -1 } },
+      { $limit: 10 },
+      {
+        $lookup: {
+          from: 'users',
+          localField: '_id',
+          foreignField: '_id',
+          as: 'userDetails',
+        },
+      },
+      { $unwind: '$userDetails' },
+      {
+        $project: {
+          _id: 1,
+          postCount: 1,
+          totalScore: 1,
+          username: '$userDetails.username',
+          karma: '$userDetails.karma',
         },
       },
     ]);
 
-    stats.upvotes = postVotes.find((v) => v._id === 'upvote')?.count || 0;
-    stats.downvotes = postVotes.find((v) => v._id === 'downvote')?.count || 0;
-    stats.totalVotes = stats.upvotes + stats.downvotes;
-
-    // En popüler postlar
-    stats.topPosts = await Post.find(postFilter)
-      .sort({ voteScore: -1 })
-      .limit(5)
-      .select('title author voteScore commentCount createdAt')
-      .populate('author', 'username');
-
-    // En aktif kullanıcılar
-    const activeUsers = await Post.aggregate([
-      { $match: postFilter },
-      { $group: { _id: '$author', postCount: { $sum: 1 } } },
-      { $sort: { postCount: -1 } },
-      { $limit: 5 },
+    // En popüler yorum yapanlar
+    const topCommenters = await Comment.aggregate([
+      {
+        $lookup: {
+          from: 'posts',
+          localField: 'post',
+          foreignField: '_id',
+          as: 'postDetails',
+        },
+      },
+      { $unwind: '$postDetails' },
+      {
+        $match: {
+          'postDetails.subreddit': mongoose.Types.ObjectId(subredditId),
+          isDeleted: false,
+          ...(timeFilter || {}),
+        },
+      },
+      { $group: { _id: '$author', commentCount: { $sum: 1 }, totalScore: { $sum: '$voteScore' } } },
+      { $sort: { commentCount: -1 } },
+      { $limit: 10 },
+      {
+        $lookup: {
+          from: 'users',
+          localField: '_id',
+          foreignField: '_id',
+          as: 'userDetails',
+        },
+      },
+      { $unwind: '$userDetails' },
+      {
+        $project: {
+          _id: 1,
+          commentCount: 1,
+          totalScore: 1,
+          username: '$userDetails.username',
+        },
+      },
     ]);
 
-    stats.activeUsers = await User.populate(activeUsers, {
-      path: '_id',
-      select: 'username profilePicture',
-    });
-
-    // Trafik istatistikleri
-    if (timeRange === 'day') {
-      // Günlük trafik (saatlik dağılım)
-      const hourlyPosts = await Post.aggregate([
-        { $match: postFilter },
-        {
-          $group: {
-            _id: { $hour: '$createdAt' },
-            count: { $sum: 1 },
-          },
+    // Flairler / Tagler dağılımı
+    const flairDistribution = await Post.aggregate([
+      {
+        $match: {
+          subreddit: mongoose.Types.ObjectId(subredditId),
+          flair: { $exists: true, $ne: null },
+          isDeleted: false,
+          ...(timeFilter || {}),
         },
-        { $sort: { _id: 1 } },
-      ]);
-
-      stats.hourlyActivity = Array.from({ length: 24 }, (_, i) => {
-        const hour = hourlyPosts.find((h) => h._id === i);
-        return { hour: i, count: hour ? hour.count : 0 };
-      });
-    } else {
-      // Haftalık/aylık trafik (günlük dağılım)
-      const startDate = new Date();
-      const endDate = new Date();
-      let days = 7;
-
-      if (timeRange === 'month') days = 30;
-      else if (timeRange === 'year') days = 365;
-
-      startDate.setDate(startDate.getDate() - days);
-
-      const dailyPosts = await Post.aggregate([
-        {
-          $match: {
-            subreddit: subreddit._id,
-            createdAt: { $gte: startDate, $lte: endDate },
-            isDeleted: false,
-            isRemoved: false,
-          },
+      },
+      { $group: { _id: '$flair', count: { $sum: 1 } } },
+      { $sort: { count: -1 } },
+      { $limit: 10 },
+      {
+        $lookup: {
+          from: 'flairs',
+          localField: '_id',
+          foreignField: '_id',
+          as: 'flairDetails',
         },
-        {
-          $group: {
-            _id: {
-              $dateToString: { format: '%Y-%m-%d', date: '$createdAt' },
-            },
-            count: { $sum: 1 },
-          },
+      },
+      { $unwind: '$flairDetails' },
+      {
+        $project: {
+          _id: 1,
+          count: 1,
+          name: '$flairDetails.name',
+          color: '$flairDetails.color',
         },
-        { $sort: { _id: 1 } },
-      ]);
+      },
+    ]);
 
-      // Tüm günleri içeren dizi oluştur
-      const dateArray = [];
-      for (let i = 0; i < days; i++) {
-        const date = new Date();
-        date.setDate(date.getDate() - (days - i - 1));
-        const dateStr = date.toISOString().split('T')[0];
-
-        const dayData = dailyPosts.find((d) => d._id === dateStr);
-        dateArray.push({
-          date: dateStr,
-          count: dayData ? dayData.count : 0,
-        });
-      }
-
-      stats.dailyActivity = dateArray;
-    }
-
-    res.status(200).json({
-      success: true,
-      data: stats,
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'İstatistikler getirilirken bir hata oluştu',
-      error: error.message,
-    });
-  }
-};
-
-/**
- * Kullanıcı istatistikleri
- * @route GET /api/users/:username/statistics
- * @access Public
- */
-const getUserStats = async (req, res) => {
-  try {
-    const { username } = req.params;
-    const { timeRange } = req.query; // day, week, month, year, all
-
-    // Kullanıcıyı bul
-    const user = await User.findOne({ username });
-
-    if (!user) {
-      return res.status(404).json({
-        success: false,
-        message: 'Kullanıcı bulunamadı',
-      });
-    }
-
-    // Zaman aralığını belirle
-    const timeFilter = getTimeFilter(timeRange);
-
-    // Temel kullanıcı bilgileri
-    const stats = {
-      username: user.username,
-      displayName: user.displayName,
-      createdAt: user.createdAt,
-      accountAge: Math.floor(
-        (Date.now() - new Date(user.createdAt).getTime()) / (1000 * 60 * 60 * 24),
-      ), // Age in days
-      totalKarma: user.totalKarma,
-      postKarma: user.karma.post,
-      commentKarma: user.karma.comment,
+    // Moderatör-özel istatistikleri ekle
+    statistics.moderatorStats = {
+      dailyActivity,
+      topContributors,
+      topCommenters,
+      flairDistribution,
     };
 
-    // Post istatistikleri
-    const postFilter = { author: user._id, isDeleted: false, ...timeFilter };
-    stats.totalPosts = await Post.countDocuments(postFilter);
+    // Büyüme istatistikleri
+    const growthStats = {
+      thisWeek: await calculateGrowthStats(subredditId, 7),
+      thisMonth: await calculateGrowthStats(subredditId, 30),
+      last3Months: await calculateGrowthStats(subredditId, 90),
+    };
 
-    // Yorum istatistikleri
-    const commentFilter = { author: user._id, isDeleted: false, ...timeFilter };
-    stats.totalComments = await Comment.countDocuments(commentFilter);
-
-    // En çok gönderi yapılan subreddit'ler
-    const topSubreddits = await Post.aggregate([
-      { $match: postFilter },
-      { $group: { _id: '$subreddit', count: { $sum: 1 } } },
-      { $sort: { count: -1 } },
-      { $limit: 5 },
-    ]);
-
-    stats.topSubreddits = await Subreddit.populate(topSubreddits, {
-      path: '_id',
-      select: 'name title',
-    });
-
-    // En popüler postlar
-    stats.topPosts = await Post.find(postFilter)
-      .sort({ voteScore: -1 })
-      .limit(5)
-      .select('title subreddit voteScore commentCount createdAt')
-      .populate('subreddit', 'name');
-
-    // En popüler yorumlar
-    stats.topComments = await Comment.find(commentFilter)
-      .sort({ voteScore: -1 })
-      .limit(5)
-      .select('content voteScore createdAt')
-      .populate({
-        path: 'post',
-        select: 'title subreddit',
-        populate: { path: 'subreddit', select: 'name' },
-      });
-
-    // Aktivite grafiği
-    if (timeRange === 'day' || timeRange === 'week') {
-      // Saatlik aktivite
-      const hourlyActivity = await Post.aggregate([
-        { $match: { ...postFilter } },
-        {
-          $group: {
-            _id: { $hour: '$createdAt' },
-            posts: { $sum: 1 },
-          },
-        },
-      ]);
-
-      const hourlyComments = await Comment.aggregate([
-        { $match: { ...commentFilter } },
-        {
-          $group: {
-            _id: { $hour: '$createdAt' },
-            comments: { $sum: 1 },
-          },
-        },
-      ]);
-
-      stats.hourlyActivity = Array.from({ length: 24 }, (_, i) => {
-        const posts = hourlyActivity.find((h) => h._id === i)?.posts || 0;
-        const comments = hourlyComments.find((h) => h._id === i)?.comments || 0;
-        return { hour: i, posts, comments, total: posts + comments };
-      });
-    } else {
-      // Günlük aktivite
-      const startDate = new Date();
-      let days = 30;
-
-      if (timeRange === 'year') days = 365;
-
-      startDate.setDate(startDate.getDate() - days);
-
-      const dailyPosts = await Post.aggregate([
-        {
-          $match: {
-            author: user._id,
-            createdAt: { $gte: startDate },
-            isDeleted: false,
-          },
-        },
-        {
-          $group: {
-            _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },
-            posts: { $sum: 1 },
-          },
-        },
-        { $sort: { _id: 1 } },
-      ]);
-
-      const dailyComments = await Comment.aggregate([
-        {
-          $match: {
-            author: user._id,
-            createdAt: { $gte: startDate },
-            isDeleted: false,
-          },
-        },
-        {
-          $group: {
-            _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },
-            comments: { $sum: 1 },
-          },
-        },
-        { $sort: { _id: 1 } },
-      ]);
-
-      // Tüm günleri içeren dizi oluştur
-      const dateArray = [];
-      for (let i = 0; i < days; i++) {
-        const date = new Date();
-        date.setDate(date.getDate() - (days - i - 1));
-        const dateStr = date.toISOString().split('T')[0];
-
-        const postData = dailyPosts.find((d) => d._id === dateStr);
-        const commentData = dailyComments.find((d) => d._id === dateStr);
-
-        const posts = postData ? postData.posts : 0;
-        const comments = commentData ? commentData.comments : 0;
-
-        dateArray.push({
-          date: dateStr,
-          posts,
-          comments,
-          total: posts + comments,
-        });
-      }
-
-      stats.dailyActivity = dateArray;
-    }
-
-    res.status(200).json({
-      success: true,
-      data: stats,
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Kullanıcı istatistikleri getirilirken bir hata oluştu',
-      error: error.message,
-    });
+    statistics.growthStats = growthStats;
   }
-};
+
+  res.status(200).json({
+    success: true,
+    data: statistics,
+  });
+});
 
 /**
- * Zaman aralığı filtresi oluştur
- * @param {String} timeRange
- * @returns {Object}
+ * @desc    Kullanıcı istatistiklerini getir
+ * @route   GET /api/statistics/users/:userId
+ * @access  Public (Detailed private stats only for user themselves or Admin)
  */
-const getTimeFilter = (timeRange) => {
-  if (!timeRange || timeRange === 'all') return {};
+const getUserStatistics = asyncHandler(async (req, res, next) => {
+  const { userId } = req.params;
+  const timeRange = req.query.timeRange || 'all';
+
+  if (!mongoose.Types.ObjectId.isValid(userId)) {
+    return next(new ErrorResponse('Geçersiz kullanıcı ID formatı', 400));
+  }
+
+  // Kullanıcının varlığını kontrol et
+  const user = await User.findById(userId);
+  if (!user || user.isDeleted) {
+    return next(new ErrorResponse('Kullanıcı bulunamadı', 404));
+  }
+
+  // Kendisi veya admin mi kontrolü
+  const isSelfOrAdmin =
+    req.user && (req.user._id.toString() === userId || req.user.role === 'admin');
+
+  // Zaman aralığı filtresi
+  const timeFilter = getTimeFilter(timeRange);
+
+  // Temel kullanıcı istatistikleri
+  const [
+    postCount,
+    commentCount,
+    upvotesGiven,
+    downvotesGiven,
+    upvotesReceived,
+    downvotesReceived,
+  ] = await Promise.all([
+    Post.countDocuments({ author: userId, isDeleted: false, ...timeFilter }),
+    Comment.countDocuments({ author: userId, isDeleted: false, ...timeFilter }),
+    Vote.countDocuments({ user: userId, value: 1, ...timeFilter }),
+    Vote.countDocuments({ user: userId, value: -1, ...timeFilter }),
+    Vote.aggregate([
+      {
+        $lookup: {
+          from: 'posts',
+          localField: 'post',
+          foreignField: '_id',
+          as: 'postDetails',
+        },
+      },
+      {
+        $match: {
+          'postDetails.author': mongoose.Types.ObjectId(userId),
+          value: 1,
+          ...(timeFilter || {}),
+        },
+      },
+      { $count: 'total' },
+    ]).then((result) => (result.length > 0 ? result[0].total : 0)),
+    Vote.aggregate([
+      {
+        $lookup: {
+          from: 'posts',
+          localField: 'post',
+          foreignField: '_id',
+          as: 'postDetails',
+        },
+      },
+      {
+        $match: {
+          'postDetails.author': mongoose.Types.ObjectId(userId),
+          value: -1,
+          ...(timeFilter || {}),
+        },
+      },
+      { $count: 'total' },
+    ]).then((result) => (result.length > 0 ? result[0].total : 0)),
+  ]);
+
+  // En çok gönderi yapılan subredditler
+  const topSubreddits = await Post.aggregate([
+    {
+      $match: { author: mongoose.Types.ObjectId(userId), isDeleted: false, ...(timeFilter || {}) },
+    },
+    { $group: { _id: '$subreddit', postCount: { $sum: 1 }, totalScore: { $sum: '$voteScore' } } },
+    { $sort: { postCount: -1 } },
+    { $limit: 5 },
+    {
+      $lookup: {
+        from: 'subreddits',
+        localField: '_id',
+        foreignField: '_id',
+        as: 'subredditDetails',
+      },
+    },
+    { $unwind: '$subredditDetails' },
+    {
+      $project: {
+        _id: 1,
+        postCount: 1,
+        totalScore: 1,
+        name: '$subredditDetails.name',
+        title: '$subredditDetails.title',
+      },
+    },
+  ]);
+
+  // En popüler postlar
+  const topPosts = await Post.find({
+    author: userId,
+    isDeleted: false,
+    ...(timeFilter || {}),
+  })
+    .sort({ voteScore: -1 })
+    .limit(5)
+    .select('title type createdAt voteScore commentCount subreddit')
+    .populate('subreddit', 'name');
+
+  // Temel istatistik objesi
+  const statistics = {
+    user: {
+      _id: user._id,
+      username: user.username,
+      createdAt: user.createdAt,
+      karma: user.karma,
+    },
+    stats: {
+      postCount,
+      commentCount,
+      votesGiven: {
+        upvotes: upvotesGiven,
+        downvotes: downvotesGiven,
+        total: upvotesGiven + downvotesGiven,
+      },
+      votesReceived: {
+        upvotes: upvotesReceived,
+        downvotes: downvotesReceived,
+        total: upvotesReceived + downvotesReceived,
+        ratio:
+          upvotesReceived + downvotesReceived > 0
+            ? (upvotesReceived / (upvotesReceived + downvotesReceived)).toFixed(2)
+            : 0,
+      },
+      topSubreddits,
+      topPosts,
+    },
+    timeRange,
+  };
+
+  // Kendisi veya admin için detaylı istatistikler
+  if (isSelfOrAdmin) {
+    // Günlük aktivite (son 30 gün)
+    const now = new Date();
+    const thirtyDaysAgo = new Date(now.setDate(now.getDate() - 30));
+
+    const [dailyPosts, dailyComments, dailyVotes] = await Promise.all([
+      Post.aggregate([
+        {
+          $match: {
+            author: mongoose.Types.ObjectId(userId),
+            isDeleted: false,
+            createdAt: { $gte: thirtyDaysAgo },
+          },
+        },
+        {
+          $group: {
+            _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },
+            count: { $sum: 1 },
+          },
+        },
+        { $sort: { _id: 1 } },
+      ]),
+      Comment.aggregate([
+        {
+          $match: {
+            author: mongoose.Types.ObjectId(userId),
+            isDeleted: false,
+            createdAt: { $gte: thirtyDaysAgo },
+          },
+        },
+        {
+          $group: {
+            _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },
+            count: { $sum: 1 },
+          },
+        },
+        { $sort: { _id: 1 } },
+      ]),
+      Vote.aggregate([
+        {
+          $match: {
+            user: mongoose.Types.ObjectId(userId),
+            createdAt: { $gte: thirtyDaysAgo },
+          },
+        },
+        {
+          $group: {
+            _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },
+            count: { $sum: 1 },
+          },
+        },
+        { $sort: { _id: 1 } },
+      ]),
+    ]);
+
+    // İçerik türlerine göre gönderi dağılımı
+    const postTypeDistribution = await Post.aggregate([
+      {
+        $match: {
+          author: mongoose.Types.ObjectId(userId),
+          isDeleted: false,
+          ...(timeFilter || {}),
+        },
+      },
+      { $group: { _id: '$type', count: { $sum: 1 } } },
+      { $sort: { count: -1 } },
+    ]);
+
+    // Kullanıcının en çok etkileşim kurduğu kullanıcılar
+    const topInteractedUsers = await Comment.aggregate([
+      {
+        $match: {
+          author: mongoose.Types.ObjectId(userId),
+          isDeleted: false,
+          ...(timeFilter || {}),
+        },
+      },
+      {
+        $lookup: {
+          from: 'posts',
+          localField: 'post',
+          foreignField: '_id',
+          as: 'postDetails',
+        },
+      },
+      { $unwind: '$postDetails' },
+      { $match: { 'postDetails.author': { $ne: mongoose.Types.ObjectId(userId) } } },
+      { $group: { _id: '$postDetails.author', count: { $sum: 1 } } },
+      { $sort: { count: -1 } },
+      { $limit: 5 },
+      {
+        $lookup: {
+          from: 'users',
+          localField: '_id',
+          foreignField: '_id',
+          as: 'userDetails',
+        },
+      },
+      { $unwind: '$userDetails' },
+      {
+        $project: {
+          _id: 1,
+          count: 1,
+          username: '$userDetails.username',
+        },
+      },
+    ]);
+
+    // Kişisel istatistikleri ekle
+    statistics.personalStats = {
+      dailyActivity: {
+        posts: dailyPosts,
+        comments: dailyComments,
+        votes: dailyVotes,
+      },
+      postTypeDistribution,
+      topInteractedUsers,
+      bestTimeToPost: await calculateBestTimeToPost(userId),
+    };
+
+    // Karma dağılımı ve kaynakları
+    const karmaBreakdown = await calculateKarmaBreakdown(userId, timeFilter);
+    statistics.karmaStats = karmaBreakdown;
+  }
+
+  res.status(200).json({
+    success: true,
+    data: statistics,
+  });
+});
+
+/**
+ * @desc    Post istatistiklerini getir
+ * @route   GET /api/statistics/posts/:postId
+ * @access  Public (Detailed stats for Author/Moderator/Admin)
+ */
+const getPostStatistics = asyncHandler(async (req, res, next) => {
+  const { postId } = req.params;
+
+  if (!mongoose.Types.ObjectId.isValid(postId)) {
+    return next(new ErrorResponse('Geçersiz post ID formatı', 400));
+  }
+
+  // Post'un varlığını kontrol et
+  const post = await Post.findById(postId)
+    .populate('author', 'username')
+    .populate('subreddit', 'name title');
+
+  if (!post || post.isDeleted) {
+    return next(new ErrorResponse('Post bulunamadı', 404));
+  }
+
+  // Kendisi, moderatör veya admin mi kontrolü
+  const isAuthorModOrAdmin =
+    req.user &&
+    (req.user._id.toString() === post.author._id.toString() ||
+      req.user.role === 'admin' ||
+      (await SubredditMembership.findOne({
+        user: req.user._id,
+        subreddit: post.subreddit._id,
+        type: { $in: ['moderator', 'admin'] },
+        status: 'active',
+      })));
+
+  // Oy istatistikleri
+  const votes = await Vote.aggregate([
+    { $match: { post: mongoose.Types.ObjectId(postId) } },
+    { $group: { _id: '$value', count: { $sum: 1 } } },
+  ]);
+
+  // Oy istatistiklerini düzenleme
+  const voteStats = {
+    upvotes: 0,
+    downvotes: 0,
+    total: 0,
+    upvoteRatio: 0,
+  };
+
+  votes.forEach((vote) => {
+    if (vote._id === 1) voteStats.upvotes = vote.count;
+    else if (vote._id === -1) voteStats.downvotes = vote.count;
+  });
+
+  voteStats.total = voteStats.upvotes + voteStats.downvotes;
+  voteStats.upvoteRatio =
+    voteStats.total > 0 ? (voteStats.upvotes / voteStats.total).toFixed(2) : 0;
+
+  // Yorumların dağılımı
+  const commentStats = await Comment.aggregate([
+    { $match: { post: mongoose.Types.ObjectId(postId), isDeleted: false } },
+    { $count: 'total' },
+    {
+      $lookup: {
+        from: 'comments',
+        let: { postId: mongoose.Types.ObjectId(postId) },
+        pipeline: [
+          {
+            $match: {
+              $expr: {
+                $and: [
+                  { $eq: ['$post', '$$postId'] },
+                  { $eq: ['$isDeleted', false] },
+                  { $eq: ['$parent', null] },
+                ],
+              },
+            },
+          },
+          { $count: 'count' },
+        ],
+        as: 'topLevelComments',
+      },
+    },
+  ]).then((result) => {
+    return {
+      total: result.length > 0 ? result[0].total : 0,
+      topLevel:
+        result.length > 0 && result[0].topLevelComments.length > 0
+          ? result[0].topLevelComments[0].count
+          : 0,
+    };
+  });
+
+  // Postun görüntülenme zamanlarını getir (varsayılan olarak eklemiyoruz, gerçek uygulamada implement edilebilir)
+  const viewTimeDistribution = [];
+
+  // Temel istatistik objesi
+  const statistics = {
+    post: {
+      _id: post._id,
+      title: post.title,
+      type: post.type,
+      createdAt: post.createdAt,
+      author: {
+        _id: post.author._id,
+        username: post.author.username,
+      },
+      subreddit: {
+        _id: post.subreddit._id,
+        name: post.subreddit.name,
+        title: post.subreddit.title,
+      },
+    },
+    stats: {
+      votes: voteStats,
+      voteScore: post.voteScore,
+      comments: commentStats,
+      viewTimeDistribution,
+    },
+  };
+
+  // Yazar, moderatör veya admin için detaylı istatistikler
+  if (isAuthorModOrAdmin) {
+    // Yorumcuların dağılımı
+    const commenters = await Comment.aggregate([
+      { $match: { post: mongoose.Types.ObjectId(postId), isDeleted: false } },
+      { $group: { _id: '$author', count: { $sum: 1 } } },
+      { $sort: { count: -1 } },
+      { $limit: 10 },
+      {
+        $lookup: {
+          from: 'users',
+          localField: '_id',
+          foreignField: '_id',
+          as: 'userDetails',
+        },
+      },
+      { $unwind: '$userDetails' },
+      {
+        $project: {
+          _id: 1,
+          count: 1,
+          username: '$userDetails.username',
+        },
+      },
+    ]);
+
+    // Zaman içinde yorum ve oy eğilimi
+    const hourlyStats = await Vote.aggregate([
+      { $match: { post: mongoose.Types.ObjectId(postId) } },
+      {
+        $group: {
+          _id: { $hour: '$createdAt' },
+          votes: { $sum: 1 },
+          score: { $sum: '$value' },
+        },
+      },
+      { $sort: { _id: 1 } },
+    ]);
+
+    // Trafiğin geldiği yerler (referrer) - bu genelde analitik araçları ile ölçülür
+    // Burada örnek olarak ekledik
+    const traffic = {
+      sources: [
+        { source: 'direct', count: 120 },
+        { source: 'reddit homepage', count: 87 },
+        { source: 'subreddit', count: 64 },
+        { source: 'external', count: 23 },
+      ],
+      userAgents: [
+        { type: 'desktop', count: 184 },
+        { type: 'mobile', count: 97 },
+        { type: 'tablet', count: 13 },
+      ],
+    };
+
+    // Detaylı istatistikleri ekle
+    statistics.detailedStats = {
+      commenters,
+      hourlyStats,
+      traffic,
+    };
+  }
+
+  res.status(200).json({
+    success: true,
+    data: statistics,
+  });
+});
+
+/**
+ * @desc    Genel yorum istatistiklerini getir
+ * @route   GET /api/statistics/comments
+ * @access  Private (Admin)
+ */
+const getCommentStatistics = asyncHandler(async (req, res, next) => {
+  // Admin kontrolü
+  if (!req.user || req.user.role !== 'admin') {
+    return next(new ErrorResponse('Bu endpoint sadece admin kullanıcılar içindir', 403));
+  }
+
+  const timeRange = req.query.timeRange || 'all';
+  const timeFilter = getTimeFilter(timeRange);
+
+  // Toplam yorum sayısı
+  const totalComments = await Comment.countDocuments({
+    isDeleted: false,
+    ...(timeFilter || {}),
+  });
+
+  // Saatlik yorum dağılımı
+  const hourlyDistribution = await Comment.aggregate([
+    { $match: { isDeleted: false, ...(timeFilter || {}) } },
+    {
+      $group: {
+        _id: { $hour: '$createdAt' },
+        count: { $sum: 1 },
+      },
+    },
+    { $sort: { _id: 1 } },
+  ]);
+
+  // Yorum derinliği dağılımı
+  const depthDistribution = await Comment.aggregate([
+    { $match: { isDeleted: false, ...(timeFilter || {}) } },
+    {
+      $group: {
+        _id: '$depth',
+        count: { $sum: 1 },
+      },
+    },
+    { $sort: { _id: 1 } },
+  ]);
+
+  // En çok yorum alan postlar
+  const topCommentedPosts = await Post.find()
+    .sort({ commentCount: -1 })
+    .limit(10)
+    .select('title commentCount voteScore createdAt subreddit author')
+    .populate('author', 'username')
+    .populate('subreddit', 'name');
+
+  // En aktif yorumcular
+  const topCommenters = await Comment.aggregate([
+    { $match: { isDeleted: false, ...(timeFilter || {}) } },
+    { $group: { _id: '$author', count: { $sum: 1 } } },
+    { $sort: { count: -1 } },
+    { $limit: 10 },
+    {
+      $lookup: {
+        from: 'users',
+        localField: '_id',
+        foreignField: '_id',
+        as: 'userDetails',
+      },
+    },
+    { $unwind: '$userDetails' },
+    {
+      $project: {
+        _id: 1,
+        count: 1,
+        username: '$userDetails.username',
+        karma: '$userDetails.karma.comment',
+      },
+    },
+  ]);
+
+  res.status(200).json({
+    success: true,
+    data: {
+      totalComments,
+      hourlyDistribution,
+      depthDistribution,
+      topCommentedPosts,
+      topCommenters,
+      timeRange,
+    },
+  });
+});
+
+/**
+ * @desc    Trend istatistiklerini getir
+ * @route   GET /api/statistics/trends
+ * @access  Public
+ */
+const getTrendStatistics = asyncHandler(async (req, res, next) => {
+  const timeRange = req.query.timeRange || 'week';
+  let timeFilter;
+
+  // Zaman aralığını belirle
+  switch (timeRange) {
+    case 'day':
+      timeFilter = { createdAt: { $gte: moment().subtract(24, 'hours').toDate() } };
+      break;
+    case 'week':
+      timeFilter = { createdAt: { $gte: moment().subtract(7, 'days').toDate() } };
+      break;
+    case 'month':
+      timeFilter = { createdAt: { $gte: moment().subtract(30, 'days').toDate() } };
+      break;
+    default:
+      timeFilter = { createdAt: { $gte: moment().subtract(7, 'days').toDate() } };
+  }
+
+  // Trend olan postlar
+  const trendingPosts = await Post.aggregate([
+    { $match: { isDeleted: false, ...timeFilter } },
+    {
+      $addFields: {
+        // Trend skorunu hesaplama - yeni postlar ve hızlı büyüyen postları öne çıkarma
+        trendScore: {
+          $divide: [
+            { $add: ['$voteScore', { $multiply: ['$commentCount', 3] }] },
+            {
+              $add: [
+                1,
+                {
+                  $divide: [
+                    { $subtract: [new Date(), '$createdAt'] },
+                    3600000, // milisaniye cinsinden 1 saat
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+      },
+    },
+    { $sort: { trendScore: -1 } },
+    { $limit: 10 },
+    {
+      $lookup: {
+        from: 'users',
+        localField: 'author',
+        foreignField: '_id',
+        as: 'authorDetails',
+      },
+    },
+    { $unwind: '$authorDetails' },
+    {
+      $lookup: {
+        from: 'subreddits',
+        localField: 'subreddit',
+        foreignField: '_id',
+        as: 'subredditDetails',
+      },
+    },
+    { $unwind: '$subredditDetails' },
+    {
+      $project: {
+        _id: 1,
+        title: 1,
+        type: 1,
+        voteScore: 1,
+        commentCount: 1,
+        createdAt: 1,
+        trendScore: 1,
+        author: {
+          _id: '$authorDetails._id',
+          username: '$authorDetails.username',
+        },
+        subreddit: {
+          _id: '$subredditDetails._id',
+          name: '$subredditDetails.name',
+        },
+      },
+    },
+  ]);
+
+  // Büyüyen subredditler
+  const growingSubreddits = await Subreddit.find({ isDeleted: false })
+    .sort({ memberCount: -1 })
+    .limit(10)
+    .select('name title memberCount createdAt');
+
+  // Aktif konular/taglar
+  const activeTopics = await Post.aggregate([
+    { $match: { isDeleted: false, ...timeFilter } },
+    { $unwind: '$keywords' },
+    { $group: { _id: '$keywords', count: { $sum: 1 } } },
+    { $sort: { count: -1 } },
+    { $limit: 10 },
+  ]);
+
+  res.status(200).json({
+    success: true,
+    data: {
+      trendingPosts,
+      growingSubreddits,
+      activeTopics,
+      timeRange,
+    },
+  });
+});
+
+// Yardımcı Fonksiyonlar
+
+/**
+ * Zaman aralığı filtresini oluşturur
+ * @param {string} timeRange - Zaman aralığı ('day', 'week', 'month', 'year', 'all')
+ * @returns {Object} MongoDB sorgusu için zaman filtresi
+ */
+function getTimeFilter(timeRange) {
+  if (timeRange === 'all') return null;
 
   const now = new Date();
   let startDate;
 
   switch (timeRange) {
     case 'day':
-      startDate = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+      startDate = new Date(now.setDate(now.getDate() - 1));
       break;
     case 'week':
-      startDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+      startDate = new Date(now.setDate(now.getDate() - 7));
       break;
     case 'month':
       startDate = new Date(now.setMonth(now.getMonth() - 1));
@@ -384,187 +1196,313 @@ const getTimeFilter = (timeRange) => {
       startDate = new Date(now.setFullYear(now.getFullYear() - 1));
       break;
     default:
-      return {};
+      return null;
   }
 
   return { createdAt: { $gte: startDate } };
-};
+}
 
 /**
- * Platform genel istatistikleri (admin için)
- * @route GET /api/statistics
- * @access Private/Admin
+ * Büyüme istatistiklerini hesaplar
+ * @param {string} subredditId - Subreddit ID
+ * @param {number} days - Gün sayısı
+ * @returns {Object} Büyüme istatistikleri
  */
-const getPlatformStats = async (req, res) => {
-  try {
-    // Admin kontrolü
-    if (!req.user.isAdmin) {
-      return res.status(403).json({
-        success: false,
-        message: 'Bu işlem için admin yetkiniz bulunmamaktadır',
-      });
-    }
+async function calculateGrowthStats(subredditId, days) {
+  const now = new Date();
+  const startDate = new Date(now.setDate(now.getDate() - days));
 
-    const stats = {
-      users: {
-        total: await User.countDocuments(),
-        active: await User.countDocuments({ accountStatus: 'active' }),
-        newToday: await User.countDocuments({
-          createdAt: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) },
-        }),
-      },
-      posts: {
-        total: await Post.countDocuments(),
-        today: await Post.countDocuments({
-          createdAt: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) },
-        }),
-      },
-      comments: {
-        total: await Comment.countDocuments(),
-        today: await Comment.countDocuments({
-          createdAt: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) },
-        }),
-      },
-      subreddits: {
-        total: await Subreddit.countDocuments(),
-        active: await Subreddit.countDocuments({ status: 'active' }),
-        newToday: await Subreddit.countDocuments({
-          createdAt: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) },
-        }),
-      },
-      votes: {
-        total: await Vote.countDocuments(),
-        upvotes: await Vote.countDocuments({ voteType: 'upvote' }),
-        downvotes: await Vote.countDocuments({ voteType: 'downvote' }),
-      },
-    };
-
-    // En popüler subredditler
-    stats.topSubreddits = await Subreddit.find()
-      .sort({ subscriberCount: -1 })
-      .limit(10)
-      .select('name title subscriberCount');
-
-    // En aktif kullanıcılar (son 7 gün)
-    const lastWeek = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
-
-    const activePosters = await Post.aggregate([
-      { $match: { createdAt: { $gte: lastWeek } } },
-      { $group: { _id: '$author', count: { $sum: 1 } } },
-      { $sort: { count: -1 } },
-      { $limit: 10 },
-    ]);
-
-    stats.mostActiveUsers = await User.populate(activePosters, {
-      path: '_id',
-      select: 'username totalKarma',
-    });
-
-    // Günlük aktivite (son 30 gün)
-    const last30Days = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
-
-    const dailyActivity = await Post.aggregate([
-      { $match: { createdAt: { $gte: last30Days } } },
+  // İlgili dönemdeki post, yorum ve oy sayıları
+  const [periodPosts, periodComments, periodVotes] = await Promise.all([
+    Post.countDocuments({
+      subreddit: subredditId,
+      isDeleted: false,
+      createdAt: { $gte: startDate },
+    }),
+    Comment.aggregate([
       {
-        $group: {
-          _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },
-          posts: { $sum: 1 },
+        $lookup: {
+          from: 'posts',
+          localField: 'post',
+          foreignField: '_id',
+          as: 'postDetails',
         },
       },
-      { $sort: { _id: 1 } },
-    ]);
-
-    const dailyComments = await Comment.aggregate([
-      { $match: { createdAt: { $gte: last30Days } } },
+      { $unwind: '$postDetails' },
       {
-        $group: {
-          _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },
-          comments: { $sum: 1 },
+        $match: {
+          'postDetails.subreddit': mongoose.Types.ObjectId(subredditId),
+          isDeleted: false,
+          createdAt: { $gte: startDate },
         },
       },
-      { $sort: { _id: 1 } },
-    ]);
+      { $count: 'total' },
+    ]).then((result) => (result.length > 0 ? result[0].total : 0)),
+    Vote.aggregate([
+      {
+        $lookup: {
+          from: 'posts',
+          localField: 'post',
+          foreignField: '_id',
+          as: 'postDetails',
+        },
+      },
+      {
+        $match: {
+          'postDetails.subreddit': mongoose.Types.ObjectId(subredditId),
+          createdAt: { $gte: startDate },
+        },
+      },
+      { $count: 'total' },
+    ]).then((result) => (result.length > 0 ? result[0].total : 0)),
+  ]);
 
-    // Günlük aktivite grafiği oluştur
-    const dailyData = [];
-    for (let i = 0; i < 30; i++) {
-      const date = new Date();
-      date.setDate(date.getDate() - (30 - i - 1));
-      const dateStr = date.toISOString().split('T')[0];
+  // Bir önceki döneme ait değerleri hesapla
+  const previousStartDate = new Date(startDate);
+  previousStartDate.setDate(previousStartDate.getDate() - days); // Bir önceki eşit zaman dilimi
 
-      const postData = dailyActivity.find((d) => d._id === dateStr);
-      const commentData = dailyComments.find((d) => d._id === dateStr);
+  const [previousPosts, previousComments, previousVotes] = await Promise.all([
+    Post.countDocuments({
+      subreddit: subredditId,
+      isDeleted: false,
+      createdAt: { $gte: previousStartDate, $lt: startDate },
+    }),
+    Comment.aggregate([
+      {
+        $lookup: {
+          from: 'posts',
+          localField: 'post',
+          foreignField: '_id',
+          as: 'postDetails',
+        },
+      },
+      { $unwind: '$postDetails' },
+      {
+        $match: {
+          'postDetails.subreddit': mongoose.Types.ObjectId(subredditId),
+          isDeleted: false,
+          createdAt: { $gte: previousStartDate, $lt: startDate },
+        },
+      },
+      { $count: 'total' },
+    ]).then((result) => (result.length > 0 ? result[0].total : 0)),
+    Vote.aggregate([
+      {
+        $lookup: {
+          from: 'posts',
+          localField: 'post',
+          foreignField: '_id',
+          as: 'postDetails',
+        },
+      },
+      {
+        $match: {
+          'postDetails.subreddit': mongoose.Types.ObjectId(subredditId),
+          createdAt: { $gte: previousStartDate, $lt: startDate },
+        },
+      },
+      { $count: 'total' },
+    ]).then((result) => (result.length > 0 ? result[0].total : 0)),
+  ]);
 
-      dailyData.push({
-        date: dateStr,
-        posts: postData ? postData.posts : 0,
-        comments: commentData ? commentData.comments : 0,
-      });
-    }
+  // Büyüme yüzdeleri hesapla
+  const calculateGrowth = (current, previous) => {
+    if (previous === 0) return current > 0 ? 100 : 0;
+    return (((current - previous) / previous) * 100).toFixed(2);
+  };
 
-    stats.dailyActivity = dailyData;
-
-    // Büyüme oranları (son 30 güne kıyasla)
-    const last60Days = new Date(Date.now() - 60 * 24 * 60 * 60 * 1000);
-
-    // Son 30 gün
-    const last30DaysStats = {
-      users: await User.countDocuments({ createdAt: { $gte: last30Days } }),
-      posts: await Post.countDocuments({ createdAt: { $gte: last30Days } }),
-      comments: await Comment.countDocuments({ createdAt: { $gte: last30Days } }),
-      subreddits: await Subreddit.countDocuments({ createdAt: { $gte: last30Days } }),
-    };
-
-    // Önceki 30 gün
-    const previous30DaysStats = {
-      users: await User.countDocuments({
-        createdAt: { $gte: last60Days, $lt: last30Days },
-      }),
-      posts: await Post.countDocuments({
-        createdAt: { $gte: last60Days, $lt: last30Days },
-      }),
-      comments: await Comment.countDocuments({
-        createdAt: { $gte: last60Days, $lt: last30Days },
-      }),
-      subreddits: await Subreddit.countDocuments({
-        createdAt: { $gte: last60Days, $lt: last30Days },
-      }),
-    };
-
-    // Büyüme oranlarını hesapla
-    stats.growth = {
-      users: calculateGrowthRate(previous30DaysStats.users, last30DaysStats.users),
-      posts: calculateGrowthRate(previous30DaysStats.posts, last30DaysStats.posts),
-      comments: calculateGrowthRate(previous30DaysStats.comments, last30DaysStats.comments),
-      subreddits: calculateGrowthRate(previous30DaysStats.subreddits, last30DaysStats.subreddits),
-    };
-
-    res.status(200).json({
-      success: true,
-      data: stats,
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Platform istatistikleri getirilirken bir hata oluştu',
-      error: error.message,
-    });
-  }
-};
+  return {
+    posts: {
+      current: periodPosts,
+      previous: previousPosts,
+      growth: calculateGrowth(periodPosts, previousPosts),
+    },
+    comments: {
+      current: periodComments,
+      previous: previousComments,
+      growth: calculateGrowth(periodComments, previousComments),
+    },
+    votes: {
+      current: periodVotes,
+      previous: previousVotes,
+      growth: calculateGrowth(periodVotes, previousVotes),
+    },
+  };
+}
 
 /**
- * Büyüme oranı hesapla
- * @param {Number} previous
- * @param {Number} current
- * @returns {Number}
+ * Kullanıcının karma detaylarını hesaplar
+ * @param {string} userId - Kullanıcı ID
+ * @param {Object} timeFilter - Zaman filtresi
+ * @returns {Object} Karma dağılımı ve detayları
  */
-const calculateGrowthRate = (previous, current) => {
-  if (previous === 0) return current > 0 ? 100 : 0;
-  return parseFloat((((current - previous) / previous) * 100).toFixed(2));
-};
+async function calculateKarmaBreakdown(userId, timeFilter) {
+  // Post karması dağılımı
+  const postKarma = await Post.aggregate([
+    {
+      $match: { author: mongoose.Types.ObjectId(userId), isDeleted: false, ...(timeFilter || {}) },
+    },
+    {
+      $group: {
+        _id: '$subreddit',
+        totalKarma: { $sum: '$voteScore' },
+        postCount: { $sum: 1 },
+      },
+    },
+    { $match: { totalKarma: { $ne: 0 } } },
+    { $sort: { totalKarma: -1 } },
+    {
+      $lookup: {
+        from: 'subreddits',
+        localField: '_id',
+        foreignField: '_id',
+        as: 'subredditDetails',
+      },
+    },
+    { $unwind: '$subredditDetails' },
+    {
+      $project: {
+        _id: 1,
+        totalKarma: 1,
+        postCount: 1,
+        name: '$subredditDetails.name',
+      },
+    },
+  ]);
+
+  // Yorum karması dağılımı
+  const commentKarma = await Comment.aggregate([
+    {
+      $match: { author: mongoose.Types.ObjectId(userId), isDeleted: false, ...(timeFilter || {}) },
+    },
+    {
+      $group: {
+        _id: '$post',
+        totalKarma: { $sum: '$voteScore' },
+        commentCount: { $sum: 1 },
+      },
+    },
+    { $match: { totalKarma: { $ne: 0 } } },
+    { $sort: { totalKarma: -1 } },
+    {
+      $lookup: {
+        from: 'posts',
+        localField: '_id',
+        foreignField: '_id',
+        as: 'postDetails',
+      },
+    },
+    { $unwind: '$postDetails' },
+    {
+      $lookup: {
+        from: 'subreddits',
+        localField: 'postDetails.subreddit',
+        foreignField: '_id',
+        as: 'subredditDetails',
+      },
+    },
+    { $unwind: '$subredditDetails' },
+    {
+      $project: {
+        _id: 1,
+        totalKarma: 1,
+        commentCount: 1,
+        postTitle: '$postDetails.title',
+        subreddit: {
+          _id: '$subredditDetails._id',
+          name: '$subredditDetails.name',
+        },
+      },
+    },
+    { $limit: 10 },
+  ]);
+
+  // Karma özeti
+  const user = await User.findById(userId).select('karma');
+
+  return {
+    summary: user.karma,
+    totalKarma: user.totalKarma,
+    postKarmaBySubreddit: postKarma,
+    commentKarmaByPost: commentKarma,
+  };
+}
+
+/**
+ * Kullanıcının post paylaşmak için en iyi zamanını hesaplar
+ * @param {string} userId - Kullanıcı ID
+ * @returns {Object} En iyi gün ve saat istatistikleri
+ */
+async function calculateBestTimeToPost(userId) {
+  // Saatlere göre post başarısı
+  const hourlyPerformance = await Post.aggregate([
+    { $match: { author: mongoose.Types.ObjectId(userId), isDeleted: false } },
+    {
+      $group: {
+        _id: { $hour: '$createdAt' },
+        avgScore: { $avg: '$voteScore' },
+        avgComments: { $avg: '$commentCount' },
+        postCount: { $sum: 1 },
+      },
+    },
+    { $sort: { avgScore: -1 } },
+  ]);
+
+  // Günlere göre post başarısı
+  const dailyPerformance = await Post.aggregate([
+    { $match: { author: mongoose.Types.ObjectId(userId), isDeleted: false } },
+    {
+      $group: {
+        _id: { $dayOfWeek: '$createdAt' },
+        avgScore: { $avg: '$voteScore' },
+        avgComments: { $avg: '$commentCount' },
+        postCount: { $sum: 1 },
+      },
+    },
+    { $sort: { avgScore: -1 } },
+  ]);
+
+  // Gün isimlerini map'le
+  const dayNames = [
+    'Pazar',
+    'Pazartesi',
+    'Salı',
+    'Çarşamba',
+    'Perşembe',
+    'Cuma',
+    'Cumartesi',
+    'Pazar',
+  ];
+  const processedDailyData = dailyPerformance.map((item) => ({
+    day: dayNames[item._id],
+    dayNumber: item._id,
+    avgScore: parseFloat(item.avgScore.toFixed(2)),
+    avgComments: parseFloat(item.avgComments.toFixed(2)),
+    postCount: item.postCount,
+  }));
+
+  // Saatleri düzenleme
+  const processedHourlyData = hourlyPerformance.map((item) => ({
+    hour: item._id,
+    hourFormatted: `${item._id}:00`,
+    avgScore: parseFloat(item.avgScore.toFixed(2)),
+    avgComments: parseFloat(item.avgComments.toFixed(2)),
+    postCount: item.postCount,
+  }));
+
+  return {
+    bestDays: processedDailyData.slice(0, 3),
+    bestHours: processedHourlyData.slice(0, 3),
+    hourlyPerformance: processedHourlyData,
+    dailyPerformance: processedDailyData,
+  };
+}
 
 module.exports = {
-  getSubredditStats,
-  getUserStats,
-  getPlatformStats,
+  getSiteStatistics,
+  getSubredditStatistics,
+  getUserStatistics,
+  getPostStatistics,
+  getCommentStatistics,
+  getTrendStatistics,
 };

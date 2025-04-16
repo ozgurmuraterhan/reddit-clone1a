@@ -1,557 +1,1042 @@
-const { Award, Post, Comment, User, Notification } = require('../models');
+const mongoose = require('mongoose');
+const Award = require('../models/Award');
+const AwardInstance = require('../models/AwardInstance');
+const User = require('../models/User');
+const Subreddit = require('../models/Subreddit');
+const SubredditMembership = require('../models/SubredditMembership');
+const Transaction = require('../models/Transaction');
+const Post = require('../models/Post');
+const Comment = require('../models/Comment');
+const UserPremium = require('../models/UserPremium');
+const ErrorResponse = require('../utils/errorResponse');
+const asyncHandler = require('../middleware/async');
 
 /**
- * Tüm ödül tiplerini listele
- * @route GET /api/awards/types
- * @access Public
+ * @desc    Tüm ödülleri getir
+ * @route   GET /api/awards
+ * @route   GET /api/subreddits/:subredditId/awards
+ * @access  Public
  */
-const getAwardTypes = async (req, res) => {
-  try {
-    // Ödül tiplerini manuel olarak tanımlayalım (gerçek sistemde veritabanından gelebilir)
-    const awardTypes = [
-      {
-        id: 'silver',
-        name: 'Silver',
-        description: 'Gümüş Ödül - Teşekkür etmenin bir yolu',
-        icon: '/images/awards/silver.png',
-        price: 100,
-        benefits: {
-          karma: 10,
-          coins: 0,
-          premium: 0,
-        },
-      },
-      {
-        id: 'gold',
-        name: 'Gold',
-        description: 'Altın Ödül - Bir hafta Premium üyelik kazandırır',
-        icon: '/images/awards/gold.png',
-        price: 500,
-        benefits: {
-          karma: 50,
-          coins: 100,
-          premium: 7, // 7 gün
-        },
-      },
-      {
-        id: 'platinum',
-        name: 'Platinum',
-        description: 'Platin Ödül - Bir ay Premium üyelik kazandırır',
-        icon: '/images/awards/platinum.png',
-        price: 1800,
-        benefits: {
-          karma: 100,
-          coins: 700,
-          premium: 30, // 30 gün
-        },
-      },
-      {
-        id: 'wholesome',
-        name: 'Wholesome',
-        description: 'İçten ve samimi içerikler için',
-        icon: '/images/awards/wholesome.png',
-        price: 150,
-        benefits: {
-          karma: 15,
-          coins: 0,
-          premium: 0,
-        },
-      },
-      {
-        id: 'helpful',
-        name: 'Helpful',
-        description: 'Yardımcı olan içerikler için',
-        icon: '/images/awards/helpful.png',
-        price: 150,
-        benefits: {
-          karma: 15,
-          coins: 0,
-          premium: 0,
-        },
-      },
-    ];
+const getAwards = asyncHandler(async (req, res, next) => {
+  const { subredditId } = req.params;
 
-    res.status(200).json({
-      success: true,
-      data: awardTypes,
+  let query = { isActive: true };
+
+  // Subreddit kontrolü
+  if (subredditId) {
+    if (!mongoose.Types.ObjectId.isValid(subredditId)) {
+      return next(new ErrorResponse('Geçersiz subreddit ID formatı', 400));
+    }
+
+    const subreddit = await Subreddit.findById(subredditId);
+    if (!subreddit) {
+      return next(new ErrorResponse('Subreddit bulunamadı', 404));
+    }
+
+    // Subreddit'e özel ve sistem ödüllerini getir
+    query = {
+      isActive: true,
+      $or: [{ subreddit: subredditId }, { category: 'system' }, { category: 'premium' }],
+    };
+  }
+
+  // Filtreler
+  if (req.query.category) {
+    if (!['premium', 'community', 'moderator', 'system'].includes(req.query.category)) {
+      return next(new ErrorResponse('Geçersiz kategori', 400));
+    }
+    query.category = req.query.category;
+  }
+
+  if (req.query.maxPrice) {
+    query.coinPrice = { $lte: parseInt(req.query.maxPrice) };
+  }
+
+  // Admin ve moderatörler, admin paneli için tüm ödülleri görebilir
+  if (req.query.showAll === 'true' && req.user) {
+    if (req.user.role === 'admin') {
+      delete query.isActive;
+    } else if (subredditId) {
+      // Subreddit moderatörleri sadece kendi subreddit'lerine ait ödülleri görebilir
+      const isModerator = await SubredditMembership.findOne({
+        user: req.user._id,
+        subreddit: subredditId,
+        type: 'moderator',
+      });
+
+      if (isModerator) {
+        delete query.isActive;
+      }
+    }
+  }
+
+  // Sıralama
+  let sort = {};
+  if (req.query.sort) {
+    if (req.query.sort === 'price-asc') {
+      sort.coinPrice = 1;
+    } else if (req.query.sort === 'price-desc') {
+      sort.coinPrice = -1;
+    } else if (req.query.sort === 'name') {
+      sort.name = 1;
+    } else if (req.query.sort === 'newest') {
+      sort.createdAt = -1;
+    }
+  } else {
+    // Varsayılan olarak kategoriye göre ve sonra fiyata göre sırala
+    sort = { category: 1, coinPrice: 1 };
+  }
+
+  // Sayfalama
+  const page = parseInt(req.query.page, 10) || 1;
+  const limit = parseInt(req.query.limit, 10) || 50;
+  const startIndex = (page - 1) * limit;
+  const endIndex = page * limit;
+
+  const total = await Award.countDocuments(query);
+  const awards = await Award.find(query)
+    .sort(sort)
+    .skip(startIndex)
+    .limit(limit)
+    .populate('subreddit', 'name title icon')
+    .populate('createdBy', 'username');
+
+  // Popülerlik istatistiklerini getir
+  if (req.query.includeStats === 'true' && awards.length > 0) {
+    const awardIds = awards.map((award) => award._id);
+
+    const awardStats = await AwardInstance.aggregate([
+      { $match: { award: { $in: awardIds } } },
+      {
+        $group: {
+          _id: '$award',
+          usageCount: { $sum: 1 },
+        },
+      },
+    ]);
+
+    // İstatistikleri ödül objelerine ekle
+    const statsMap = {};
+    awardStats.forEach((stat) => {
+      statsMap[stat._id.toString()] = stat.usageCount;
     });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Ödül tipleri getirilirken bir hata oluştu',
-      error: error.message,
+
+    awards.forEach((award) => {
+      award._doc.usageCount = statsMap[award._id.toString()] || 0;
     });
   }
-};
+
+  // Sayfalama sonuçları
+  const pagination = {};
+
+  if (endIndex < total) {
+    pagination.next = {
+      page: page + 1,
+      limit,
+    };
+  }
+
+  if (startIndex > 0) {
+    pagination.prev = {
+      page: page - 1,
+      limit,
+    };
+  }
+
+  res.status(200).json({
+    success: true,
+    count: awards.length,
+    pagination,
+    data: awards,
+  });
+});
 
 /**
- * İçeriğe (post/comment) ödül ver
- * @route POST /api/awards
- * @access Private
+ * @desc    Belirli bir ödülü getir
+ * @route   GET /api/awards/:id
+ * @access  Public
  */
-const giveAward = async (req, res) => {
-  try {
-    const { itemType, itemId, awardType, message, isAnonymous } = req.body;
-    const userId = req.user._id;
+const getAward = asyncHandler(async (req, res, next) => {
+  const award = await Award.findById(req.params.id)
+    .populate('subreddit', 'name title icon')
+    .populate('createdBy', 'username');
 
-    // Ödül veren kullanıcıyı getir (coin durumunu kontrol etmek için)
-    const user = await User.findById(userId);
-    if (!user) {
-      return res.status(404).json({
-        success: false,
-        message: 'Kullanıcı bulunamadı',
-      });
+  if (!award) {
+    return next(new ErrorResponse('Ödül bulunamadı', 404));
+  }
+
+  // Aktif olmayan ödüller sadece admin veya moderatörler tarafından görüntülenebilir
+  if (!award.isActive) {
+    if (!req.user) {
+      return next(new ErrorResponse('Ödül bulunamadı', 404));
     }
 
-    // Ödül tipini doğrula
-    const awardTypes = await getValidAwardTypes();
-    const selectedAward = awardTypes.find((award) => award.id === awardType);
+    if (req.user.role !== 'admin') {
+      if (award.subreddit) {
+        const isModerator = await SubredditMembership.findOne({
+          user: req.user._id,
+          subreddit: award.subreddit._id,
+          type: 'moderator',
+        });
 
-    if (!selectedAward) {
-      return res.status(400).json({
-        success: false,
-        message: 'Geçersiz ödül tipi',
-      });
-    }
-
-    // Kullanıcının yeterli coini var mı kontrol et
-    if (user.coins < selectedAward.price) {
-      return res.status(400).json({
-        success: false,
-        message: "Yeterli miktarda coin'iniz bulunmamaktadır",
-      });
-    }
-
-    // İçeriği ve yazarını bul
-    let targetItem;
-    let authorId;
-    let subredditId;
-
-    if (itemType === 'post') {
-      targetItem = await Post.findById(itemId);
-      if (targetItem) {
-        authorId = targetItem.author;
-        subredditId = targetItem.subreddit;
-      }
-    } else if (itemType === 'comment') {
-      targetItem = await Comment.findById(itemId);
-      if (targetItem) {
-        authorId = targetItem.author;
-
-        // Yorumun bağlı olduğu postu bul
-        const post = await Post.findById(targetItem.post);
-        if (post) {
-          subredditId = post.subreddit;
+        if (!isModerator) {
+          return next(new ErrorResponse('Ödül bulunamadı', 404));
         }
+      } else {
+        return next(new ErrorResponse('Ödül bulunamadı', 404));
+      }
+    }
+  }
+
+  // İstatistikler
+  if (req.query.includeStats === 'true') {
+    const usageCount = await AwardInstance.countDocuments({ award: award._id });
+    award._doc.usageCount = usageCount;
+
+    // Son kullanımlar
+    const recentUsage = await AwardInstance.find({ award: award._id })
+      .sort({ createdAt: -1 })
+      .limit(5)
+      .populate('giver', 'username')
+      .populate({
+        path: 'targetType',
+        select: 'targetPost targetComment targetUser',
+        populate: {
+          path: 'targetPost targetComment targetUser',
+          select: 'title content username',
+        },
+      });
+
+    award._doc.recentUsage = recentUsage;
+  }
+
+  res.status(200).json({
+    success: true,
+    data: award,
+  });
+});
+
+/**
+ * @desc    Yeni ödül oluştur
+ * @route   POST /api/awards
+ * @route   POST /api/subreddits/:subredditId/awards
+ * @access  Private (Admin veya Subreddit Moderator)
+ */
+const createAward = asyncHandler(async (req, res, next) => {
+  const { subredditId } = req.params;
+  const { name, description, icon, coinPrice, category, effects, isActive } = req.body;
+
+  // Yetki kontrolü
+  if (!req.user) {
+    return next(new ErrorResponse('Bu işlem için giriş yapmalısınız', 401));
+  }
+
+  // Ödül kategorisi belirleme
+  let awardCategory = category;
+
+  // Site geneli ödüller için admin olma şartı
+  if (!subredditId) {
+    if (req.user.role !== 'admin') {
+      return next(
+        new ErrorResponse('Site geneli ödül oluşturmak için admin yetkileri gereklidir', 403),
+      );
+    }
+
+    // Admin değilse premium veya system kategorisinde ödül oluşturamaz
+    if (['premium', 'system'].includes(awardCategory) && req.user.role !== 'admin') {
+      return next(
+        new ErrorResponse(
+          'Bu kategori tipinde ödül oluşturmak için admin yetkileri gereklidir',
+          403,
+        ),
+      );
+    }
+  } else {
+    // Subreddit'e özel ödüller
+    if (!mongoose.Types.ObjectId.isValid(subredditId)) {
+      return next(new ErrorResponse('Geçersiz subreddit ID formatı', 400));
+    }
+
+    const subreddit = await Subreddit.findById(subredditId);
+    if (!subreddit) {
+      return next(new ErrorResponse('Subreddit bulunamadı', 404));
+    }
+
+    // Moderatör kontrolü
+    if (req.user.role !== 'admin') {
+      const isModerator = await SubredditMembership.findOne({
+        user: req.user._id,
+        subreddit: subredditId,
+        type: 'moderator',
+      });
+
+      if (!isModerator) {
+        return next(new ErrorResponse('Bu subreddit için ödül oluşturma yetkiniz yok', 403));
+      }
+    }
+
+    // Subreddit ödülleri sadece community kategorisinde olabilir
+    awardCategory = 'community';
+  }
+
+  // Ödül oluşturma
+  const award = await Award.create({
+    name,
+    description,
+    icon,
+    coinPrice: parseInt(coinPrice),
+    category: awardCategory,
+    effects: {
+      givesCoins: effects?.givesCoins || 0,
+      givesPremium: effects?.givesPremium || false,
+      premiumDurationDays: effects?.premiumDurationDays || 0,
+      awardeeKarma: effects?.awardeeKarma || 0,
+      awarderKarma: effects?.awarderKarma || 0,
+      trophy: effects?.trophy || false,
+    },
+    subreddit: subredditId || null,
+    createdBy: req.user._id,
+    isActive: isActive !== false,
+  });
+
+  res.status(201).json({
+    success: true,
+    data: award,
+  });
+});
+
+/**
+ * @desc    Ödül güncelle
+ * @route   PUT /api/awards/:id
+ * @access  Private (Admin veya Subreddit Moderator)
+ */
+const updateAward = asyncHandler(async (req, res, next) => {
+  let award = await Award.findById(req.params.id);
+
+  if (!award) {
+    return next(new ErrorResponse('Ödül bulunamadı', 404));
+  }
+
+  // Yetki kontrolü
+  if (req.user.role !== 'admin') {
+    // Subreddit'e özel ödül ise moderatör kontrolü
+    if (award.subreddit) {
+      const isModerator = await SubredditMembership.findOne({
+        user: req.user._id,
+        subreddit: award.subreddit,
+        type: 'moderator',
+      });
+
+      if (!isModerator) {
+        return next(new ErrorResponse('Bu ödülü güncelleme yetkiniz yok', 403));
       }
     } else {
-      return res.status(400).json({
-        success: false,
-        message: 'Geçersiz içerik türü. "post" veya "comment" olmalıdır.',
-      });
+      // Site geneli ödüller sadece admin tarafından güncellenebilir
+      return next(new ErrorResponse('Bu ödülü güncelleme yetkiniz yok', 403));
     }
 
-    if (!targetItem) {
-      return res.status(404).json({
-        success: false,
-        message: 'Ödül verilecek içerik bulunamadı',
+    // Community dışındaki kategoriler sadece admin tarafından düzenlenebilir
+    if (award.category !== 'community') {
+      return next(
+        new ErrorResponse('Bu kategorideki ödülleri sadece adminler düzenleyebilir', 403),
+      );
+    }
+  }
+
+  // Güncellenecek verileri hazırla
+  const updateData = {};
+
+  // Temel özellikler
+  if (req.body.name) updateData.name = req.body.name;
+  if (req.body.description) updateData.description = req.body.description;
+  if (req.body.icon) updateData.icon = req.body.icon;
+  if (req.body.coinPrice) updateData.coinPrice = parseInt(req.body.coinPrice);
+  if (req.body.isActive !== undefined) updateData.isActive = req.body.isActive;
+
+  // Kategoriler (sadece admin değiştirebilir)
+  if (req.body.category && req.user.role === 'admin') {
+    if (!['premium', 'community', 'moderator', 'system'].includes(req.body.category)) {
+      return next(new ErrorResponse('Geçersiz kategori', 400));
+    }
+    updateData.category = req.body.category;
+  }
+
+  // Ödül etkileri
+  if (req.body.effects) {
+    updateData.effects = {
+      ...award.effects,
+    };
+
+    // Admin olmayan kullanıcılar sadece sınırlı efektleri değiştirebilir
+    if (req.user.role !== 'admin') {
+      // Moderatörler sadece awardeeKarma ve awarderKarma değerlerini düzenleyebilir
+      if (req.body.effects.awardeeKarma !== undefined) {
+        // Karma değerlerini sınırla (max 100)
+        updateData.effects.awardeeKarma = Math.min(
+          100,
+          parseInt(req.body.effects.awardeeKarma) || 0,
+        );
+      }
+      if (req.body.effects.awarderKarma !== undefined) {
+        updateData.effects.awarderKarma = Math.min(
+          100,
+          parseInt(req.body.effects.awarderKarma) || 0,
+        );
+      }
+    } else {
+      // Admin tüm efektleri değiştirebilir
+      if (req.body.effects.givesCoins !== undefined) {
+        updateData.effects.givesCoins = parseInt(req.body.effects.givesCoins) || 0;
+      }
+      if (req.body.effects.givesPremium !== undefined) {
+        updateData.effects.givesPremium = req.body.effects.givesPremium || false;
+      }
+      if (req.body.effects.premiumDurationDays !== undefined) {
+        updateData.effects.premiumDurationDays =
+          parseInt(req.body.effects.premiumDurationDays) || 0;
+      }
+      if (req.body.effects.awardeeKarma !== undefined) {
+        updateData.effects.awardeeKarma = parseInt(req.body.effects.awardeeKarma) || 0;
+      }
+      if (req.body.effects.awarderKarma !== undefined) {
+        updateData.effects.awarderKarma = parseInt(req.body.effects.awarderKarma) || 0;
+      }
+      if (req.body.effects.trophy !== undefined) {
+        updateData.effects.trophy = req.body.effects.trophy || false;
+      }
+    }
+  }
+
+  // Ödülü güncelle
+  award = await Award.findByIdAndUpdate(req.params.id, updateData, {
+    new: true,
+    runValidators: true,
+  });
+
+  res.status(200).json({
+    success: true,
+    data: award,
+  });
+});
+
+/**
+ * @desc    Ödül sil (soft delete - isActive false yapar)
+ * @route   DELETE /api/awards/:id
+ * @access  Private (Admin veya Subreddit Moderator)
+ */
+const deleteAward = asyncHandler(async (req, res, next) => {
+  const award = await Award.findById(req.params.id);
+
+  if (!award) {
+    return next(new ErrorResponse('Ödül bulunamadı', 404));
+  }
+
+  // Yetki kontrolü
+  if (req.user.role !== 'admin') {
+    // Subreddit'e özel ödül ise moderatör kontrolü
+    if (award.subreddit) {
+      const isModerator = await SubredditMembership.findOne({
+        user: req.user._id,
+        subreddit: award.subreddit,
+        type: 'moderator',
       });
+
+      if (!isModerator) {
+        return next(new ErrorResponse('Bu ödülü silme yetkiniz yok', 403));
+      }
+    } else {
+      // Site geneli ödüller sadece admin tarafından silinebilir
+      return next(new ErrorResponse('Bu ödülü silme yetkiniz yok', 403));
     }
 
-    // Kullanıcının kendi içeriğine ödül verip vermediğini kontrol et
-    if (authorId.toString() === userId.toString()) {
-      return res.status(400).json({
-        success: false,
-        message: 'Kendinize ödül veremezsiniz',
-      });
+    // Community dışındaki kategoriler sadece admin tarafından silinebilir
+    if (award.category !== 'community') {
+      return next(new ErrorResponse('Bu kategorideki ödülleri sadece adminler silebilir', 403));
+    }
+  }
+
+  // Ödül kullanımda mı kontrol et
+  const awardUsageCount = await AwardInstance.countDocuments({ award: award._id });
+
+  if (awardUsageCount > 0 && req.query.force !== 'true') {
+    // Aktif olarak kullanılan ödüller tamamen silinmez, sadece devre dışı bırakılır
+    award.isActive = false;
+    await award.save();
+
+    return res.status(200).json({
+      success: true,
+      message: 'Bu ödül aktif olarak kullanıldığı için devre dışı bırakıldı.',
+      data: award,
+    });
+  }
+
+  // Ödülü sil (force parametre varsa tamamen sil)
+  if (req.query.force === 'true' && req.user.role === 'admin') {
+    await award.remove();
+
+    return res.status(200).json({
+      success: true,
+      message: 'Ödül tamamen silindi.',
+      data: {},
+    });
+  } else {
+    // Soft delete - isActive false yap
+    award.isActive = false;
+    await award.save();
+
+    return res.status(200).json({
+      success: true,
+      message: 'Ödül devre dışı bırakıldı.',
+      data: award,
+    });
+  }
+});
+
+/**
+ * @desc    Ödül ver (post, yorum veya kullanıcıya)
+ * @route   POST /api/awards/give
+ * @access  Private
+ */
+const giveAward = asyncHandler(async (req, res, next) => {
+  const { awardId, targetType, targetId, message, isAnonymous } = req.body;
+
+  // Gerekli alanlar kontrolü
+  if (!awardId || !targetType || !targetId) {
+    return next(new ErrorResponse('Ödül ID, hedef tipi ve hedef ID alanları zorunludur', 400));
+  }
+
+  // Hedef tipi kontrolü
+  if (!['post', 'comment', 'user'].includes(targetType)) {
+    return next(new ErrorResponse('Geçersiz hedef tipi. (post, comment veya user olmalı)', 400));
+  }
+
+  // ObjectId kontrolü
+  if (!mongoose.Types.ObjectId.isValid(awardId) || !mongoose.Types.ObjectId.isValid(targetId)) {
+    return next(new ErrorResponse('Geçersiz ID formatı', 400));
+  }
+
+  // Ödülü getir
+  const award = await Award.findById(awardId);
+  if (!award) {
+    return next(new ErrorResponse('Ödül bulunamadı', 404));
+  }
+
+  // Aktif ödül kontrolü
+  if (!award.isActive) {
+    return next(new ErrorResponse('Bu ödül artık mevcut değil', 400));
+  }
+
+  // Hedefi doğrula
+  let targetObject;
+  let targetSubreddit;
+
+  if (targetType === 'post') {
+    targetObject = await Post.findById(targetId);
+    if (!targetObject) {
+      return next(new ErrorResponse('Gönderi bulunamadı', 404));
+    }
+    if (targetObject.isDeleted) {
+      return next(new ErrorResponse('Silinmiş gönderiye ödül verilemez', 400));
+    }
+    targetSubreddit = targetObject.subreddit;
+  } else if (targetType === 'comment') {
+    targetObject = await Comment.findById(targetId);
+    if (!targetObject) {
+      return next(new ErrorResponse('Yorum bulunamadı', 404));
+    }
+    if (targetObject.isDeleted) {
+      return next(new ErrorResponse('Silinmiş yoruma ödül verilemez', 400));
     }
 
-    // Ödülü oluştur
-    const award = await Award.create({
-      type: awardType,
-      giver: userId,
-      recipient: authorId,
-      itemType,
-      [itemType]: itemId,
-      subreddit: subredditId,
-      message: message || '',
-      isAnonymous: isAnonymous || false,
-    });
+    // Yorumun ait olduğu gönderiyi bul
+    const post = await Post.findById(targetObject.post);
+    targetSubreddit = post.subreddit;
+  } else if (targetType === 'user') {
+    targetObject = await User.findById(targetId);
+    if (!targetObject) {
+      return next(new ErrorResponse('Kullanıcı bulunamadı', 404));
+    }
+    if (targetObject.isDeleted || targetObject.accountStatus !== 'active') {
+      return next(new ErrorResponse('Bu kullanıcıya ödül verilemez', 400));
+    }
+  }
 
-    // Kullanıcının coinlerini azalt
-    await User.findByIdAndUpdate(userId, {
-      $inc: {
-        coins: -selectedAward.price,
-        'karma.awarder': 1, // Ödül verince karma puanı artar
-      },
-    });
+  // Subreddit spesifik ödül kontrolü
+  if (award.category === 'community' && award.subreddit) {
+    // Eğer hedef bir kullanıcı ise, subreddit ödüllerini doğrudan veremezsiniz
+    if (targetType === 'user') {
+      return next(new ErrorResponse('Bu subreddit ödülü doğrudan kullanıcılara verilemez', 400));
+    }
 
-    // Ödül alan kullanıcıya karmasını ve coinlerini ekle
-    await User.findByIdAndUpdate(authorId, {
-      $inc: {
-        'karma.awardee': selectedAward.benefits.karma,
-        totalKarma: selectedAward.benefits.karma,
-        coins: selectedAward.benefits.coins,
-      },
-    });
+    // Hedefin ait olduğu subreddit ile ödülün subreddit'i eşleşmeli
+    if (!targetSubreddit || !targetSubreddit.equals(award.subreddit)) {
+      return next(
+        new ErrorResponse("Bu ödül sadece ait olduğu subreddit'teki içeriklere verilebilir", 400),
+      );
+    }
+  }
 
-    // Premium üyelik günü varsa ekle
-    if (selectedAward.benefits.premium > 0) {
-      const recipient = await User.findById(authorId);
-      let premiumExpiresAt = recipient.premiumExpiresAt || new Date();
+  // Kullanıcının yeterli coin'i var mı kontrol et
+  const user = await User.findById(req.user._id);
+  const coinBalance = user.coinBalance || 0;
 
-      // Eğer zaten premium üyelik varsa üzerine ekle, yoksa şimdiden başlat
-      if (premiumExpiresAt < new Date()) {
-        premiumExpiresAt = new Date();
+  if (coinBalance < award.coinPrice) {
+    return next(
+      new ErrorResponse(
+        `Bu ödülü vermek için yeterli coin'iniz yok. Gereken: ${award.coinPrice}, Mevcut: ${coinBalance}`,
+        400,
+      ),
+    );
+  }
+
+  // İşlem başlat
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
+  try {
+    // Kullanıcının coin bakiyesini güncelle
+    await User.findByIdAndUpdate(
+      req.user._id,
+      { $inc: { coinBalance: -award.coinPrice } },
+      { session },
+    );
+
+    // Ödül örneği oluştur
+    const awardInstance = await AwardInstance.create(
+      [
+        {
+          award: award._id,
+          giver: req.user._id,
+          targetType,
+          targetPost: targetType === 'post' ? targetId : undefined,
+          targetComment: targetType === 'comment' ? targetId : undefined,
+          targetUser: targetType === 'user' ? targetId : undefined,
+          message: message || undefined,
+          isAnonymous: isAnonymous || false,
+        },
+      ],
+      { session },
+    );
+
+    // İşlem kaydı oluştur
+    await Transaction.create(
+      [
+        {
+          user: req.user._id,
+          type: 'award_given',
+          amount: award.coinPrice,
+          currency: 'coins',
+          description: `${award.name} ödülü verildi`,
+          status: 'completed',
+          relatedAward: awardInstance[0]._id,
+        },
+      ],
+      { session },
+    );
+
+    // Ödül efektlerini uygula
+
+    // 1. Alıcıya coin verilecekse
+    if (award.effects.givesCoins > 0) {
+      let recipientId;
+
+      if (targetType === 'user') {
+        recipientId = targetId;
+      } else if (targetType === 'post' || targetType === 'comment') {
+        recipientId = targetObject.author;
       }
 
-      premiumExpiresAt.setDate(premiumExpiresAt.getDate() + selectedAward.benefits.premium);
+      if (recipientId) {
+        await User.findByIdAndUpdate(
+          recipientId,
+          { $inc: { coinBalance: award.effects.givesCoins } },
+          { session },
+        );
 
-      await User.findByIdAndUpdate(authorId, {
-        isPremium: true,
-        premiumExpiresAt,
-      });
+        // Alıcı için işlem kaydı
+        await Transaction.create(
+          [
+            {
+              user: recipientId,
+              type: 'award_received',
+              amount: award.effects.givesCoins,
+              currency: 'coins',
+              description: `${award.name} ödülünden kazanılan coinler`,
+              status: 'completed',
+              relatedAward: awardInstance[0]._id,
+            },
+          ],
+          { session },
+        );
+      }
     }
 
-    // İçeriğe ödül sayısını ekle
-    if (itemType === 'post') {
-      await Post.findByIdAndUpdate(itemId, {
-        $inc: { awardCount: 1 },
-        $push: { awards: award._id },
-      });
-    } else {
-      await Comment.findByIdAndUpdate(itemId, {
-        $inc: { awardCount: 1 },
-        $push: { awards: award._id },
-      });
+    // 2. Premium verilecekse
+    if (award.effects.givesPremium && award.effects.premiumDurationDays > 0) {
+      let recipientId;
+
+      if (targetType === 'user') {
+        recipientId = targetId;
+      } else if (targetType === 'post' || targetType === 'comment') {
+        recipientId = targetObject.author;
+      }
+
+      if (recipientId) {
+        // Premium bitiş tarihini hesapla
+        const endDate = new Date();
+        endDate.setDate(endDate.getDate() + award.effects.premiumDurationDays);
+
+        // Premium kayıt oluştur
+        await UserPremium.create(
+          [
+            {
+              user: recipientId,
+              startDate: new Date(),
+              endDate,
+              source: 'award',
+              sourceReference: awardInstance[0]._id.toString(),
+              isActive: true,
+            },
+          ],
+          { session },
+        );
+      }
     }
 
-    // Ödül alan kullanıcıya bildirim gönder
-    await Notification.create({
-      type: 'award',
-      recipient: authorId,
-      sender: isAnonymous ? null : userId,
-      message: `${itemType === 'post' ? 'Gönderiniz' : 'Yorumunuz'} ${selectedAward.name} ödülü aldı!`,
-      relatedAward: award._id,
-      [itemType === 'post' ? 'relatedPost' : 'relatedComment']: itemId,
-    });
+    // 3. Karma puanları ekle
+    if (award.effects.awardeeKarma > 0) {
+      let recipientId;
+
+      if (targetType === 'user') {
+        recipientId = targetId;
+      } else if (targetType === 'post' || targetType === 'comment') {
+        recipientId = targetObject.author;
+      }
+
+      if (recipientId) {
+        await User.findByIdAndUpdate(
+          recipientId,
+          { $inc: { 'karma.awardee': award.effects.awardeeKarma } },
+          { session },
+        );
+      }
+    }
+
+    // 4. Veren kişiye karma puanı ekle
+    if (award.effects.awarderKarma > 0) {
+      await User.findByIdAndUpdate(
+        req.user._id,
+        { $inc: { 'karma.awarder': award.effects.awarderKarma } },
+        { session },
+      );
+    }
+
+    // İşlemi tamamla
+    await session.commitTransaction();
+
+    // Tam veriyi getir
+    const fullAwardInstance = await AwardInstance.findById(awardInstance[0]._id)
+      .populate('award', 'name icon effects')
+      .populate('giver', 'username profilePicture')
+      .populate({
+        path: 'targetPost',
+        select: 'title author',
+        populate: {
+          path: 'author',
+          select: 'username',
+        },
+      })
+      .populate({
+        path: 'targetComment',
+        select: 'content author',
+        populate: {
+          path: 'author',
+          select: 'username',
+        },
+      })
+      .populate('targetUser', 'username profilePicture');
 
     res.status(201).json({
       success: true,
-      message: 'Ödül başarıyla verildi',
-      data: award,
+      data: fullAwardInstance,
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Ödül verilirken bir hata oluştu',
-      error: error.message,
-    });
+    // İşlem sırasında hata oluşursa geri al
+    await session.abortTransaction();
+    console.error('Ödül verme hatası:', error);
+    return next(new ErrorResponse('Ödül verme işlemi sırasında bir hata oluştu', 500));
+  } finally {
+    // Oturumu kapat
+    session.endSession();
   }
-};
+});
 
 /**
- * İçeriğe verilen ödülleri listele
- * @route GET /api/:itemType/:itemId/awards
- * @access Public
+ * @desc    Kullanıcının sahip olduğu ödülleri getir
+ * @route   GET /api/awards/my-awards
+ * @access  Private
  */
-const getItemAwards = async (req, res) => {
-  try {
-    const { itemType, itemId } = req.params;
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 20;
-    const skip = (page - 1) * limit;
+const getMyAwards = asyncHandler(async (req, res, next) => {
+  const user = await User.findById(req.user._id);
 
-    if (!['post', 'comment'].includes(itemType)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Geçersiz içerik türü. "post" veya "comment" olmalıdır.',
-      });
-    }
+  // Kullanıcının coin bakiyesini getir
+  const coinBalance = user.coinBalance || 0;
 
-    // Filtreyi oluştur
-    const filter = {
-      itemType,
-      [itemType]: itemId,
-    };
+  // Kullanıcının satın aldığı veya kazandığı ödülleri getir
+  const myAwards = await AwardInstance.find({
+    giver: req.user._id,
+    isUsed: false, // Henüz kullanılmamış ödüller
+  })
+    .populate('award', 'name description icon coinPrice category effects')
+    .sort({ createdAt: -1 });
 
-    // Ödülleri getir
-    const awards = await Award.find(filter)
-      .skip(skip)
-      .limit(limit)
-      .sort({ createdAt: -1 })
-      .populate({
-        path: 'giver',
-        select: 'username profilePicture',
-        match: { isAnonymous: false },
-      });
+  // Satın alınabilir tüm ödülleri getir (aktif olanlar)
+  const availableAwards = await Award.find({
+    isActive: true,
+    coinPrice: { $lte: coinBalance }, // Kullanıcının alabileceği ödüller
+  })
+    .sort({ category: 1, coinPrice: 1 })
+    .select('name description icon coinPrice category effects');
 
-    const totalAwards = await Award.countDocuments(filter);
-
-    // Ödül tiplerine göre gruplama yap
-    const awardsByType = awards.reduce((acc, award) => {
-      if (!acc[award.type]) {
-        acc[award.type] = 0;
-      }
-      acc[award.type]++;
-      return acc;
-    }, {});
-
-    res.status(200).json({
-      success: true,
-      count: awards.length,
-      total: totalAwards,
-      totalPages: Math.ceil(totalAwards / limit),
-      currentPage: page,
-      awardsByType,
-      data: awards,
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Ödüller getirilirken bir hata oluştu',
-      error: error.message,
-    });
-  }
-};
+  res.status(200).json({
+    success: true,
+    data: {
+      coinBalance,
+      myAwards,
+      availableAwards,
+    },
+  });
+});
 
 /**
- * Kullanıcının aldığı ödülleri listele
- * @route GET /api/users/:username/awards/received
- * @access Public
+ * @desc    Kullanıcının aldığı ödülleri getir
+ * @route   GET /api/awards/received
+ * @access  Private
  */
-const getUserReceivedAwards = async (req, res) => {
-  try {
-    const { username } = req.params;
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 20;
-    const skip = (page - 1) * limit;
+const getReceivedAwards = asyncHandler(async (req, res, next) => {
+  // Kullanıcıya direkt verilen ödüller
+  const directAwards = await AwardInstance.find({
+    targetType: 'user',
+    targetUser: req.user._id,
+  })
+    .populate('award', 'name description icon coinPrice category effects')
+    .populate('giver', 'username profilePicture')
+    .sort({ createdAt: -1 });
 
-    // Kullanıcıyı bul
-    const user = await User.findOne({ username });
-    if (!user) {
-      return res.status(404).json({
-        success: false,
-        message: 'Kullanıcı bulunamadı',
-      });
-    }
+  // Kullanıcının postlarına verilen ödüller
+  const userPosts = await Post.find({ author: req.user._id }).select('_id');
+  const postIds = userPosts.map((post) => post._id);
 
-    // Ödülleri getir
-    const awards = await Award.find({ recipient: user._id })
-      .skip(skip)
-      .limit(limit)
-      .sort({ createdAt: -1 })
-      .populate({
-        path: 'giver',
-        select: 'username profilePicture',
-      })
-      .populate('post', 'title')
-      .populate('comment', 'content');
+  const postAwards = await AwardInstance.find({
+    targetType: 'post',
+    targetPost: { $in: postIds },
+  })
+    .populate('award', 'name description icon coinPrice category effects')
+    .populate('giver', 'username profilePicture')
+    .populate('targetPost', 'title')
+    .sort({ createdAt: -1 });
 
-    const totalAwards = await Award.countDocuments({ recipient: user._id });
+  // Kullanıcının yorumlarına verilen ödüller
+  const userComments = await Comment.find({ author: req.user._id }).select('_id');
+  const commentIds = userComments.map((comment) => comment._id);
 
-    res.status(200).json({
-      success: true,
-      count: awards.length,
-      total: totalAwards,
-      totalPages: Math.ceil(totalAwards / limit),
-      currentPage: page,
-      data: awards,
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Kullanıcının aldığı ödüller getirilirken bir hata oluştu',
-      error: error.message,
-    });
-  }
-};
+  const commentAwards = await AwardInstance.find({
+    targetType: 'comment',
+    targetComment: { $in: commentIds },
+  })
+    .populate('award', 'name description icon coinPrice category effects')
+    .populate('giver', 'username profilePicture')
+    .populate('targetComment', 'content')
+    .populate({
+      path: 'targetComment',
+      populate: {
+        path: 'post',
+        select: 'title',
+      },
+    })
+    .sort({ createdAt: -1 });
+
+  res.status(200).json({
+    success: true,
+    counts: {
+      directAwards: directAwards.length,
+      postAwards: postAwards.length,
+      commentAwards: commentAwards.length,
+      total: directAwards.length + postAwards.length + commentAwards.length,
+    },
+    data: {
+      directAwards,
+      postAwards,
+      commentAwards,
+    },
+  });
+});
 
 /**
- * Kullanıcının verdiği ödülleri listele
- * @route GET /api/users/:username/awards/given
- * @access Public
+ * @desc    Bir içeriğe verilen ödülleri getir
+ * @route   GET /api/posts/:postId/awards
+ * @route   GET /api/comments/:commentId/awards
+ * @route   GET /api/users/:userId/awards
+ * @access  Public
  */
-const getUserGivenAwards = async (req, res) => {
-  try {
-    const { username } = req.params;
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 20;
-    const skip = (page - 1) * limit;
-    const isCurrentUser = req.user && req.user.username === username;
+const getContentAwards = asyncHandler(async (req, res, next) => {
+  const { postId, commentId, userId } = req.params;
 
-    // Kullanıcıyı bul
-    const user = await User.findOne({ username });
-    if (!user) {
-      return res.status(404).json({
-        success: false,
-        message: 'Kullanıcı bulunamadı',
-      });
-    }
+  let targetType;
+  let targetId;
 
-    // Filtre oluştur
-    const filter = { giver: user._id };
-
-    // Eğer kendi profili değilse, sadece anonim olmayan ödülleri göster
-    if (!isCurrentUser) {
-      filter.isAnonymous = false;
-    }
-
-    // Ödülleri getir
-    const awards = await Award.find(filter)
-      .skip(skip)
-      .limit(limit)
-      .sort({ createdAt: -1 })
-      .populate('recipient', 'username profilePicture')
-      .populate('post', 'title')
-      .populate('comment', 'content');
-
-    const totalAwards = await Award.countDocuments(filter);
-
-    res.status(200).json({
-      success: true,
-      count: awards.length,
-      total: totalAwards,
-      totalPages: Math.ceil(totalAwards / limit),
-      currentPage: page,
-      data: awards,
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Kullanıcının verdiği ödüller getirilirken bir hata oluştu',
-      error: error.message,
-    });
+  if (postId) {
+    targetType = 'post';
+    targetId = postId;
+  } else if (commentId) {
+    targetType = 'comment';
+    targetId = commentId;
+  } else if (userId) {
+    targetType = 'user';
+    targetId = userId;
+  } else {
+    return next(new ErrorResponse('Geçerli bir hedef ID belirtilmedi', 400));
   }
-};
+
+  // ObjectId kontrolü
+  if (!mongoose.Types.ObjectId.isValid(targetId)) {
+    return next(new ErrorResponse('Geçersiz ID formatı', 400));
+  }
+
+  // Hedefe verilen ödülleri getir
+  const query = {
+    targetType,
+    [targetType === 'post'
+      ? 'targetPost'
+      : targetType === 'comment'
+        ? 'targetComment'
+        : 'targetUser']: targetId,
+  };
+
+  const awards = await AwardInstance.find(query)
+    .populate('award', 'name description icon coinPrice category effects')
+    .populate('giver', 'username profilePicture')
+    .sort({ createdAt: -1 });
+
+  // Ödül özetini hazırla
+  const awardSummary = {};
+  awards.forEach((awardInstance) => {
+    const awardId = awardInstance.award._id.toString();
+    if (!awardSummary[awardId]) {
+      awardSummary[awardId] = {
+        award: awardInstance.award,
+        count: 1,
+      };
+    } else {
+      awardSummary[awardId].count += 1;
+    }
+  });
+
+  res.status(200).json({
+    success: true,
+    count: awards.length,
+    data: {
+      awards,
+      summary: Object.values(awardSummary),
+    },
+  });
+});
 
 /**
- * Kullanıcının coin satın alması
- * @route POST /api/awards/purchase-coins
- * @access Private
+ * @desc    Ödül satın al (kullanıcı coin bakiyesine ekle)
+ * @route   POST /api/awards/purchase
+ * @access  Private
  */
-const purchaseCoins = async (req, res) => {
+const purchaseCoins = asyncHandler(async (req, res, next) => {
+  const { packageId, paymentMethod, paymentDetails } = req.body;
+
+  // Coin paketini doğrula
+  const coinPackages = {
+    small: { coins: 500, price: 1.99, currency: 'USD' },
+    medium: { coins: 1100, price: 3.99, currency: 'USD' },
+    large: { coins: 3000, price: 9.99, currency: 'USD' },
+    xlarge: { coins: 7000, price: 19.99, currency: 'USD' },
+    premium: { coins: 15000, price: 39.99, currency: 'USD' },
+  };
+
+  if (!packageId || !coinPackages[packageId]) {
+    return next(new ErrorResponse('Geçersiz paket ID', 400));
+  }
+
+  const selectedPackage = coinPackages[packageId];
+
+  // Ödeme yöntemi kontrolü
+  if (!['credit_card', 'paypal', 'apple_pay', 'google_pay'].includes(paymentMethod)) {
+    return next(new ErrorResponse('Geçersiz ödeme yöntemi', 400));
+  }
+
+  // Burada gerçek bir ödeme işlemi entegrasyonu yapılabilir (Stripe, PayPal vb.)
+  // Bu örnekte başarılı ödeme varsayıyoruz
+
+  // Örnek ödeme referansı oluştur
+  const paymentReference = `PAY-${Date.now()}-${Math.floor(Math.random() * 1000000)}`;
+
+  // İşlem başlat
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
   try {
-    const userId = req.user._id;
-    const { packageId } = req.body;
+    // Kullanıcı coin bakiyesini güncelle
+    await User.findByIdAndUpdate(
+      req.user._id,
+      { $inc: { coinBalance: selectedPackage.coins } },
+      { session },
+    );
 
-    // Coin paketlerini tanımla
-    const coinPackages = [
-      { id: 'small', amount: 500, price: 1.99, bonus: 0 },
-      { id: 'medium', amount: 1100, price: 3.99, bonus: 100 },
-      { id: 'large', amount: 3100, price: 7.99, bonus: 600 },
-      { id: 'platinum', amount: 7200, price: 19.99, bonus: 1700 },
-    ];
+    // İşlem kaydı oluştur
+    const transaction = await Transaction.create(
+      [
+        {
+          user: req.user._id,
+          type: 'purchase',
+          amount: selectedPackage.price,
+          currency: selectedPackage.currency,
+          description: `${selectedPackage.coins} Reddit coin satın alındı`,
+          status: 'completed',
+          paymentMethod,
+          paymentReference,
+          metadata: { packageId, coinsReceived: selectedPackage.coins },
+        },
+      ],
+      { session },
+    );
 
-    const selectedPackage = coinPackages.find((pack) => pack.id === packageId);
+    // İşlemi tamamla
+    await session.commitTransaction();
 
-    if (!selectedPackage) {
-      return res.status(400).json({
-        success: false,
-        message: 'Geçersiz coin paketi',
-      });
-    }
-
-    // Burada ödeme işlemi yapılabilir (örn. Stripe ile)
-    // Ödeme başarılı olduktan sonra:
-
-    // Kullanıcıya coinleri ekle
-    await User.findByIdAndUpdate(userId, {
-      $inc: { coins: selectedPackage.amount },
-    });
-
-    // İşlem kaydını oluştur (gerçek uygulamada ödeme geçmişi için)
-    // await CoinTransaction.create({
-    //   user: userId,
-    //   amount: selectedPackage.amount,
-    //   packageId,
-    //   price: selectedPackage.price,
-    //   paymentMethod: req.body.paymentMethod,
-    //   paymentId: 'payment-123' // Ödeme sağlayıcıdan gelen ID
-    // });
-
-    res.status(200).json({
+    res.status(201).json({
       success: true,
-      message: `${selectedPackage.amount} coin başarıyla satın alındı`,
+      message: 'Coin satın alma işlemi başarılı',
       data: {
-        purchasedCoins: selectedPackage.amount,
-        packageId,
+        coinsReceived: selectedPackage.coins,
+        transaction: transaction[0],
       },
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Coin satın alınırken bir hata oluştu',
-      error: error.message,
-    });
+    // İşlem sırasında hata oluşursa geri al
+    await session.abortTransaction();
+    console.error('Coin satın alma hatası:', error);
+    return next(new ErrorResponse('Satın alma işlemi sırasında bir hata oluştu', 500));
+  } finally {
+    // Oturumu kapat
+    session.endSession();
   }
-};
-
-/**
- * Geçerli ödül tiplerini getir (internal kullanım için)
- * @returns {Array} awardTypes
- */
-const getValidAwardTypes = async () => {
-  // Gerçek uygulamada veritabanından alınabilir
-  return [
-    {
-      id: 'silver',
-      name: 'Silver',
-      price: 100,
-      benefits: {
-        karma: 10,
-        coins: 0,
-        premium: 0,
-      },
-    },
-    {
-      id: 'gold',
-      name: 'Gold',
-      price: 500,
-      benefits: {
-        karma: 50,
-        coins: 100,
-        premium: 7,
-      },
-    },
-    {
-      id: 'platinum',
-      name: 'Platinum',
-      price: 1800,
-      benefits: {
-        karma: 100,
-        coins: 700,
-        premium: 30,
-      },
-    },
-    {
-      id: 'wholesome',
-      name: 'Wholesome',
-      price: 150,
-      benefits: {
-        karma: 15,
-        coins: 0,
-        premium: 0,
-      },
-    },
-    {
-      id: 'helpful',
-      name: 'Helpful',
-      price: 150,
-      benefits: {
-        karma: 15,
-        coins: 0,
-        premium: 0,
-      },
-    },
-  ];
-};
+});
 
 module.exports = {
-  getAwardTypes,
+  getAwards,
+  getAward,
+  createAward,
+  updateAward,
+  deleteAward,
   giveAward,
-  getItemAwards,
-  getUserReceivedAwards,
-  getUserGivenAwards,
+  getMyAwards,
+  getReceivedAwards,
+  getContentAwards,
   purchaseCoins,
 };
