@@ -9,7 +9,7 @@ const {
 } = require('../models');
 const ErrorResponse = require('../utils/errorResponse');
 const asyncHandler = require('../middleware/async');
-
+const { isModeratorOf, hasRoleInSubreddit } = require('../utils/roleHelpers'); // Yeni eklenen import
 /**
  * @desc    Arşiv politikalarını getir
  * @route   GET /api/archive-policies
@@ -37,15 +37,16 @@ const getArchivePolicies = asyncHandler(async (req, res, next) => {
   } else {
     // Hiç subreddit belirtilmezse hem site geneli hem de kullanıcının moderatör olduğu subreddit'lerin politikalarını getir
     if (req.user) {
-      const userModeratedSubreddits = await SubredditMembership.find({
-        user: req.user._id,
-        type: 'moderator',
-      }).select('subreddit');
+      const moderatorRoleAssignments = await mongoose
+        .model('UserRoleAssignment')
+        .find({
+          user: req.user._id,
+          entityType: 'subreddit',
+          role: { $in: await getModeratorRoleIds() },
+        })
+        .select('entity');
 
-      const moderatedSubredditIds = userModeratedSubreddits.map(
-        (membership) => membership.subreddit,
-      );
-
+      const moderatedSubredditIds = moderatorRoleAssignments.map((assignment) => assignment.entity);
       if (req.user.role === 'admin') {
         // Admin tüm politikaları görebilir
         query = {};
@@ -107,11 +108,7 @@ const getArchivePolicy = asyncHandler(async (req, res, next) => {
 
   // Yetki kontrolü
   if (archivePolicy.scope === 'subreddit' && req.user && req.user.role !== 'admin') {
-    const isModerator = await SubredditMembership.findOne({
-      user: req.user._id,
-      subreddit: archivePolicy.subreddit._id,
-      type: 'moderator',
-    });
+    const isModerator = await isModeratorOf(req.user._id, archivePolicy.subreddit._id);
 
     if (!isModerator) {
       return next(new ErrorResponse('Bu arşiv politikasını görüntüleme yetkiniz yok', 403));
@@ -176,11 +173,7 @@ const createArchivePolicy = asyncHandler(async (req, res, next) => {
 
     // Kullanıcı subreddit'in moderatörü mü kontrol et
     if (req.user.role !== 'admin') {
-      const isModerator = await SubredditMembership.findOne({
-        user: req.user._id,
-        subreddit: finalSubredditId,
-        type: 'moderator',
-      });
+      const isModerator = await isModeratorOf(req.user._id, finalSubredditId);
 
       if (!isModerator) {
         return next(
@@ -275,11 +268,7 @@ const updateArchivePolicy = asyncHandler(async (req, res, next) => {
   }
 
   if (archivePolicy.scope === 'subreddit') {
-    const isModerator = await SubredditMembership.findOne({
-      user: req.user._id,
-      subreddit: archivePolicy.subreddit,
-      type: 'moderator',
-    });
+    const isModerator = await isModeratorOf(req.user._id, archivePolicy.subreddit);
 
     if (!isModerator && req.user.role !== 'admin') {
       return next(new ErrorResponse('Bu arşiv politikasını güncelleme yetkiniz yok', 403));
@@ -368,11 +357,7 @@ const deleteArchivePolicy = asyncHandler(async (req, res, next) => {
   }
 
   if (archivePolicy.scope === 'subreddit') {
-    const isModerator = await SubredditMembership.findOne({
-      user: req.user._id,
-      subreddit: archivePolicy.subreddit,
-      type: 'moderator',
-    });
+    const isModerator = await isModeratorOf(req.user._id, archivePolicy.subreddit);
 
     if (!isModerator && req.user.role !== 'admin') {
       return next(new ErrorResponse('Bu arşiv politikasını silme yetkiniz yok', 403));
@@ -588,11 +573,7 @@ const getSubredditArchiveSettings = asyncHandler(async (req, res, next) => {
 
   // Yetki kontrolü
   if (req.user && req.user.role !== 'admin') {
-    const isModerator = await SubredditMembership.findOne({
-      user: req.user._id,
-      subreddit: subredditId,
-      type: 'moderator',
-    });
+    const isModerator = await isModeratorOf(req.user._id, subredditId);
 
     if (!isModerator) {
       return next(
@@ -790,11 +771,7 @@ const manuallyArchiveContent = asyncHandler(async (req, res, next) => {
 
   // Yetki kontrolü
   if (req.user.role !== 'admin') {
-    const isModerator = await SubredditMembership.findOne({
-      user: req.user._id,
-      subreddit: subredditId,
-      type: 'moderator',
-    });
+    const isModerator = await isModeratorOf(req.user._id, subredditId);
 
     if (!isModerator) {
       return next(new ErrorResponse('Bu içeriği arşivleme yetkiniz yok', 403));
@@ -887,11 +864,7 @@ const unarchiveContent = asyncHandler(async (req, res, next) => {
 
   // Yetki kontrolü
   if (req.user.role !== 'admin') {
-    const isModerator = await SubredditMembership.findOne({
-      user: req.user._id,
-      subreddit: subredditId,
-      type: 'moderator',
-    });
+    const isModerator = await isModeratorOf(req.user._id, subredditId);
 
     if (!isModerator) {
       return next(new ErrorResponse('Bu içeriği arşivden çıkarma yetkiniz yok', 403));

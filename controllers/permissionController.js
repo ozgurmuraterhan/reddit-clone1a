@@ -5,13 +5,10 @@ const User = require('../models/User');
 const UserRoleAssignment = require('../models/UserRoleAssignment');
 const Subreddit = require('../models/Subreddit');
 const SubredditMembership = require('../models/SubredditMembership');
-
-
-
 const asyncHandler = require('../middleware/async');
 const ErrorResponse = require('../utils/errorResponse');
 const mongoose = require('mongoose');
-
+const { isModeratorOf } = require('../utils/roleHelpers');
 /**
  * @desc    Tüm izinleri listele
  * @route   GET /api/permissions
@@ -585,24 +582,22 @@ const setSubredditPermissions = asyncHandler(async (req, res, next) => {
 
   if (!isAdmin && !isCreator) {
     // Moderatör kontrolü (sadece kurucu veya üst düzey moderatörler izinleri değiştirebilir)
-    const membership = await SubredditMembership.findOne({
-      user: userId,
-      subreddit: subredditId,
-      type: 'moderator'
-    });
-
-    if (!membership || !membership.isFounder) {
-      return next(new ErrorResponse('Bu işlem için subreddit sahibi veya kurucu moderatör yetkiniz olmalı', 403));
+    const isModerator = await isModeratorOf(userId, subredditId);
+    if (!isModerator) {
+      return next(new ErrorResponse('Bu işlem için moderatör yetkiniz olmalı', 403));
     }
+
+    // Kullanıcı moderatör ise çalışması gereken diğer kodlar...
   }
+
+  // İleride yapılabilecek bir geliştirme örneği (yoruma alınmalı veya kaldırılmalı):
+  // const isFounder = await isModeratorOf(userId, subredditId, { checkFounder: true });
+  // if (!isFounder) {
+  //   return next(new ErrorResponse('Bu işlem için subreddit sahibi veya kurucu moderatör yetkiniz olmalı', 403));
+  // }
 
   // Rolü kontrol et
   const role = await Role.findById(roleId);
-
-  if (!role) {
-    return next(new ErrorResponse('Rol bulunamadı', 404));
-  }
-
   // Rolün kapsamını kontrol et
   if (role.scope !== 'subreddit') {
     return next(new ErrorResponse('Sadece subreddit kapsamlı roller için izinler ayarlanabilir', 400));

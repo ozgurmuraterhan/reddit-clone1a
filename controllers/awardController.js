@@ -3,13 +3,13 @@ const Award = require('../models/Award');
 const AwardInstance = require('../models/AwardInstance');
 const User = require('../models/User');
 const Subreddit = require('../models/Subreddit');
-const SubredditMembership = require('../models/SubredditMembership');
 const Transaction = require('../models/Transaction');
 const Post = require('../models/Post');
 const Comment = require('../models/Comment');
 const UserPremium = require('../models/UserPremium');
 const ErrorResponse = require('../utils/errorResponse');
 const asyncHandler = require('../middleware/async');
+const { isModeratorOf } = require('../utils/roleHelpers');
 
 /**
  * @desc    Tüm ödülleri getir
@@ -47,7 +47,6 @@ const getAwards = asyncHandler(async (req, res, next) => {
     }
     query.category = req.query.category;
   }
-
   if (req.query.maxPrice) {
     query.coinPrice = { $lte: parseInt(req.query.maxPrice) };
   }
@@ -58,11 +57,7 @@ const getAwards = asyncHandler(async (req, res, next) => {
       delete query.isActive;
     } else if (subredditId) {
       // Subreddit moderatörleri sadece kendi subreddit'lerine ait ödülleri görebilir
-      const isModerator = await SubredditMembership.findOne({
-        user: req.user._id,
-        subreddit: subredditId,
-        type: 'moderator',
-      });
+      const isModerator = await isModeratorOf(req.user._id, subredditId);
 
       if (isModerator) {
         delete query.isActive;
@@ -173,11 +168,7 @@ const getAward = asyncHandler(async (req, res, next) => {
 
     if (req.user.role !== 'admin') {
       if (award.subreddit) {
-        const isModerator = await SubredditMembership.findOne({
-          user: req.user._id,
-          subreddit: award.subreddit._id,
-          type: 'moderator',
-        });
+        const isModerator = await isModeratorOf(req.user._id, award.subreddit);
 
         if (!isModerator) {
           return next(new ErrorResponse('Ödül bulunamadı', 404));
@@ -264,11 +255,7 @@ const createAward = asyncHandler(async (req, res, next) => {
 
     // Moderatör kontrolü
     if (req.user.role !== 'admin') {
-      const isModerator = await SubredditMembership.findOne({
-        user: req.user._id,
-        subreddit: subredditId,
-        type: 'moderator',
-      });
+      const isModerator = await isModeratorOf(req.user._id, subredditId);
 
       if (!isModerator) {
         return next(new ErrorResponse('Bu subreddit için ödül oluşturma yetkiniz yok', 403));
@@ -321,11 +308,7 @@ const updateAward = asyncHandler(async (req, res, next) => {
   if (req.user.role !== 'admin') {
     // Subreddit'e özel ödül ise moderatör kontrolü
     if (award.subreddit) {
-      const isModerator = await SubredditMembership.findOne({
-        user: req.user._id,
-        subreddit: award.subreddit,
-        type: 'moderator',
-      });
+      const isModerator = await isModeratorOf(req.user._id, award.subreddit._id);
 
       if (!isModerator) {
         return next(new ErrorResponse('Bu ödülü güncelleme yetkiniz yok', 403));
@@ -435,11 +418,7 @@ const deleteAward = asyncHandler(async (req, res, next) => {
   if (req.user.role !== 'admin') {
     // Subreddit'e özel ödül ise moderatör kontrolü
     if (award.subreddit) {
-      const isModerator = await SubredditMembership.findOne({
-        user: req.user._id,
-        subreddit: award.subreddit,
-        type: 'moderator',
-      });
+      const isModerator = await isModeratorOf(req.user._id, award.subreddit);
 
       if (!isModerator) {
         return next(new ErrorResponse('Bu ödülü silme yetkiniz yok', 403));

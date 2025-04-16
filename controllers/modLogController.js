@@ -5,7 +5,7 @@ const SubredditMembership = require('../models/SubredditMembership');
 const asyncHandler = require('../middleware/async');
 const ErrorResponse = require('../utils/errorResponse');
 const mongoose = require('mongoose');
-
+const { isModeratorOf } = require('../utils/roleHelpers');
 /**
  * @desc    Moderasyon logu oluştur
  * @route   POST /api/moderation/logs
@@ -42,17 +42,12 @@ const createModLog = asyncHandler(async (req, res, next) => {
   }
 
   // İstekte bulunan kullanıcının moderatör yetkisini kontrol et
-  const isModerator = await SubredditMembership.findOne({
-    user: req.user._id,
-    subreddit: subredditId,
-    type: 'moderator',
-  });
+  const isModerator = await isModeratorOf(req.user._id, subredditId);
 
   // Eğer kullanıcı moderatör veya admin değilse erişimi reddet
   if (!isModerator && req.user.role !== 'admin') {
     return next(new ErrorResponse('Bu işlem için moderatör yetkiniz yok', 403));
   }
-
   // Hedef tür-alan eşleşmesini kontrol et
   if (
     (targetType === 'post' && !targetPost) ||
@@ -109,12 +104,7 @@ const getModLog = asyncHandler(async (req, res, next) => {
   }
 
   // Kullanıcının bu logu görüntüleme yetkisi var mı kontrol et
-  const isModerator = await SubredditMembership.findOne({
-    user: req.user._id,
-    subreddit: modLog.subreddit._id,
-    type: 'moderator',
-  });
-
+  const isModerator = await isModeratorOf(req.user._id, modLog.subreddit._id);
   // Log halka açık değilse ve kullanıcı moderatör değilse erişimi reddet
   if (!modLog.isPublic && !isModerator && req.user.role !== 'admin') {
     return next(new ErrorResponse('Bu moderasyon logunu görüntüleme yetkiniz yok', 403));
@@ -159,11 +149,7 @@ const getSubredditModLogs = asyncHandler(async (req, res, next) => {
   // Kullanıcının moderatör olup olmadığını kontrol et
   let isModerator = false;
   if (req.user) {
-    isModerator = await SubredditMembership.findOne({
-      user: req.user._id,
-      subreddit: subredditId,
-      type: 'moderator',
-    });
+    isModerator = await isModeratorOf(req.user._id, subredditId);
   }
 
   // Sorgu filtresini oluştur
@@ -270,11 +256,7 @@ const getModeratorLogs = asyncHandler(async (req, res, next) => {
     let hasPermission = false;
 
     if (subredditId && mongoose.Types.ObjectId.isValid(subredditId)) {
-      const isModerator = await SubredditMembership.findOne({
-        user: req.user._id,
-        subreddit: subredditId,
-        type: 'moderator',
-      });
+      const isModerator = await isModeratorOf(req.user._id, subredditId);
 
       if (isModerator) {
         hasPermission = true;
@@ -379,11 +361,7 @@ const getTargetModLogs = asyncHandler(async (req, res, next) => {
 
   // Hedef bir subreddit ise, kullanıcının o subredditin moderatörü olduğunu kontrol et
   if (targetType === 'subreddit') {
-    const isModerator = await SubredditMembership.findOne({
-      user: req.user._id,
-      subreddit: targetId,
-      type: 'moderator',
-    });
+    const isModerator = await isModeratorOf(req.user._id, targetId);
 
     if (!isModerator && req.user.role !== 'admin') {
       filter.isPublic = true;
@@ -460,6 +438,12 @@ const updateModLog = asyncHandler(async (req, res, next) => {
 
   // Yetkiyi kontrol et: Log sahibi veya admin olmalı
   if (modLog.moderator.toString() !== req.user._id.toString() && req.user.role !== 'admin') {
+    // Önce moderatör kontrolü yap
+    const isModerator = await isModeratorOf(req.user._id, modLog.subreddit);
+    if (!isModerator) {
+      return next(new ErrorResponse('Bu log kaydını güncelleme yetkiniz yok', 403));
+    }
+
     // Üst düzey moderatör kontrolü (kurucu moderatör veya daha önce atanmış moderatör)
     const currentModMembership = await SubredditMembership.findOne({
       user: req.user._id,
@@ -483,7 +467,6 @@ const updateModLog = asyncHandler(async (req, res, next) => {
       return next(new ErrorResponse('Bu log kaydını güncelleme yetkiniz yok', 403));
     }
   }
-
   // Sadece belirli alanların güncellenmesine izin ver
   const updateData = {};
 
@@ -548,11 +531,7 @@ const getModeratorStats = asyncHandler(async (req, res, next) => {
   }
 
   // Kullanıcının moderatör olup olmadığını kontrol et
-  const isModerator = await SubredditMembership.findOne({
-    user: req.user._id,
-    subreddit: subredditId,
-    type: 'moderator',
-  });
+  const isModerator = await isModeratorOf(req.user._id, subredditId);
 
   if (!isModerator && req.user.role !== 'admin') {
     return next(new ErrorResponse('Bu işlem için moderatör yetkiniz yok', 403));

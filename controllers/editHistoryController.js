@@ -5,7 +5,6 @@ const EditHistory = require('../models/EditHistory');
 const Post = require('../models/Post');
 const Comment = require('../models/Comment');
 const User = require('../models/User');
-const SubredditMembership = require('../models/SubredditMembership');
 
 /**
  * @desc    İçerik düzenleme sayısını ve son düzenleme bilgisini getir
@@ -264,13 +263,7 @@ const getEditHistoryRecord = asyncHandler(async (req, res, next) => {
       (editRecord.comment && editRecord.comment.post && editRecord.comment.post.subreddit);
 
     if (subredditId) {
-      const membership = await SubredditMembership.findOne({
-        user: userId,
-        subreddit: subredditId,
-        isModerator: true,
-      });
-
-      isModerator = !!membership;
+      isModerator = await isModeratorOf(userId, subredditId);
     }
 
     if (!isModerator) {
@@ -331,8 +324,7 @@ const getUserEditStats = asyncHandler(async (req, res, next) => {
     isModerationEdit: true,
   });
 
-  // Son 30 gündeki düzenlemeler
-  const thirtyDaysAgo = new Date();
+  // Son 30 gündeki düzenlemeler  const thirtyDaysAgo = new Date();
   thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
 
   const recentEdits = await EditHistory.countDocuments({
@@ -391,14 +383,7 @@ const getSubredditEditStats = asyncHandler(async (req, res, next) => {
   let isModerator = false;
 
   if (!isAdmin) {
-    const membership = await SubredditMembership.findOne({
-      user: userId,
-      subreddit: subredditId,
-      isModerator: true,
-    });
-
-    isModerator = !!membership;
-
+    isModerator = await isModeratorOf(userId, subredditId);
     if (!isModerator) {
       return next(
         new ErrorResponse(
@@ -705,14 +690,7 @@ const getContentEditSummary = asyncHandler(async (req, res, next) => {
 
   if (!isAdmin && !isAuthor) {
     // Moderatör kontrolü
-    const membership = await SubredditMembership.findOne({
-      user: userId,
-      subreddit: subredditId,
-      isModerator: true,
-    });
-
-    isModerator = !!membership;
-
+    isModerator = await isModeratorOf(userId, subredditId);
     if (!isModerator) {
       return next(new ErrorResponse('Bu içeriğin düzenleme özetini görüntüleme yetkiniz yok', 403));
     }
