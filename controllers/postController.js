@@ -1,12 +1,16 @@
 const Post = require('../models/Post');
 const User = require('../models/User');
 const Subreddit = require('../models/Subreddit');
-const SubredditMembership = require('../models/SubredditMembership');
 const Poll = require('../models/Poll');
 const Vote = require('../models/Vote');
+const Comment = require('../models/Comment');
+const SavedItem = require('../models/SavedItem');
+const PostView = require('../models/PostView');
+const ModLog = require('../models/ModLog');
 const mongoose = require('mongoose');
 const asyncHandler = require('../middleware/async');
 const ErrorResponse = require('../utils/errorResponse');
+const { isModeratorOf, hasRoleInSubreddit, isSiteAdmin } = require('../utils/roleHelpers');
 
 /**
  * @desc    Yeni bir gönderi oluştur
@@ -27,17 +31,16 @@ const createPost = asyncHandler(async (req, res, next) => {
   }
 
   // Kullanıcının subreddit'e üye olup olmadığını kontrol et
-  const membership = await SubredditMembership.findOne({
-    user: req.user._id,
-    subreddit: subredditId,
-    status: { $in: ['member', 'moderator', 'admin'] },
-  });
+  const isMember = await hasRoleInSubreddit(req.user._id, subredditId, [
+    'member',
+    'moderator',
+    'admin',
+  ]);
 
   // Kapalı subreddit ise üyelik kontrolü
-  if (subreddit.type === 'private' && !membership) {
+  if (subreddit.type === 'private' && !isMember) {
     return next(new ErrorResponse("Bu subreddit'e gönderi yapma izniniz yok", 403));
   }
-
   // Gönderinin türüne göre gerekli alanları kontrol et
   if (type === 'link' && !url) {
     return next(new ErrorResponse('Link tipi gönderiler için URL gereklidir', 400));
@@ -229,19 +232,18 @@ const getSubredditPosts = asyncHandler(async (req, res, next) => {
       );
     }
 
-    const membership = await SubredditMembership.findOne({
-      user: req.user._id,
-      subreddit: subredditId,
-      status: { $in: ['member', 'moderator', 'admin'] },
-    });
+    const isMember = await hasRoleInSubreddit(req.user._id, subredditId, [
+      'member',
+      'moderator',
+      'admin',
+    ]);
 
-    if (!membership) {
+    if (!isMember) {
       return next(
         new ErrorResponse('Bu özel topluluğun gönderilerini görüntüleme izniniz yok', 403),
       );
     }
   }
-
   // Sayfalama için
   const page = parseInt(req.query.page, 10) || 1;
   const limit = parseInt(req.query.limit, 10) || 25;
@@ -532,17 +534,16 @@ const getPostById = asyncHandler(async (req, res, next) => {
       return next(new ErrorResponse('Bu gönderiyi görüntülemek için giriş yapmalısınız', 401));
     }
 
-    const membership = await SubredditMembership.findOne({
-      user: req.user._id,
-      subreddit: post.subreddit._id,
-      status: { $in: ['member', 'moderator', 'admin'] },
-    });
+    const isMember = await hasRoleInSubreddit(req.user._id, post.subreddit._id, [
+      'member',
+      'moderator',
+      'admin',
+    ]);
 
-    if (!membership) {
+    if (!isMember) {
       return next(new ErrorResponse('Bu gönderiyi görüntüleme izniniz yok', 403));
     }
   }
-
   // Kullanıcı giriş yapmışsa, kullanıcının oy durumunu getir
   if (req.user) {
     const userVote = await Vote.findOne({
@@ -553,7 +554,29 @@ const getPostById = asyncHandler(async (req, res, next) => {
     post._doc.userVote = userVote ? userVote.value : 0;
   }
 
-  // Gönderi görüntüleme sayısını artırabilir (analytics için)
+  // Post görüntüleme istatistiğini kaydet
+  if (req.user) {
+    // Kullanıcı oturum açmışsa
+    PostView.recordView(id, {
+      userId: req.user._id,
+      ipAddress: req.ip,
+      userAgent: req.headers['user-agent'],
+      referrer: req.get('Referrer') || 'direct',
+      country: req.headers['cf-ipcountry'] || 'unknown', // Cloudflare kullanıyorsanız
+      deviceType: detectDeviceType(req.headers['user-agent']),
+      sessionId: req.sessionID,
+    }).catch((err) => console.error('View recording error:', err));
+  } else {
+    // Anonim kullanıcı
+    PostView.recordView(id, {
+      ipAddress: req.ip,
+      userAgent: req.headers['user-agent'],
+      referrer: req.get('Referrer') || 'direct',
+      country: req.headers['cf-ipcountry'] || 'unknown',
+      deviceType: detectDeviceType(req.headers['user-agent']),
+      sessionId: req.sessionID,
+    }).catch((err) => console.error('View recording error:', err));
+  }
 
   res.status(200).json({
     success: true,
@@ -561,6 +584,17 @@ const getPostById = asyncHandler(async (req, res, next) => {
   });
 });
 
+// Cihaz tipini tespit eden yardımcı fonksiyon
+function detectDeviceType(userAgent) {
+  if (!userAgent) return 'other';
+
+  if (/mobile/i.test(userAgent)) return 'mobile';
+  if (/tablet|ipad/i.test(userAgent)) return 'tablet';
+  if (/android|webos|iphone|ipad|ipod|blackberry|iemobile|opera mini/i.test(userAgent))
+    return 'mobile';
+
+  return 'desktop';
+}
 /**
  * @desc    Gönderiyi güncelle
  * @route   PUT /api/posts/:id
@@ -585,18 +619,12 @@ const updatePost = asyncHandler(async (req, res, next) => {
   let isModerator = false;
 
   if (!isAuthor) {
-    isModerator = await SubredditMembership.findOne({
-      user: req.user._id,
-      subreddit: post.subreddit,
-      type: { $in: ['moderator', 'admin'] },
-      status: 'active',
-    });
+    isModerator = await isModeratorOf(req.user._id, post.subreddit);
 
-    if (!isModerator && req.user.role !== 'admin') {
+    if (!isModerator) {
       return next(new ErrorResponse('Bu gönderiyi düzenleme yetkiniz yok', 403));
     }
   }
-
   // Arşivlenmiş gönderiler düzenlenemez
   if (post.isArchived) {
     return next(new ErrorResponse('Arşivlenmiş gönderiler düzenlenemez', 400));
@@ -677,18 +705,12 @@ const deletePost = asyncHandler(async (req, res, next) => {
   let isModerator = false;
 
   if (!isAuthor) {
-    isModerator = await SubredditMembership.findOne({
-      user: req.user._id,
-      subreddit: post.subreddit,
-      type: { $in: ['moderator', 'admin'] },
-      status: 'active',
-    });
+    isModerator = await isModeratorOf(req.user._id, post.subreddit);
 
-    if (!isModerator && req.user.role !== 'admin') {
+    if (!isModerator) {
       return next(new ErrorResponse('Bu gönderiyi silme yetkiniz yok', 403));
     }
   }
-
   // Soft delete işlemi
   await Post.findByIdAndUpdate(id, {
     isDeleted: true,
@@ -845,14 +867,9 @@ const togglePinPost = asyncHandler(async (req, res, next) => {
   }
 
   // Moderatör kontrolü
-  const isModerator = await SubredditMembership.findOne({
-    user: req.user._id,
-    subreddit: post.subreddit,
-    type: { $in: ['moderator', 'admin'] },
-    status: 'active',
-  });
+  const isModerator = await isModeratorOf(req.user._id, post.subreddit);
 
-  if (!isModerator && req.user.role !== 'admin') {
+  if (!isModerator) {
     return next(new ErrorResponse('Bu gönderiyi sabitleme/kaldırma yetkiniz yok', 403));
   }
 
@@ -892,17 +909,11 @@ const toggleLockPost = asyncHandler(async (req, res, next) => {
   }
 
   // Moderatör kontrolü
-  const isModerator = await SubredditMembership.findOne({
-    user: req.user._id,
-    subreddit: post.subreddit,
-    type: { $in: ['moderator', 'admin'] },
-    status: 'active',
-  });
+  const isModerator = await isModeratorOf(req.user._id, post.subreddit);
 
-  if (!isModerator && req.user.role !== 'admin') {
+  if (!isModerator) {
     return next(new ErrorResponse('Bu gönderiyi kilitleme/kilidini açma yetkiniz yok', 403));
   }
-
   // Gönderiyi güncelle
   const updatedPost = await Post.findByIdAndUpdate(id, { isLocked }, { new: true });
 
@@ -943,14 +954,9 @@ const toggleNSFWPost = asyncHandler(async (req, res, next) => {
   let isModerator = false;
 
   if (!isAuthor) {
-    isModerator = await SubredditMembership.findOne({
-      user: req.user._id,
-      subreddit: post.subreddit,
-      type: { $in: ['moderator', 'admin'] },
-      status: 'active',
-    });
+    isModerator = await isModeratorOf(req.user._id, post.subreddit);
 
-    if (!isModerator && req.user.role !== 'admin') {
+    if (!isModerator) {
       return next(
         new ErrorResponse('Bu gönderiyi NSFW olarak işaretleme/kaldırma yetkiniz yok', 403),
       );
@@ -997,14 +1003,9 @@ const toggleSpoilerPost = asyncHandler(async (req, res, next) => {
   let isModerator = false;
 
   if (!isAuthor) {
-    isModerator = await SubredditMembership.findOne({
-      user: req.user._id,
-      subreddit: post.subreddit,
-      type: { $in: ['moderator', 'admin'] },
-      status: 'active',
-    });
+    isModerator = await isModeratorOf(req.user._id, post.subreddit);
 
-    if (!isModerator && req.user.role !== 'admin') {
+    if (!isModerator) {
       return next(
         new ErrorResponse('Bu gönderiyi spoiler olarak işaretleme/kaldırma yetkiniz yok', 403),
       );
@@ -1026,8 +1027,7 @@ const toggleSpoilerPost = asyncHandler(async (req, res, next) => {
 });
 
 /**
- * @desc    Gönderilerde arama yap
- * @route   GET /api/posts/search
+ * @desc    Gönderilerde arama yap * @route   GET /api/posts/search
  * @access  Public
  */
 const searchPosts = asyncHandler(async (req, res, next) => {
@@ -1242,31 +1242,44 @@ const getSavedPosts = asyncHandler(async (req, res, next) => {
   const limit = parseInt(req.query.limit, 10) || 25;
   const startIndex = (page - 1) * limit;
 
-  // Kaydettiği gönderileri bul
-  const savedPostIds = await SavedPost.find({ user: req.user._id })
+  // Sadece post türündeki kayıtlı öğeleri sorgulamak için comment: null filtresini ekle
+  const total = await SavedItem.countDocuments({
+    user: req.user._id,
+    post: { $ne: null },
+    comment: null,
+  });
+
+  // Kaydettiği gönderileri bul (comment alanı null olanlar)
+  const savedItems = await SavedItem.find({
+    user: req.user._id,
+    post: { $ne: null },
+    comment: null,
+  })
     .sort({ savedAt: -1 })
     .skip(startIndex)
     .limit(limit)
-    .select('post');
+    .populate({
+      path: 'post',
+      match: { isDeleted: false },
+      populate: [
+        { path: 'author', select: 'username profilePicture' },
+        { path: 'subreddit', select: 'name title icon' },
+        { path: 'flair', select: 'text backgroundColor textColor' },
+      ],
+    });
 
-  const postIds = savedPostIds.map((saved) => saved.post);
-
-  // Gönderi detaylarını getir
-  const posts = await Post.find({
-    _id: { $in: postIds },
-    isDeleted: false,
-  })
-    .populate('author', 'username profilePicture')
-    .populate('subreddit', 'name title icon')
-    .populate('flair', 'text backgroundColor textColor');
+  // Null olmayan postları filtrele (silinmiş postları çıkar)
+  const posts = savedItems.filter((saved) => saved.post !== null).map((saved) => saved.post);
 
   // Kullanıcının oylarını getir
+  const postIds = posts.map((post) => post._id);
+
+  // Her gönderiye kullanıcının oyunu ekle
   const userVotes = await Vote.find({
     user: req.user._id,
     post: { $in: postIds },
   });
 
-  // Her gönderiye kullanıcının oyunu ekle
   const votesMap = {};
   userVotes.forEach((vote) => {
     votesMap[vote.post.toString()] = vote.value;
@@ -1275,10 +1288,6 @@ const getSavedPosts = asyncHandler(async (req, res, next) => {
   posts.forEach((post) => {
     post._doc.userVote = votesMap[post._id.toString()] || 0;
   });
-
-  // Toplam kayıtlı gönderi sayısı
-  const total = await SavedPost.countDocuments({ user: req.user._id });
-
   // Sayfalama bilgisi
   const pagination = {
     page,
@@ -1333,18 +1342,21 @@ const toggleSavePost = asyncHandler(async (req, res, next) => {
   }
 
   // Mevcut kayıt durumunu kontrol et
-  const savedPost = await SavedPost.findOne({
+  const savedItem = await SavedItem.findOne({
     user: req.user._id,
     post: id,
+    comment: null, // Post kaydettiğimizden emin olmak için
   });
 
   if (save) {
     // Kaydet
-    if (!savedPost) {
-      await SavedPost.create({
+    if (!savedItem) {
+      await SavedItem.create({
         user: req.user._id,
         post: id,
+        comment: null, // Post kaydettiğimizi belirtmek için
         savedAt: Date.now(),
+        category: 'uncategorized', // Varsayılan kategori
       });
     }
 
@@ -1354,8 +1366,8 @@ const toggleSavePost = asyncHandler(async (req, res, next) => {
     });
   } else {
     // Kaydetme işlemini kaldır
-    if (savedPost) {
-      await SavedPost.findByIdAndDelete(savedPost._id);
+    if (savedItem) {
+      await SavedItem.findByIdAndDelete(savedItem._id);
     }
 
     res.status(200).json({
@@ -1364,7 +1376,6 @@ const toggleSavePost = asyncHandler(async (req, res, next) => {
     });
   }
 });
-
 /**
  * @desc    Gönderi istatistiklerini getir
  * @route   GET /api/posts/:id/analytics
@@ -1388,12 +1399,7 @@ const getPostAnalytics = asyncHandler(async (req, res, next) => {
   let isModerator = false;
 
   if (!isAuthor) {
-    isModerator = await SubredditMembership.findOne({
-      user: req.user._id,
-      subreddit: post.subreddit,
-      type: { $in: ['moderator', 'admin'] },
-      status: 'active',
-    });
+    isModerator = await isModeratorOf(req.user._id, post.subreddit);
 
     if (!isModerator && req.user.role !== 'admin') {
       return next(
@@ -1522,14 +1528,9 @@ const toggleArchivePost = asyncHandler(async (req, res, next) => {
   }
 
   // Moderatör kontrolü
-  const isModerator = await SubredditMembership.findOne({
-    user: req.user._id,
-    subreddit: post.subreddit,
-    type: { $in: ['moderator', 'admin'] },
-    status: 'active',
-  });
+  const isModerator = await isModeratorOf(req.user._id, post.subreddit);
 
-  if (!isModerator && req.user.role !== 'admin') {
+  if (!isModerator) {
     return next(new ErrorResponse('Bu gönderiyi arşivleme/arşivden çıkarma yetkiniz yok', 403));
   }
 
