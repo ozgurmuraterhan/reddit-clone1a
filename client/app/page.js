@@ -14,7 +14,7 @@ export default function Home() {
   useEffect(() => {
     const fetchPosts = async () => {
       try {
-        const res = await axios.get('http://localhost:5000/api/posts');
+        const res = await axios.get('http://localhost:5002/api/posts');
         setPosts(res.data.data);
       } catch (error) {
         console.error('Error fetching posts:', error);
@@ -34,7 +34,7 @@ export default function Home() {
 
     try {
       const res = await axios.post(
-        `http://localhost:5000/api/posts/${id}/vote`,
+        `http://localhost:5002/api/posts/${id}/vote`,
         {
           value,
         },

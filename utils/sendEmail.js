@@ -15,20 +15,24 @@ const sendEmail = async (options) => {
       throw new Error('Email, konu ve HTML içerik zorunludur');
     }
 
-    // Transporter oluştur
+    // Gmail için transporter oluştur
     const transporter = nodemailer.createTransport({
       host: process.env.SMTP_HOST,
       port: process.env.SMTP_PORT,
       secure: process.env.SMTP_SECURE === 'true', // true for 465, false for other ports
       auth: {
         user: process.env.SMTP_USER,
-        pass: process.env.SMTP_PASSWORD,
+        pass: process.env.SMTP_PASSWORD, // Gmail uygulama şifresi
+      },
+      tls: {
+        // Gmail için gerekli TLS ayarları
+        rejectUnauthorized: false,
       },
     });
 
     // Email seçeneklerini hazırla
     const mailOptions = {
-      from: `${process.env.FROM_NAME} <${process.env.FROM_EMAIL}>`,
+      from: `${process.env.FROM_NAME} <${process.env.SMTP_USER}>`, // Gmail'de FROM_EMAIL yerine SMTP_USER kullanılmalı
       to: options.email,
       subject: options.subject,
       html: options.html,
