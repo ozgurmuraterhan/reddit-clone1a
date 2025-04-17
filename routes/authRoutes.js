@@ -55,95 +55,95 @@ router.post('/social/:provider', standardLimit, socialAuth);
 
 // Google OAuth routes
 router.get(
-  '/google',
-  passport.authenticate('google', {
-    scope: ['profile', 'email'],
-  }),
+    '/google',
+    passport.authenticate('google', {
+      scope: ['profile', 'email'],
+    }),
 );
 
 router.get(
-  '/google/callback',
-  passport.authenticate('google', {
-    failureRedirect: '/login',
-    session: false,
-  }),
-  (req, res) => {
-    // Create JWT token after successful authentication
-    const token = generateToken(req.user);
+    '/google/callback',
+    passport.authenticate('google', {
+      failureRedirect: '/login',
+      session: false,
+    }),
+    (req, res) => {
+      // Create JWT token after successful authentication
+      const token = generateToken(req.user);
 
-    // Redirect to frontend with token or return token in development
-    if (process.env.NODE_ENV === 'production') {
-      res.redirect(`${process.env.FRONTEND_URL}/auth/social-callback?token=${token}`);
-    } else {
-      res.json({ success: true, token, user: req.user });
-    }
-  },
+      // Redirect to frontend with token or return token in development
+      if (process.env.NODE_ENV === 'production') {
+        res.redirect(`${process.env.FRONTEND_URL}/auth/social-callback?token=${token}`);
+      } else {
+        res.json({ success: true, token, user: req.user });
+      }
+    },
 );
 
 // Facebook OAuth routes
 router.get(
-  '/facebook',
-  passport.authenticate('facebook', {
-    scope: ['email'],
-  }),
+    '/facebook',
+    passport.authenticate('facebook', {
+      scope: ['email'],
+    }),
 );
 
 router.get(
-  '/facebook/callback',
-  passport.authenticate('facebook', {
-    failureRedirect: '/login',
-    session: false,
-  }),
-  (req, res) => {
-    // Create JWT token after successful authentication
-    const token = generateToken(req.user);
+    '/facebook/callback',
+    passport.authenticate('facebook', {
+      failureRedirect: '/login',
+      session: false,
+    }),
+    (req, res) => {
+      // Create JWT token after successful authentication
+      const token = generateToken(req.user);
 
-    // Redirect to frontend with token or return token in development
-    if (process.env.NODE_ENV === 'production') {
-      res.redirect(`${process.env.FRONTEND_URL}/auth/social-callback?token=${token}`);
-    } else {
-      res.json({ success: true, token, user: req.user });
-    }
-  },
+      // Redirect to frontend with token or return token in development
+      if (process.env.NODE_ENV === 'production') {
+        res.redirect(`${process.env.FRONTEND_URL}/auth/social-callback?token=${token}`);
+      } else {
+        res.json({ success: true, token, user: req.user });
+      }
+    },
 );
 
 // Connect social accounts to existing profile
 router.get(
-  '/connect/google',
-  isAuthenticated,
-  passport.authorize('google', {
-    scope: ['profile', 'email'],
-  }),
+    '/connect/google',
+    isAuthenticated,
+    passport.authorize('google', {
+      scope: ['profile', 'email'],
+    }),
 );
 
 router.get(
-  '/connect/facebook',
-  isAuthenticated,
-  passport.authorize('facebook', {
-    scope: ['email'],
-  }),
+    '/connect/facebook',
+    isAuthenticated,
+    passport.authorize('facebook', {
+      scope: ['email'],
+    }),
 );
 
 // Handle social account connection callbacks
 router.get(
-  '/connect/:provider/callback',
-  isAuthenticated,
-  (req, res, next) => {
-    const { provider } = req.params;
-    if (!['google', 'facebook'].includes(provider)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Invalid provider',
-      });
-    }
+    '/connect/:provider/callback',
+    isAuthenticated,
+    (req, res, next) => {
+      const { provider } = req.params;
+      if (!['google', 'facebook'].includes(provider)) {
+        return res.status(400).json({
+          success: false,
+          message: 'Invalid provider',
+        });
+      }
 
-    passport.authorize(provider, {
-      failureRedirect: '/settings/profile',
-    })(req, res, next);
-  },
-  (req, res) => {
-    res.redirect(`${process.env.FRONTEND_URL}/settings/profile?connected=true`);
-  },
+      passport.authorize(provider, {
+        failureRedirect: '/settings/profile',
+      })(req, res, next);
+    },
+    (req, res) => {
+      res.redirect(`${process.env.FRONTEND_URL}/settings/profile?connected=true`);
+    },
 );
 
 // Disconnect social accounts
